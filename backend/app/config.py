@@ -21,6 +21,7 @@ class Settings:
     host: str = os.getenv("HOST", "127.0.0.1")
     port: int = int(os.getenv("PORT", "8000"))
     token_path: Path = PROJECT_ROOT / "backend" / "data" / "gmail_token.json"
+    gemini_settings_path: Path = PROJECT_ROOT / "backend" / "data" / "gemini_settings.json"
 
 
 settings = Settings()

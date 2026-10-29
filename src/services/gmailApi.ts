@@ -1,4 +1,5 @@
-const API_URL = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
+const configuredApiUrl = (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
+const API_URL = import.meta.env.DEV ? '/api' : configuredApiUrl
 
 export type GmailAttachment = {
   id: string
@@ -32,11 +33,20 @@ export type GmailStatus = {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, init)
+  const url = `${API_URL}${path}`
+  let response: Response
+  try {
+    response = await fetch(url, init)
+  } catch (error) {
+    console.error('[Nexora][Gmail] No se pudo contactar FastAPI', { url, error })
+    throw new Error('No se pudo contactar el backend FastAPI. Ejecuta npm run dev:all.')
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => null) as { detail?: string } | null
+    console.error('[Nexora][Gmail] Error de API', { url, status: response.status, detail: payload?.detail })
     throw new Error(payload?.detail ?? `La API respondió con ${response.status}.`)
   }
+  console.info('[Nexora][Gmail] Respuesta correcta', { url, status: response.status })
   return response.json() as Promise<T>
 }
 
@@ -46,6 +56,7 @@ export const gmailApi = {
   message: (id: string) => request<GmailMessage>(`/gmail/messages/${encodeURIComponent(id)}`),
   disconnect: () => request<{ connected: boolean }>('/gmail/disconnect', { method: 'POST' }),
   startAuth: () => {
+    console.info('[Nexora][Gmail] Abriendo OAuth', { url: `${API_URL}/auth/gmail/start` })
     window.location.assign(`${API_URL}/auth/gmail/start`)
   },
   attachmentUrl: (messageId: string, attachmentId: string) => `${API_URL}/gmail/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}`,

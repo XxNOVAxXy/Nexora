@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import html
+import mimetypes
 import re
 from datetime import datetime, timezone
 from email.utils import parseaddr
@@ -50,7 +51,12 @@ class GmailClient:
 
     def create_flow(self, state: str | None = None) -> Flow:
         flow = Flow.from_client_config(
-            _client_config(), scopes=GMAIL_SCOPES, state=state
+            _client_config(),
+            scopes=GMAIL_SCOPES,
+            state=state,
+            # This is a confidential web client; do not generate a verifier
+            # that would need to be persisted between the two OAuth requests.
+            autogenerate_code_verifier=False,
         )
         flow.redirect_uri = settings.google_redirect_uri
         return flow
@@ -60,7 +66,7 @@ class GmailClient:
         authorization_url, state = flow.authorization_url(
             access_type="offline",
             include_granted_scopes="true",
-            prompt="consent",
+            prompt="select_account consent",
         )
         return authorization_url, state
 
@@ -140,7 +146,18 @@ class GmailClient:
         )
         return self._serialize_message(raw_message)
 
-    def attachment(self, message_id: str, attachment_id: str) -> tuple[bytes, str]:
+    def attachment(self, message_id: str, attachment_id: str) -> tuple[bytes, str, str]:
+        message = (
+            self.service()
+            .users()
+            .messages()
+            .get(userId="me", id=message_id, format="full")
+            .execute()
+        )
+        attachment_info = next(
+            (item for item in _attachments(message.get("payload", {})) if item["id"] == attachment_id),
+            None,
+        )
         response = (
             self.service()
             .users()
@@ -151,7 +168,14 @@ class GmailClient:
         )
         data = response.get("data", "")
         try:
-            return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)), "application/octet-stream"
+            filename = attachment_info["filename"] if attachment_info else "attachment"
+            declared_type = attachment_info["mimeType"] if attachment_info else ""
+            media_type = _media_type_for(filename, declared_type)
+            return (
+                base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)),
+                media_type,
+                filename,
+            )
         except (binascii.Error, ValueError) as error:
             raise GmailNotConnectedError("Gmail devolvió un adjunto inválido.") from error
 
@@ -228,7 +252,7 @@ def _attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 {
                     "id": body["attachmentId"],
                     "filename": filename,
-                    "mimeType": part.get("mimeType", "application/octet-stream"),
+                    "mimeType": _media_type_for(filename, part.get("mimeType", "")),
                     "size": body.get("size", 0),
                 }
             )
@@ -237,3 +261,10 @@ def _attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
     collect(payload)
     return result
+
+
+def _media_type_for(filename: str, declared_type: str) -> str:
+    guessed_type, _ = mimetypes.guess_type(filename)
+    if declared_type and declared_type != "application/octet-stream":
+        return declared_type
+    return guessed_type or "application/octet-stream"
