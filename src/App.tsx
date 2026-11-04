@@ -3,7 +3,9 @@ import { Link, NavLink, Route, Routes, useLocation, useNavigate } from 'react-ro
 import type { DocumentItem, Transaction, TransactionStatus } from './types'
 import { mockApi } from './services/mockApi'
 import { gmailApi, type GmailAttachment, type GmailMessage, type GmailStatus } from './services/gmailApi'
-import { geminiApi, type GeminiStatus } from './services/geminiApi'
+import { geminiApi, type GeminiExtractionResponse, type GeminiStatus } from './services/geminiApi'
+import { buildSaveDataPayload, createInitialSaveDataAttempt, formatSaveDataPayload, updateMethodValue, validateSaveDataDocument, type SaveDataAttempt, type SaveDataMethod, type SaveDataRecord } from './services/saveData'
+import { classifyMessagesWithCache, classificationLabel, detectStatementEmail, preliminaryClassification, type ClassificationCache, type EmailClassification } from './services/emailClassification'
 import {
   Archive,
   ArrowDownToLine,
@@ -55,7 +57,7 @@ import {
 } from 'lucide-react'
 
 type Icon = typeof Inbox
-type ExtractionMode = 'manual' | 'gemini'
+type ExtractionMode = SaveDataMethod
 const documents = mockApi.documents
 const baseTransactions = mockApi.transactions
 type MailFolder = 'inbox' | 'sent' | 'archive' | 'trash'
@@ -75,8 +77,8 @@ function App() {
         <Topbar onMenu={() => setSidebarOpen(true)} />
         <main className="mx-auto max-w-[1440px] px-5 pb-10 pt-6 sm:px-8 lg:px-10">
           <Routes>
-            <Route path="/" element={<GmailInboxPage />} />
-            <Route path="/emails" element={<GmailInboxPage />} />
+            <Route path="/" element={<FilteredGmailInboxPage />} />
+            <Route path="/emails" element={<FilteredGmailInboxPage />} />
             <Route path="/extraction" element={<ExtractionWorkspace />} />
             <Route path="/settings" element={<SettingsPageV3 />} />
           </Routes>
@@ -159,6 +161,169 @@ function GmailInboxPage() {
   const attachmentCount = messages.reduce((total, message) => total + message.attachments.length, 0)
 
   return <><PageHeading eyebrow="Centro de comunicaciones" title="Correos" description="Consulta los mensajes reales de la cuenta de Gmail configurada."><button className="btn-primary" onClick={() => void loadEmails()} disabled={loading || !status?.connected}><RefreshCw size={15} className={loading ? 'animate-spin' : ''} />Sincronizar</button></PageHeading>{error && <ErrorNotice text={error} onClose={() => setError(null)} />}{status && !status.connected && !error && <div className="mb-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"><div className="flex items-center gap-2"><CircleHelp size={17} /><span>Gmail no está conectado. La conexión se administra únicamente desde Configuración.</span></div></div>}<div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4"><StatCard icon={Inbox} label="Mensajes por revisar" value={`${unreadCount}`} change={status?.connected ? 'Cuenta real' : 'Sin conectar'} tone="blue" /><StatCard icon={Paperclip} label="Adjuntos recibidos" value={`${attachmentCount}`} change="En esta bandeja" tone="coral" /><StatCard icon={FileCheck2} label="Mensajes sincronizados" value={`${messages.length}`} change={folderLabel(folder)} tone="green" /><StatCard icon={Archive} label="Cuenta Gmail" value={status?.connected ? '1' : '0'} change={status?.email ?? 'Pendiente'} tone="purple" /></div><div className="panel grid min-h-[580px] grid-cols-1 overflow-hidden lg:grid-cols-[255px_minmax(350px,1fr)_minmax(360px,1.1fr)]"><GmailFoldersReadOnly folder={folder} setFolder={setFolder} status={status} /><div className="border-t border-slate-200 lg:border-l lg:border-t-0"><div className="flex items-center justify-between border-b border-slate-200 px-5 py-4"><div><div className="font-semibold text-ink">{folderLabel(folder)}</div><div className="mt-0.5 text-[11px] text-slate-400">{loading ? 'Consultando Gmail...' : `${messages.length} mensajes reales`}</div></div><button className="rounded-lg p-2 text-slate-400 hover:bg-slate-50" aria-label="Filtros"><Filter size={16} /></button></div><div className="p-2">{loading && <div className="flex items-center justify-center gap-2 py-14 text-xs text-slate-400"><RefreshCw size={16} className="animate-spin" />Consultando Gmail</div>}{!loading && messages.length === 0 && <div className="px-5 py-14 text-center text-xs text-slate-400">{status?.connected ? 'No hay mensajes en esta carpeta.' : 'Conecta Gmail desde Configuración para ver tus mensajes.'}</div>}{!loading && messages.map((mail) => <button key={mail.id} onClick={() => setSelected(mail)} className={`w-full rounded-xl border-b border-slate-100 p-3 text-left transition last:border-b-0 hover:bg-slate-50 ${selected?.id === mail.id ? 'bg-slate-50 ring-1 ring-slate-200' : ''}`}><div className="flex gap-3"><div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><span className={`truncate text-xs ${mail.unread ? 'font-bold text-ink' : 'font-semibold text-slate-600'}`}>{mail.sender}</span><span className="shrink-0 text-[10px] text-slate-400">{timeLabel(mail.receivedAt)}</span></div><div className={`mt-1 truncate text-xs ${mail.unread ? 'font-semibold text-slate-700' : 'text-slate-500'}`}>{mail.subject}</div><div className="mt-1 flex items-center gap-2 truncate text-[11px] text-slate-400"><span className="truncate">{mail.snippet || 'Sin vista previa'}</span>{mail.attachments.length > 0 && <Paperclip size={12} className="shrink-0" />}</div></div>{mail.unread && <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-coral" />}</div></button>)}</div></div>{selected ? <GmailMessageDetail mail={selected} /> : <EmptyMailDetail />}</div></>
+}
+
+type EmailFilter = 'all' | 'statements' | 'pending' | 'other'
+type LocalClassificationOverride = { classification: EmailClassification; fingerprint: string }
+
+/*
+function FilteredGmailInboxPage() {
+  const navigate = useNavigate()
+  const [selected, setSelected] = useState<GmailMessage | null>(null)
+  const [messages, setMessages] = useState<GmailMessage[]>([])
+  const [status, setStatus] = useState<GmailStatus | null>(null)
+  const [folder, setFolder] = useState<MailFolder>('inbox')
+  const [filter, setFilter] = useState<EmailFilter>('all')
+  const [classificationCache, setClassificationCache] = useState<ClassificationCache>({})
+  const [classificationOverrides, setClassificationOverrides] = useState<Record<string, LocalClassificationOverride>>({})
+  const [classificationLoading, setClassificationLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const loadEmails = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const nextStatus = await gmailApi.status()
+      setStatus(nextStatus)
+      if (!nextStatus.connected) {
+        setMessages([])
+        setSelected(null)
+        return
+      }
+      const nextMessages = await gmailApi.messages(folder)
+      setMessages(nextMessages)
+      setSelected((current) => nextMessages.find((message) => message.id === current?.id) ?? nextMessages[0] ?? null)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'No se pudo consultar Gmail.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { void loadEmails() }, [folder])
+
+  const resultFor = (message: GmailMessage) => classificationCache[message.id] ?? { ...detectStatementEmail(message), classification: preliminaryClassification(detectStatementEmail(message)), fingerprint: '', analyzedAt: '', source: 'preliminar' as const }
+  const classificationFor = (message: GmailMessage) => {
+    const result = resultFor(message)
+    const override = classificationOverrides[message.id]
+    return override?.fingerprint === result.fingerprint ? override.classification : result.classification
+  }
+  const filteredMessages = messages.filter((message) => {
+    const classification = classificationFor(message)
+    return filter === 'all' || (filter === 'statements' && classification === 'ESTADO_DE_CUENTA') || (filter === 'pending' && classification === 'REQUIERE_REVISION') || (filter === 'other' && classification === 'NO_ES_ESTADO_DE_CUENTA')
+  })
+  const visibleSelected = selected && filteredMessages.some((message) => message.id === selected.id) ? selected : filteredMessages[0] ?? null
+  const unreadCount = messages.filter((message) => message.unread).length
+  const attachmentCount = messages.reduce((total, message) => total + message.attachments.length, 0)
+  const pendingCount = messages.filter((message) => classificationFor(message) === 'REQUIERE_REVISION').length
+  const statementCount = messages.filter((message) => classificationFor(message) === 'ESTADO_DE_CUENTA').length
+
+  const setClassification = (messageId: string, classification: EmailClassification) => {
+    setClassificationOverrides((current) => ({ ...current, [messageId]: classification }))
+  }
+
+  return <><PageHeading eyebrow="Centro de comunicaciones" title="Correos" description="Identifica posibles estados de cuenta sin modificar los mensajes ni etiquetas originales."><button className="btn-primary" onClick={() => void loadEmails()} disabled={loading || !status?.connected}><RefreshCw size={15} className={loading ? 'animate-spin' : ''} />Sincronizar</button></PageHeading>{error && <ErrorNotice text={error} onClose={() => setError(null)} />}{status && !status.connected && !error && <div className="mb-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"><div className="flex items-center gap-2"><CircleHelp size={17} /><span>Gmail no está conectado. La conexión se administra únicamente desde Configuración.</span></div></div>}<div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4"><StatCard icon={Inbox} label="Mensajes por revisar" value={`${unreadCount}`} change={status?.connected ? 'Cuenta real' : 'Sin conectar'} tone="blue" /><StatCard icon={Paperclip} label="Adjuntos recibidos" value={`${attachmentCount}`} change="En esta bandeja" tone="coral" /><StatCard icon={FileCheck2} label="Estados confirmados" value={`${statementCount}`} change="Corrección local" tone="green" /><StatCard icon={CircleHelp} label="Pendientes de verificar" value={`${pendingCount}`} change="Detección preliminar" tone="purple" /></div><div className="panel grid min-h-[580px] grid-cols-1 overflow-hidden lg:grid-cols-[255px_minmax(350px,1fr)_minmax(390px,1.1fr)]"><GmailFoldersReadOnly folder={folder} setFolder={setFolder} status={status} /><div className="border-t border-slate-200 lg:border-l lg:border-t-0"><div className="border-b border-slate-200 px-4 py-4"><div className="flex items-center justify-between gap-3"><div><div className="font-semibold text-ink">{folderLabel(folder)}</div><div className="mt-0.5 text-[11px] text-slate-400">{loading ? 'Consultando Gmail...' : `${filteredMessages.length} de ${messages.length} mensajes`}</div></div><Filter size={16} className="text-slate-400" /></div><div className="mt-3 flex gap-1 overflow-x-auto rounded-lg bg-slate-100 p-1">{([{ value: 'all', label: 'Todos' }, { value: 'statements', label: 'Estados de cuenta' }, { value: 'pending', label: 'Pendientes' }, { value: 'other', label: 'Otros' }] as { value: EmailFilter; label: string }[]).map((item) => <button key={item.value} type="button" onClick={() => setFilter(item.value)} className={`whitespace-nowrap rounded-md px-2.5 py-1.5 text-[11px] font-bold transition ${filter === item.value ? 'bg-white text-ink shadow-sm' : 'text-slate-500 hover:text-ink'}`}>{item.label}</button>)}</div></div><div className="p-2">{loading && <div className="flex items-center justify-center gap-2 py-14 text-xs text-slate-400"><RefreshCw size={16} className="animate-spin" />Consultando Gmail</div>}{!loading && filteredMessages.length === 0 && <div className="px-5 py-14 text-center text-xs text-slate-400">No hay correos en este filtro.</div>}{!loading && filteredMessages.map((mail) => { const detection = detectStatementEmail(mail); const classification = classificationFor(mail); return <button key={mail.id} onClick={() => setSelected(mail)} className={`w-full rounded-xl border-b border-slate-100 p-3 text-left transition last:border-b-0 hover:bg-slate-50 ${visibleSelected?.id === mail.id ? 'bg-slate-50 ring-1 ring-slate-200' : ''}`}><div className="flex gap-3"><div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><span className={`truncate text-xs ${mail.unread ? 'font-bold text-ink' : 'font-semibold text-slate-600'}`}>{mail.sender}</span><span className="shrink-0 text-[10px] text-slate-400">{timeLabel(mail.receivedAt)}</span></div><div className={`mt-1 truncate text-xs ${mail.unread ? 'font-semibold text-slate-700' : 'text-slate-500'}`}>{mail.subject || '(Sin asunto)'}</div><div className="mt-1 flex items-center gap-2 truncate text-[11px] text-slate-400"><span className="truncate">{mail.snippet || 'Sin vista previa'}</span>{mail.attachments.length > 0 && <Paperclip size={12} className="shrink-0" />}</div><div className="mt-2 flex flex-wrap items-center gap-1.5"><ClassificationBadge classification={classification} manual={Boolean(classificationOverrides[mail.id])} />{detection.hasDocumentAttachment && <span className="rounded-full bg-slate-100 px-2 py-1 text-[9px] font-semibold text-slate-500">Adjunto documental</span>}</div></div>{mail.unread && <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-coral" />}</div></button> })}</div></div>{visibleSelected ? <ClassifiedGmailMessageDetail mail={visibleSelected} classification={classificationFor(visibleSelected)} detection={detectStatementEmail(visibleSelected)} manual={Boolean(classificationOverrides[visibleSelected.id])} onClassificationChange={(classification) => setClassification(visibleSelected.id, classification)} onExtract={(attachment) => navigate(`/extraction?message=${encodeURIComponent(visibleSelected.id)}&attachment=${encodeURIComponent(attachment.id)}&filename=${encodeURIComponent(attachment.filename)}`)} /> : <EmptyMailDetail />}</div></div></>
+}
+
+*/
+function FilteredGmailInboxPage() {
+  const navigate = useNavigate()
+  const [selected, setSelected] = useState<GmailMessage | null>(null)
+  const [messages, setMessages] = useState<GmailMessage[]>([])
+  const [status, setStatus] = useState<GmailStatus | null>(null)
+  const [folder, setFolder] = useState<MailFolder>('inbox')
+  const [filter, setFilter] = useState<EmailFilter>('all')
+  const [classificationCache, setClassificationCache] = useState<ClassificationCache>({})
+  const [classificationOverrides, setClassificationOverrides] = useState<Record<string, LocalClassificationOverride>>({})
+  const [classificationLoading, setClassificationLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const loadEmails = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const nextStatus = await gmailApi.status()
+      setStatus(nextStatus)
+      if (!nextStatus.connected) {
+        setMessages([])
+        setSelected(null)
+        return
+      }
+      const nextMessages = await gmailApi.messages(folder)
+      setClassificationLoading(true)
+      const nextCache = classifyMessagesWithCache(nextMessages, classificationCache)
+      setMessages(nextMessages)
+      setClassificationCache(nextCache)
+      setClassificationOverrides((current) => Object.fromEntries(Object.entries(current).filter(([messageId, override]) => nextCache[messageId]?.fingerprint === override.fingerprint)))
+      setSelected((current) => nextMessages.find((message) => message.id === current?.id) ?? nextMessages[0] ?? null)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'No se pudo consultar Gmail.')
+    } finally {
+      setClassificationLoading(false)
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { void loadEmails() }, [folder])
+
+  const resultFor = (message: GmailMessage) => classificationCache[message.id] ?? { ...detectStatementEmail(message), classification: preliminaryClassification(detectStatementEmail(message)), fingerprint: '', analyzedAt: '', source: 'preliminar' as const }
+  const classificationFor = (message: GmailMessage) => {
+    const result = resultFor(message)
+    const override = classificationOverrides[message.id]
+    return override?.fingerprint === result.fingerprint ? override.classification : result.classification
+  }
+  const filteredMessages = messages.filter((message) => matchesEmailFilter(classificationFor(message), filter))
+  const visibleSelected = selected && filteredMessages.some((message) => message.id === selected.id) ? selected : filteredMessages[0] ?? null
+  const unreadCount = messages.filter((message) => message.unread).length
+  const attachmentCount = messages.reduce((total, message) => total + message.attachments.length, 0)
+  const pendingCount = messages.filter((message) => classificationFor(message) === 'REQUIERE_REVISION').length
+  const statementCount = messages.filter((message) => classificationFor(message) === 'ESTADO_DE_CUENTA').length
+  const setClassification = (message: GmailMessage, classification: EmailClassification) => {
+    const result = resultFor(message)
+    setClassificationOverrides((current) => ({ ...current, [message.id]: { classification, fingerprint: result.fingerprint } }))
+  }
+
+  return (
+    <>
+      <PageHeading eyebrow="Centro de comunicaciones" title="Correos" description="Identifica posibles estados de cuenta sin modificar los mensajes ni etiquetas originales.">
+        <button className="btn-primary" onClick={() => void loadEmails()} disabled={loading || !status?.connected}><RefreshCw size={15} className={loading ? 'animate-spin' : ''} />Sincronizar</button>
+      </PageHeading>
+      {error && <ErrorNotice text={error} onClose={() => setError(null)} />}
+      {status && !status.connected && !error && <div className="mb-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"><div className="flex items-center gap-2"><CircleHelp size={17} /><span>Gmail no está conectado. La conexión se administra únicamente desde Configuración.</span></div></div>}
+      <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <StatCard icon={Inbox} label="Mensajes por revisar" value={`${unreadCount}`} change={status?.connected ? 'Cuenta real' : 'Sin conectar'} tone="blue" />
+        <StatCard icon={Paperclip} label="Adjuntos recibidos" value={`${attachmentCount}`} change="En esta bandeja" tone="coral" />
+        <StatCard icon={FileCheck2} label="Estados confirmados" value={`${statementCount}`} change="Corrección local" tone="green" />
+        <StatCard icon={CircleHelp} label="Pendientes de verificar" value={`${pendingCount}`} change="Detección preliminar" tone="purple" />
+      </div>
+      <div className="panel grid min-h-[580px] grid-cols-1 overflow-hidden lg:grid-cols-[255px_minmax(350px,1fr)_minmax(390px,1.1fr)]">
+        <GmailFoldersReadOnly folder={folder} setFolder={setFolder} status={status} />
+        <EmailMessageList messages={messages} filteredMessages={filteredMessages} selected={visibleSelected} loading={loading} classificationLoading={classificationLoading} folder={folder} filter={filter} onFilterChange={setFilter} classificationFor={classificationFor} classificationOverrides={classificationOverrides} onSelect={setSelected} />
+        {visibleSelected ? <ClassifiedGmailMessageDetail mail={visibleSelected} classification={classificationFor(visibleSelected)} detection={resultFor(visibleSelected)} manual={classificationOverrides[visibleSelected.id]?.fingerprint === resultFor(visibleSelected).fingerprint} onClassificationChange={(classification) => setClassification(visibleSelected, classification)} onExtract={(attachment) => navigate(`/extraction?message=${encodeURIComponent(visibleSelected.id)}&attachment=${encodeURIComponent(attachment.id)}&filename=${encodeURIComponent(attachment.filename)}`)} /> : <EmptyMailDetail />}
+      </div>
+    </>
+  )
+}
+
+function matchesEmailFilter(classification: EmailClassification, filter: EmailFilter) {
+  return filter === 'all' || (filter === 'statements' && classification === 'ESTADO_DE_CUENTA') || (filter === 'pending' && classification === 'REQUIERE_REVISION') || (filter === 'other' && classification === 'NO_ES_ESTADO_DE_CUENTA')
+}
+
+function EmailMessageList({ messages, filteredMessages, selected, loading, classificationLoading, folder, filter, onFilterChange, classificationFor, classificationOverrides, onSelect }: { messages: GmailMessage[]; filteredMessages: GmailMessage[]; selected: GmailMessage | null; loading: boolean; classificationLoading: boolean; folder: MailFolder; filter: EmailFilter; onFilterChange: (filter: EmailFilter) => void; classificationFor: (message: GmailMessage) => EmailClassification; classificationOverrides: Record<string, LocalClassificationOverride>; onSelect: (message: GmailMessage) => void }) {
+  const filters: { value: EmailFilter; label: string }[] = [{ value: 'all', label: 'Todos' }, { value: 'statements', label: 'Estados de cuenta' }, { value: 'pending', label: 'Pendientes' }, { value: 'other', label: 'Otros' }]
+  return <div className="border-t border-slate-200 lg:border-l lg:border-t-0"><div className="border-b border-slate-200 px-4 py-4"><div className="flex items-center justify-between gap-3"><div><div className="font-semibold text-ink">{folderLabel(folder)}</div><div className="mt-0.5 text-[11px] text-slate-400">{loading ? 'Consultando Gmail...' : `${filteredMessages.length} de ${messages.length} mensajes`}</div></div><Filter size={16} className="text-slate-400" /></div><div className="mt-3 flex gap-1 overflow-x-auto rounded-lg bg-slate-100 p-1">{filters.map((item) => <button key={item.value} type="button" onClick={() => onFilterChange(item.value)} className={`whitespace-nowrap rounded-md px-2.5 py-1.5 text-[11px] font-bold transition ${filter === item.value ? 'bg-white text-ink shadow-sm' : 'text-slate-500 hover:text-ink'}`}>{item.label}</button>)}</div></div><div className="p-2">{loading && <div className="flex items-center justify-center gap-2 py-14 text-xs text-slate-400"><RefreshCw size={16} className="animate-spin" />Consultando Gmail</div>}{!loading && filteredMessages.length === 0 && <div className="px-5 py-14 text-center text-xs text-slate-400">No hay correos en este filtro.</div>}{!loading && filteredMessages.map((mail) => { const detection = detectStatementEmail(mail); const classification = classificationFor(mail); return <button key={mail.id} onClick={() => onSelect(mail)} className={`w-full rounded-xl border-b border-slate-100 p-3 text-left transition last:border-b-0 hover:bg-slate-50 ${selected?.id === mail.id ? 'bg-slate-50 ring-1 ring-slate-200' : ''}`}><div className="flex gap-3"><div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><span className={`truncate text-xs ${mail.unread ? 'font-bold text-ink' : 'font-semibold text-slate-600'}`}>{mail.sender}</span><span className="shrink-0 text-[10px] text-slate-400">{timeLabel(mail.receivedAt)}</span></div><div className={`mt-1 truncate text-xs ${mail.unread ? 'font-semibold text-slate-700' : 'text-slate-500'}`}>{mail.subject || '(Sin asunto)'}</div><div className="mt-1 flex items-center gap-2 truncate text-[11px] text-slate-400"><span className="truncate">{mail.snippet || 'Sin vista previa'}</span>{mail.attachments.length > 0 && <Paperclip size={12} className="shrink-0" />}</div><div className="mt-2 flex flex-wrap items-center gap-1.5"><ClassificationBadge classification={classification} manual={Boolean(classificationOverrides[mail.id])} />{detection.hasDocumentAttachment && <span className="rounded-full bg-slate-100 px-2 py-1 text-[9px] font-semibold text-slate-500">Adjunto documental</span>}</div></div>{mail.unread && <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-coral" />}</div></button> })}</div></div>
+}
+
+function ClassificationBadge({ classification, manual = false }: { classification: EmailClassification; manual?: boolean }) {
+  const tone: Record<EmailClassification, string> = { ESTADO_DE_CUENTA: 'bg-emerald-50 text-emerald-700', NO_ES_ESTADO_DE_CUENTA: 'bg-slate-100 text-slate-600', REQUIERE_REVISION: 'bg-amber-50 text-amber-700' }
+  return <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[9px] font-bold ${tone[classification]}`}><span className={`h-1.5 w-1.5 rounded-full ${classification === 'ESTADO_DE_CUENTA' ? 'bg-emerald-500' : classification === 'REQUIERE_REVISION' ? 'bg-amber-500' : 'bg-slate-400'}`} />{classificationLabel(classification)}{manual && ' · Manual'}</span>
+}
+
+function ClassifiedGmailMessageDetail({ mail, classification, detection, manual, onClassificationChange, onExtract }: { mail: GmailMessage; classification: EmailClassification; detection: ReturnType<typeof detectStatementEmail>; manual: boolean; onClassificationChange: (classification: EmailClassification) => void; onExtract: (attachment: GmailAttachment) => void }) {
+  const [preview, setPreview] = useState<GmailAttachment | null>(null)
+  return <div className="border-t border-slate-200 bg-slate-50/30 lg:border-l lg:border-t-0"><div className="flex items-center justify-between border-b border-slate-200 px-5 py-4"><div className="flex items-center gap-2 text-xs text-slate-500"><span className="ml-2">Gmail · Clasificación local</span></div><ClassificationBadge classification={classification} manual={manual} /></div><div className="p-5 sm:p-7"><div className="mb-6 flex items-start gap-3"><div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xs font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0"><h3 className="font-display text-base font-bold text-ink">{mail.subject || '(Sin asunto)'}</h3><div className="mt-1 text-xs text-slate-500"><span className="font-semibold text-slate-700">{mail.sender}</span> &lt;{mail.senderEmail}&gt;</div><div className="mt-1 text-[11px] text-slate-400">Para: {mail.to || 'Tu cuenta de Gmail'} · {timeLabel(mail.receivedAt)}</div></div></div><div className="mb-5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_220px]"><div className="rounded-xl border border-slate-200 bg-white p-3"><div className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">Clasificación manual</div><select value={classification} onChange={(event) => onClassificationChange(event.target.value as EmailClassification)} className="input"><option value="ESTADO_DE_CUENTA">ESTADO_DE_CUENTA</option><option value="NO_ES_ESTADO_DE_CUENTA">NO_ES_ESTADO_DE_CUENTA</option><option value="REQUIERE_REVISION">REQUIERE_REVISION</option></select><div className="mt-2 text-[11px] text-slate-500">Esta corrección solo se guarda en Nexora; no cambia las etiquetas originales.</div></div><div className="rounded-xl border border-violet-200 bg-violet-50/60 p-3"><div className="flex items-center gap-2 text-xs font-bold text-violet-800"><Sparkles size={14} />Gemini documental</div><div className="mt-1.5 text-[11px] leading-5 text-violet-700">Pendiente de backend para analizar el archivo adjunto.</div><button type="button" disabled className="btn-soft mt-2 w-full justify-center px-2 py-2 text-[11px]"><Sparkles size={13} />Verificar con Gemini</button></div></div>{detection.matched && <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-[11px] leading-5 text-amber-800"><strong>Detección preliminar:</strong> coincidencias en {detection.matchedTerms.join(', ')}. Esto no confirma que sea un estado de cuenta.</div>}{!detection.matched && <div className="mb-5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-[11px] leading-5 text-slate-500">No se encontraron términos preliminares de estado de cuenta. La clasificación documental por Gemini aún requiere backend.</div>}<div className="whitespace-pre-line text-sm leading-6 text-slate-600">{mail.body || mail.snippet || 'Este mensaje no contiene texto visible.'}</div>{mail.attachments.length > 0 && <div className="mt-8"><div className="mb-3 text-[10px] font-bold uppercase tracking-wider text-slate-400">{mail.attachments.length} archivo{mail.attachments.length === 1 ? '' : 's'} adjunto{mail.attachments.length === 1 ? '' : 's'}</div><div className="space-y-2">{mail.attachments.map((attachment) => <GmailAttachmentCard key={attachment.id} attachment={attachment} onPreview={() => setPreview(attachment)} onExtract={() => onExtract(attachment)} />)}</div></div>}</div>{preview && <AttachmentPreview messageId={mail.id} attachment={preview} onClose={() => setPreview(null)} />}</div>
 }
 
 function GmailFoldersReadOnly({ folder, setFolder, status }: { folder: MailFolder; setFolder: (value: MailFolder) => void; status: GmailStatus | null }) {
@@ -309,10 +474,16 @@ function DocumentCard({ doc, onOpen }: { doc: DocumentItem; onOpen: () => void }
 function Notice({ text, onClose }: { text: string; onClose: () => void }) { return <div className="mb-5 flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700"><div className="flex items-center gap-2"><CheckCircle2 size={17} />{text}</div><button onClick={onClose}><X size={16} /></button></div> }
 
 function ExtractionWorkspace() {
-  const navigate = useNavigate()
   const [mode, setMode] = useState<ExtractionMode>('manual')
+  const [geminiResult, setGeminiResult] = useState<GeminiExtractionResponse | null>(null)
+  return <div className="space-y-5"><ExtractionReviewWorkspace mode={mode} onModeChange={setMode} onGeminiResult={setGeminiResult} /><GeminiStatementSummary result={geminiResult} visible={mode === 'gemini'} /><EnterpriseExportSection mode={mode} /></div>
+}
+
+/*
+ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMode; onModeChange: (mode: ExtractionMode) => void }) {
+  const navigate = useNavigate()
   const [page, setPage] = useState(1)
-  const [saved, setSaved] = useState(false)
+  const [savedByMethod, setSavedByMethod] = useState<Record<ExtractionMode, boolean>>({ manual: false, gemini: false })
   const [extracting, setExtracting] = useState(false)
   const [progress, setProgress] = useState(0)
   const [activeTxn, setActiveTxn] = useState(0)
@@ -322,20 +493,19 @@ function ExtractionWorkspace() {
   const setTransactions: Dispatch<SetStateAction<Transaction[]>> = mode === 'manual' ? setManualTransactions : setGeminiTransactions
   const selectedIndex = Math.min(activeTxn, Math.max(0, transactions.length - 1))
   const current = transactions[selectedIndex]
+  const saved = savedByMethod[mode]
   const params = new URLSearchParams(window.location.search)
   const filename = params.get('filename') ?? 'Comprobante_transferencia_1842.pdf'
   const fileType = filename.split('.').pop()?.toUpperCase() ?? 'PDF'
 
   const setField = (field: keyof Transaction, value: string) => setTransactions((items) => items.map((item, index) => index === selectedIndex ? { ...item, [field]: value } : item))
   const selectMode = (nextMode: ExtractionMode) => {
-    setMode(nextMode)
+    onModeChange(nextMode)
     if (nextMode === 'gemini') {
-      setGeminiTransactions([
-        { ...baseTransactions[0], bank: 'Banco del Centro', sender: 'ACME Servicios, S.A.', beneficiary: 'Nexora Operaciones', amount: '48,250.00', currency: 'MXN', concept: 'Pago factura AC-1842', status: 'Revisar' },
-        { ...baseTransactions[1], bank: 'Banco del Centro', sender: 'Logística Norte', beneficiary: 'Nexora Operaciones', amount: '16,800.00', currency: 'MXN', concept: 'Servicios de abril', status: 'Revisar' },
-      ])
+      setGeminiTransactions([])
     }
   }
+  const setSaved = (value: boolean) => setSavedByMethod((currentState) => updateMethodValue(currentState, mode, value))
   const runGemini = () => {
     selectMode('gemini')
     if (extracting) return
@@ -361,6 +531,252 @@ function ExtractionWorkspace() {
   if (!params.get('message') || !params.get('attachment')) return <div className="space-y-4"><section className="sticky top-2 z-20 flex items-center justify-between rounded-xl border border-slate-200 bg-white/95 p-4 shadow-sm backdrop-blur"><div><div className="eyebrow">Workspace de extracción</div><div className="text-sm font-bold text-ink">Sin documento seleccionado</div></div><button type="button" onClick={() => navigate('/emails')} className="btn-soft px-3 py-2"><ArrowLeft size={14} />Volver a correos</button></section><div className="grid gap-4 xl:grid-cols-[minmax(0,1.22fr)_minmax(390px,1fr)]"><EmptyDocumentViewer /><section className="panel flex min-h-[560px] items-center justify-center p-8 text-center"><div><div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-100 text-slate-400"><FileSearch size={22} /></div><div className="mt-4 text-sm font-bold text-ink">Sin transacciones para revisar</div><div className="mt-1.5 max-w-xs text-xs leading-5 text-slate-400">Selecciona un PDF o imagen desde Correos y pulsa Extraer para comenzar.</div></div></section></div></div>
 
   return <div className="space-y-4"><section className="sticky top-2 z-20 rounded-xl border border-slate-200 bg-white/95 p-3 shadow-sm backdrop-blur sm:p-4"><div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between"><div className="flex min-w-0 items-center gap-3"><div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-coral/10 text-coral"><FileText size={18} /></div><div className="min-w-0"><div className="eyebrow">Revisión de comprobante · {fileType}</div><div className="truncate text-sm font-bold text-ink sm:text-base">{filename}</div></div><span className={`hidden shrink-0 rounded-full px-2.5 py-1 text-[10px] font-bold sm:inline-flex ${current.status === 'Revisar' ? 'bg-amber-50 text-amber-700' : 'bg-slate-100 text-slate-600'}`}>{current.status}</span></div><div className="flex flex-wrap items-center gap-2"><div className="flex rounded-lg bg-slate-100 p-1"><button type="button" onClick={() => selectMode('manual')} className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold ${mode === 'manual' ? 'bg-white text-ink shadow-sm' : 'text-slate-500'}`}><UserRound size={13} />Manual</button><button type="button" onClick={() => selectMode('gemini')} className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold ${mode === 'gemini' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><Sparkles size={13} />Gemini</button></div>{mode === 'gemini' && <button type="button" onClick={runGemini} disabled={extracting} className="btn-primary px-3 py-2"><Sparkles size={14} className={extracting ? 'animate-pulse' : ''} />{extracting ? `Extrayendo ${progress}%` : 'Extraer con Gemini'}</button>}<button type="button" onClick={() => navigate('/emails')} className="btn-soft px-3 py-2"><ArrowLeft size={14} />Volver</button><button type="button" onClick={() => setSaved(true)} className="btn-primary px-3 py-2"><Check size={14} />Guardar</button></div></div>{(extracting || saved) && <div className="mt-3 flex items-center gap-3 border-t border-slate-100 pt-3">{extracting ? <><div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-violet-500 transition-all" style={{ width: `${progress}%` }} /></div><span className="text-[11px] font-semibold text-violet-700">Procesando documento</span></> : <Notice text={`Resultado ${mode === 'gemini' ? 'Gemini' : 'manual'} guardado correctamente.`} onClose={() => setSaved(false)} />}</div>}</section><div className="grid min-h-0 gap-4 xl:h-[calc(100vh-226px)] xl:grid-cols-[minmax(0,1.22fr)_minmax(390px,1fr)]"><section className="min-h-[560px] min-w-0 overflow-hidden rounded-2xl"> <div className="h-full overflow-y-auto scrollbar-thin"><DocumentViewer page={page} setPage={setPage} /></div></section><section className="panel flex min-h-[560px] min-w-0 flex-col overflow-hidden"><div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-5"><div><div className="text-sm font-bold text-ink">Datos de la transacción</div><div className="mt-0.5 text-[11px] text-slate-400">{mode === 'gemini' ? 'Resultado editable de Gemini' : 'Captura manual'}</div></div><div className="flex items-center gap-1"><button type="button" disabled={selectedIndex === 0} onClick={() => setActiveTxn((value) => value - 1)} className="rounded border border-slate-200 p-1.5 text-slate-500 disabled:opacity-40"><ChevronLeft size={14} /></button><span className="px-1 text-[10px] font-bold text-slate-500">{selectedIndex + 1}/{transactions.length}</span><button type="button" disabled={selectedIndex === transactions.length - 1} onClick={() => setActiveTxn((value) => value + 1)} className="rounded border border-slate-200 p-1.5 text-slate-500 disabled:opacity-40"><ChevronRight size={14} /></button><button type="button" onClick={() => setTransactions([...transactions, { ...baseTransactions[0], id: `txn-${transactions.length + 1}`, status: 'Borrador' }])} className="ml-1 rounded border border-slate-200 p-1.5 text-slate-500 hover:text-ink"><Plus size={14} /></button></div></div><div className="min-h-0 flex-1 overflow-y-auto p-4 scrollbar-thin sm:p-5">{groups.map((group) => <div key={group.title} className="mb-5 last:mb-0"><div className="mb-3 flex items-center gap-2"><span className="eyebrow">{group.title}</span><div className="h-px flex-1 bg-slate-100" /></div><div className="grid gap-3 sm:grid-cols-2">{group.fields.map((field) => <Field key={field} field={field} value={current[field]} mode={mode} onChange={(value) => setField(field, value)} />)}</div></div>)}</div><div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-4 py-2.5 text-[11px] text-slate-400"><div className="flex items-center gap-1.5"><CircleHelp size={13} />{mode === 'gemini' ? 'Revisa los campos con confianza antes de guardar.' : 'Completa y corrige los campos antes de guardar.'}</div></div></section></div></div>
+}
+
+*/
+function ExtractionReviewWorkspace({ mode, onModeChange, onGeminiResult }: { mode: ExtractionMode; onModeChange: (mode: ExtractionMode) => void; onGeminiResult: (result: GeminiExtractionResponse | null) => void }) {
+  const navigate = useNavigate()
+  const [page, setPage] = useState(1)
+  const [savedByMethod, setSavedByMethod] = useState<Record<ExtractionMode, boolean>>({ manual: false, gemini: false })
+  const [extracting, setExtracting] = useState(false)
+  const [progress, setProgress] = useState(0)
+  const [activeTxn, setActiveTxn] = useState(0)
+  const [manualTransactions, setManualTransactions] = useState<Transaction[]>(baseTransactions)
+  const [geminiTransactions, setGeminiTransactions] = useState<Transaction[]>([])
+  const [geminiResultDocumentKey, setGeminiResultDocumentKey] = useState<string | null>(null)
+  const [geminiStatus, setGeminiStatus] = useState<GeminiStatus | null>(null)
+  const [geminiError, setGeminiError] = useState<string | null>(null)
+  const params = new URLSearchParams(window.location.search)
+  const messageId = params.get('message')
+  const attachmentId = params.get('attachment')
+  const filename = params.get('filename') ?? 'Comprobante_transferencia_1842.pdf'
+  const fileType = filename.split('.').pop()?.toUpperCase() ?? 'PDF'
+  const documentKey = messageId && attachmentId ? `${messageId}:${attachmentId}` : null
+  const transactions = mode === 'manual' ? manualTransactions : geminiResultDocumentKey === documentKey ? geminiTransactions : []
+  const setTransactions: Dispatch<SetStateAction<Transaction[]>> = mode === 'manual' ? setManualTransactions : (value) => {
+    if (typeof value !== 'function') return
+    setGeminiTransactions(value)
+  }
+  const selectedIndex = Math.min(activeTxn, Math.max(0, transactions.length - 1))
+  const current = transactions[selectedIndex] ?? { id: 'empty', date: '', bank: '', sender: '', beneficiary: '', origin: '', destination: '', reference: '', concept: '', operation: '', amount: '', currency: '', status: 'Borrador' as TransactionStatus }
+  const saved = savedByMethod[mode]
+  const groups: { title: string; fields: (keyof Transaction)[] }[] = [
+    { title: 'Operación', fields: ['date', 'bank', 'operation', 'amount', 'currency', 'status'] },
+    { title: 'Participantes y cuentas', fields: ['sender', 'beneficiary', 'origin', 'destination'] },
+    { title: 'Trazabilidad', fields: ['reference', 'concept'] },
+  ]
+
+  useEffect(() => {
+    let active = true
+    setGeminiTransactions([])
+    setGeminiResultDocumentKey(null)
+    setGeminiError(null)
+    onGeminiResult(null)
+    setExtracting(false)
+    setProgress(0)
+    setActiveTxn(0)
+    if (!documentKey) {
+      setGeminiStatus(null)
+      return () => { active = false }
+    }
+    void geminiApi.status().then((status) => {
+      if (active) setGeminiStatus(status)
+    }).catch((error: unknown) => {
+      if (active) setGeminiError(error instanceof Error ? `Extracción IA no disponible: ${error.message}` : 'Extracción IA no disponible.')
+    })
+    return () => { active = false }
+  }, [documentKey, onGeminiResult])
+
+  const setField = (field: keyof Transaction, value: string) => setTransactions((items) => items.map((item, index) => index === selectedIndex ? { ...item, [field]: value } : item))
+  const selectMode = (nextMode: ExtractionMode) => onModeChange(nextMode)
+  const setSaved = (value: boolean) => setSavedByMethod((currentState) => updateMethodValue(currentState, mode, value))
+  const runGemini = async () => {
+    if (extracting || !messageId || !attachmentId) return
+    onModeChange('gemini')
+    setGeminiError(null)
+    setGeminiTransactions([])
+    setGeminiResultDocumentKey(null)
+    onGeminiResult(null)
+    setActiveTxn(0)
+    setExtracting(true)
+    setProgress(10)
+    try {
+      const status = geminiStatus ?? await geminiApi.status()
+      setGeminiStatus(status)
+      if (!status.enabled) throw new Error('Gemini no está conectado o habilitado en FastAPI.')
+      setProgress(25)
+      const result = await geminiApi.extract(messageId, attachmentId)
+      setGeminiTransactions(result.transactions)
+      setGeminiResultDocumentKey(documentKey)
+      onGeminiResult(result)
+      setProgress(100)
+    } catch (error: unknown) {
+      setGeminiTransactions([])
+      setProgress(0)
+      setGeminiError(error instanceof Error ? `Extracción IA no disponible: ${error.message}` : 'Extracción IA no disponible.')
+    } finally {
+      setExtracting(false)
+    }
+  }
+
+  if (!messageId || !attachmentId) return <div className="space-y-4"><section className="sticky top-2 z-20 flex items-center justify-between rounded-xl border border-slate-200 bg-white/95 p-4 shadow-sm backdrop-blur"><div><div className="eyebrow">Workspace de extracción</div><div className="text-sm font-bold text-ink">Sin documento seleccionado</div></div><button type="button" onClick={() => navigate('/emails')} className="btn-soft px-3 py-2"><ArrowLeft size={14} />Volver a correos</button></section><div className="grid gap-4 xl:grid-cols-[minmax(0,1.22fr)_minmax(390px,1fr)]"><EmptyDocumentViewer /><section className="panel flex min-h-[560px] items-center justify-center p-8 text-center"><div><div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-100 text-slate-400"><FileSearch size={22} /></div><div className="mt-4 text-sm font-bold text-ink">Sin transacciones para revisar</div><div className="mt-1.5 max-w-xs text-xs leading-5 text-slate-400">Selecciona un PDF o imagen desde Correos y pulsa Extraer para comenzar.</div></div></section></div></div>
+
+  return <div className="space-y-4"><section className="sticky top-2 z-20 rounded-xl border border-slate-200 bg-white/95 p-3 shadow-sm backdrop-blur sm:p-4"><div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between"><div className="flex min-w-0 items-center gap-3"><div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-coral/10 text-coral"><FileText size={18} /></div><div className="min-w-0"><div className="eyebrow">Revisión de comprobante · {fileType}</div><div className="truncate text-sm font-bold text-ink sm:text-base">{filename}</div></div><span className="hidden shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-bold text-slate-600 sm:inline-flex">{transactions.length === 0 ? 'Sin extracción' : current.status}</span></div><div className="flex flex-wrap items-center gap-2"><div className="flex rounded-lg bg-slate-100 p-1"><button type="button" onClick={() => selectMode('manual')} className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold ${mode === 'manual' ? 'bg-white text-ink shadow-sm' : 'text-slate-500'}`}><UserRound size={13} />Manual</button><button type="button" onClick={() => selectMode('gemini')} className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold ${mode === 'gemini' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><Sparkles size={13} />Gemini</button></div>{mode === 'gemini' && <button type="button" onClick={() => void runGemini()} disabled={extracting || geminiStatus?.enabled !== true} className="btn-primary px-3 py-2"><Sparkles size={14} className={extracting ? 'animate-pulse' : ''} />{extracting ? `Extrayendo ${progress}%` : geminiStatus?.enabled === true ? 'Extraer con Gemini' : 'Extracción IA no disponible'}</button>}<button type="button" onClick={() => navigate('/emails')} className="btn-soft px-3 py-2"><ArrowLeft size={14} />Volver</button><button type="button" onClick={() => setSaved(true)} className="btn-primary px-3 py-2"><Check size={14} />Guardar</button></div></div>{mode === 'gemini' && !geminiStatus?.enabled && <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">{geminiError ?? 'Consultando disponibilidad de Gemini en FastAPI. La extracción no generará datos hasta que esté habilitado.'}</div>}{geminiError && geminiStatus?.enabled === true && <div className="mt-3"><ErrorNotice text={geminiError} onClose={() => setGeminiError(null)} /></div>}{extracting && <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-violet-500 transition-all" style={{ width: `${progress}%` }} /></div>}{saved && <div className="mt-3"><Notice text={`Resultado ${mode === 'gemini' ? 'Gemini' : 'manual'} guardado correctamente.`} onClose={() => setSaved(false)} /></div>}</section><div className="grid min-h-0 gap-4 xl:h-[calc(100vh-226px)] xl:grid-cols-[minmax(0,1.22fr)_minmax(390px,1fr)]"><section className="min-h-[560px] min-w-0 overflow-hidden rounded-2xl"><div className="h-full overflow-y-auto scrollbar-thin"><DocumentViewer page={page} setPage={setPage} /></div></section><section className="panel flex min-h-[560px] min-w-0 flex-col overflow-hidden"><div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-5"><div><div className="text-sm font-bold text-ink">Datos de la transacción</div><div className="mt-0.5 text-[11px] text-slate-400">{mode === 'gemini' ? 'Resultado real del backend Gemini' : 'Captura manual'}</div></div><div className="flex items-center gap-1"><button type="button" disabled={transactions.length === 0 || selectedIndex === 0} onClick={() => setActiveTxn((value) => value - 1)} className="rounded border border-slate-200 p-1.5 text-slate-500 disabled:opacity-40"><ChevronLeft size={14} /></button><span className="px-1 text-[10px] font-bold text-slate-500">{transactions.length === 0 ? '0/0' : `${selectedIndex + 1}/${transactions.length}`}</span><button type="button" disabled={transactions.length === 0 || selectedIndex === transactions.length - 1} onClick={() => setActiveTxn((value) => value + 1)} className="rounded border border-slate-200 p-1.5 text-slate-500 disabled:opacity-40"><ChevronRight size={14} /></button><button type="button" onClick={() => setTransactions([...transactions, { ...baseTransactions[0], id: `${mode}-${transactions.length + 1}`, status: 'Borrador' }])} className="ml-1 rounded border border-slate-200 p-1.5 text-slate-500 hover:text-ink"><Plus size={14} /></button></div></div>{mode === 'gemini' && transactions.length === 0 && !extracting && <div className="border-b border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">Pulsa <strong>Extraer con Gemini</strong> cuando la IA esté disponible. No se muestran datos de ejemplo.</div>}<div className="min-h-0 flex-1 overflow-y-auto p-4 scrollbar-thin sm:p-5">{groups.map((group) => <div key={group.title} className="mb-5 last:mb-0"><div className="mb-3 flex items-center gap-2"><span className="eyebrow">{group.title}</span><div className="h-px flex-1 bg-slate-100" /></div><div className="grid gap-3 sm:grid-cols-2">{group.fields.map((field) => <Field key={field} field={field} value={current[field]} mode={mode} onChange={(value) => setField(field, value)} />)}</div></div>)}</div><div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-4 py-2.5 text-[11px] text-slate-400"><div className="flex items-center gap-1.5"><CircleHelp size={13} />{mode === 'gemini' ? `${transactions.length} movimiento${transactions.length === 1 ? '' : 's'} devuelto${transactions.length === 1 ? '' : 's'} por el backend.` : 'Completa y corrige los campos antes de guardar.'}</div></div></section></div></div>
+}
+
+function GeminiStatementSummary({ result, visible }: { result: GeminiExtractionResponse | null; visible: boolean }) {
+  if (!visible || !result) return null
+  const statement = result.statement
+  const balanceTone = result.balanceValidation.consistent === true ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : result.balanceValidation.consistent === false ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-slate-200 bg-slate-50 text-slate-600'
+  const fields = [
+    ['Banco', statement.bank],
+    ['Titular', statement.account_holder],
+    ['Cuenta', statement.account_number],
+    ['Periodo', statement.statement_period],
+    ['Moneda', statement.currency],
+    ['Saldo inicial', statement.opening_balance],
+    ['Abonos', statement.total_credits],
+    ['Cargos', statement.total_debits],
+    ['Saldo final', statement.closing_balance],
+  ]
+  return <section className="panel overflow-hidden"><div className="border-b border-slate-200 bg-violet-50/50 p-5 sm:p-6"><div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start"><div><div className="eyebrow mb-2 text-violet-700">Resumen del estado de cuenta</div><h2 className="font-display text-xl font-extrabold tracking-tight text-ink">Datos documentales extraídos</h2><p className="mt-1.5 text-sm text-slate-500">Gemini · {result.model} · {result.transactions.length} movimientos visibles</p></div><span className="rounded-full bg-white px-3 py-2 text-xs font-semibold text-violet-700">{result.filename}</span></div></div><div className="grid gap-5 p-5 sm:p-6 lg:grid-cols-[minmax(0,1fr)_minmax(280px,.7fr)]"><dl className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{fields.map(([label, value]) => <div key={label} className="rounded-lg border border-slate-100 bg-slate-50/60 p-3"><dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{label}</dt><dd className="mt-1 break-words text-sm font-semibold text-ink">{value || 'No identificado'}</dd></div>)}</dl><div className={`rounded-xl border p-4 ${balanceTone}`}><div className="text-[10px] font-bold uppercase tracking-wider">Validación de saldos</div><div className="mt-2 text-sm font-bold">{result.balanceValidation.message}</div>{result.balanceValidation.difference && <div className="mt-1 text-xs">Diferencia: {result.balanceValidation.difference}</div>}{result.warnings.length > 0 && <div className="mt-4 border-t border-current/15 pt-3"><div className="text-[10px] font-bold uppercase tracking-wider">Advertencias</div><ul className="mt-2 space-y-1 text-xs">{result.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>}</div></div></section>
+}
+
+type EnterpriseRecordDraft = {
+  Sucursal: string
+  Articulo: string
+  Saldo: string
+  Clave: string
+}
+
+const initialEnterpriseRecords: EnterpriseRecordDraft[] = [
+  { Sucursal: '3102', Articulo: '10000453', Saldo: '10.0', Clave: 'H' },
+  { Sucursal: '3102', Articulo: '10000453', Saldo: '2.0', Clave: 'S' },
+  { Sucursal: '3102', Articulo: '10000451', Saldo: '5.0', Clave: 'H' },
+  { Sucursal: '3102', Articulo: '10000451', Saldo: '1.0', Clave: 'S' },
+]
+
+/*
+function EnterpriseExportSection({ mode }: { mode: ExtractionMode }) {
+  const [recordsByMethod, setRecordsByMethod] = useState<Record<ExtractionMode, EnterpriseRecordDraft[]>>({
+    manual: initialEnterpriseRecords,
+    gemini: initialEnterpriseRecords.map((record) => ({ ...record })),
+  })
+  const [cargaInicialByMethod, setCargaInicialByMethod] = useState<Record<ExtractionMode, boolean>>({ manual: false, gemini: false })
+  const [copiedByMethod, setCopiedByMethod] = useState<Record<ExtractionMode, boolean>>({ manual: false, gemini: false })
+  const records = recordsByMethod[mode]
+  const cargaInicial = cargaInicialByMethod[mode]
+  const copied = copiedByMethod[mode]
+  const parsedRecords: SaveDataRecord[] = records.map((record) => ({
+    Sucursal: Number(record.Sucursal),
+    Articulo: record.Articulo,
+    Saldo: Number(record.Saldo),
+    Clave: record.Clave,
+  }))
+  const validationErrors = validateSaveDataDocument({ CargaInicial: cargaInicial, Saldos: parsedRecords })
+  const visibleValidationErrors = records.length === 0 ? ['Agrega al menos un registro en Saldos.'] : validationErrors
+  const isValid = visibleValidationErrors.length === 0
+  const preview = formatSaveDataPayload(buildSaveDataPayload(parsedRecords, cargaInicial))
+
+  const setRecords = (updater: SetStateAction<EnterpriseRecordDraft[]>) => {
+    setRecordsByMethod((current) => {
+      const nextRecords = typeof updater === 'function' ? updater(current[mode]) : updater
+      return updateMethodValue(current, mode, nextRecords)
+    })
+  }
+  const updateRecord = (index: number, field: keyof EnterpriseRecordDraft, value: string) => {
+    setRecords((current) => current.map((record, recordIndex) => recordIndex === index ? { ...record, [field]: value } : record))
+    setCopiedByMethod((current) => updateMethodValue(current, mode, false))
+  }
+  const addRecord = () => setRecords((current) => [...current, { Sucursal: '', Articulo: '', Saldo: '', Clave: '' }])
+  const removeRecord = (index: number) => setRecords((current) => current.filter((_, recordIndex) => recordIndex !== index))
+  const updateCargaInicial = (value: boolean) => setCargaInicialByMethod((current) => updateMethodValue(current, mode, value))
+  const copyJson = async () => {
+    if (!isValid) return
+    try {
+      await navigator.clipboard.writeText(preview)
+      setCopiedByMethod((current) => updateMethodValue(current, mode, true))
+    } catch {
+      setCopiedByMethod((current) => updateMethodValue(current, mode, false))
+    }
+  }
+  const downloadJson = () => {
+    if (!isValid) return
+    const url = URL.createObjectURL(new Blob([preview], { type: 'application/json' }))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = 'nexora-savedata.json'
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  return <section className="panel overflow-hidden"><div className="border-b border-slate-200 bg-slate-50/60 p-5 sm:p-6"><div className="flex flex-col justify-between gap-4 md:flex-row md:items-start"><div><div className="eyebrow mb-2">Integración empresarial · {mode === 'manual' ? 'Manual' : 'Gemini'}</div><h2 className="font-display text-xl font-extrabold tracking-tight text-ink">Exportación empresarial</h2><p className="mt-1.5 max-w-2xl text-sm text-slate-500">Prepara los registros para SaveData. Estos campos son independientes de los datos bancarios extraídos y requieren revisión explícita.</p></div><div className="flex shrink-0 items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700"><CircleHelp size={14} />Pendiente de conectar</div></div></div><div className="grid gap-5 p-5 sm:p-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(360px,.8fr)]"><div><div className="mb-3 flex items-center justify-between gap-3"><div><h3 className="text-sm font-bold text-ink">Registros validados · {mode === 'manual' ? 'Manual' : 'Gemini'}</h3><p className="mt-1 text-[11px] text-slate-400">Ejemplo editable. No se deriva automáticamente del estado de cuenta.</p></div><button type="button" onClick={addRecord} className="btn-soft px-3 py-2 text-xs"><Plus size={14} />Agregar registro</button></div><div className="space-y-3">{records.map((record, index) => <div key={index} className="rounded-xl border border-slate-200 bg-white p-3"><div className="mb-3 flex items-center justify-between"><span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Registro {index + 1}</span><button type="button" onClick={() => removeRecord(index)} className="rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600" aria-label={`Eliminar registro ${index + 1}`}><Trash2 size={14} /></button></div><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><EnterpriseField label="Sucursal" value={record.Sucursal} type="number" onChange={(value) => updateRecord(index, 'Sucursal', value)} /><EnterpriseField label="Articulo" value={record.Articulo} onChange={(value) => updateRecord(index, 'Articulo', value)} /><EnterpriseField label="Saldo" value={record.Saldo} type="number" step="any" onChange={(value) => updateRecord(index, 'Saldo', value)} /><EnterpriseField label="Clave" value={record.Clave} onChange={(value) => updateRecord(index, 'Clave', value)} /></div></div>)}{records.length === 0 && <div className="rounded-xl border border-dashed border-slate-300 p-8 text-center text-xs text-slate-400">Agrega un registro para construir Saldos.</div>}</div><label className="mt-4 flex items-center gap-2 text-xs font-semibold text-slate-600"><input type="checkbox" checked={cargaInicial} onChange={(event) => updateCargaInicial(event.target.checked)} className="h-4 w-4 rounded border-slate-300 text-coral focus:ring-coral" />CargaInicial</label>{visibleValidationErrors.length > 0 && <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700"><div className="mb-1 font-bold">Revisa los campos obligatorios:</div><div className="space-y-1">{visibleValidationErrors.map((error) => <div key={error}>{error}</div>)}</div></div>}</div><div className="min-w-0"><div className="mb-3 flex items-center justify-between"><div><h3 className="text-sm font-bold text-ink">Vista previa del JSON · {mode === 'manual' ? 'Manual' : 'Gemini'}</h3><p className="mt-1 text-[11px] text-slate-400">Cuerpo listo para el futuro backend FastAPI.</p></div><Code2 size={17} className="text-slate-400" /></div><pre className="scrollbar-thin min-h-[300px] overflow-auto rounded-xl bg-ink p-4 text-[11px] leading-5 text-slate-200">{preview}</pre><div className="mt-3 flex flex-wrap gap-2"><button type="button" onClick={() => void copyJson()} disabled={!isValid} className="btn-primary px-3 py-2 text-xs"><Copy size={14} />{copied ? 'JSON copiado' : 'Copiar JSON'}</button><button type="button" onClick={downloadJson} disabled={!isValid} className="btn-soft px-3 py-2 text-xs"><ArrowDownToLine size={14} />Descargar JSON</button></div><div className="mt-4 flex items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-[11px] leading-5 text-slate-500"><ShieldCheck size={15} className="mt-0.5 shrink-0 text-emerald-600" /><span><strong className="text-slate-700">Integración:</strong> pendiente de conectar. El botón Enviar al sistema permanecerá deshabilitado hasta contar con un backend seguro.</span></div><button type="button" disabled className="btn-soft mt-3 w-full justify-center text-xs"><Send size={14} />Enviar al sistema</button></div></div></section>
+}
+
+*/
+function EnterpriseExportSection({ mode }: { mode: ExtractionMode }) {
+  const [recordsByMethod, setRecordsByMethod] = useState<Record<ExtractionMode, EnterpriseRecordDraft[]>>({
+    manual: initialEnterpriseRecords,
+    gemini: initialEnterpriseRecords.map((record) => ({ ...record })),
+  })
+  const [cargaInicialByMethod, setCargaInicialByMethod] = useState<Record<ExtractionMode, boolean>>({ manual: false, gemini: false })
+  const [copiedByMethod, setCopiedByMethod] = useState<Record<ExtractionMode, boolean>>({ manual: false, gemini: false })
+  const [attempt, setAttempt] = useState<SaveDataAttempt>(createInitialSaveDataAttempt)
+  const records = recordsByMethod[mode]
+  const cargaInicial = cargaInicialByMethod[mode]
+  const copied = copiedByMethod[mode]
+  const parsedRecords: SaveDataRecord[] = records.map((record) => ({ Sucursal: Number(record.Sucursal), Articulo: record.Articulo, Saldo: Number(record.Saldo), Clave: record.Clave }))
+  const validationErrors = validateSaveDataDocument({ CargaInicial: cargaInicial, Saldos: parsedRecords })
+  const visibleValidationErrors = records.length === 0 ? ['Agrega al menos un registro en Saldos.'] : validationErrors
+  const isValid = visibleValidationErrors.length === 0
+  const preview = formatSaveDataPayload(buildSaveDataPayload(parsedRecords, cargaInicial))
+  const saveDataBackendReady = false
+  const canSend = isValid && saveDataBackendReady
+
+  const setRecords = (updater: SetStateAction<EnterpriseRecordDraft[]>) => {
+    setRecordsByMethod((current) => {
+      const nextRecords = typeof updater === 'function' ? updater(current[mode]) : updater
+      return updateMethodValue(current, mode, nextRecords)
+    })
+  }
+  const updateRecord = (index: number, field: keyof EnterpriseRecordDraft, value: string) => {
+    setRecords((current) => current.map((record, recordIndex) => recordIndex === index ? { ...record, [field]: value } : record))
+    setCopiedByMethod((current) => updateMethodValue(current, mode, false))
+  }
+  const addRecord = () => setRecords((current) => [...current, { Sucursal: '', Articulo: '', Saldo: '', Clave: '' }])
+  const removeRecord = (index: number) => setRecords((current) => current.filter((_, recordIndex) => recordIndex !== index))
+  const updateCargaInicial = (value: boolean) => setCargaInicialByMethod((current) => updateMethodValue(current, mode, value))
+  const copyJson = async () => {
+    if (!isValid) return
+    try {
+      await navigator.clipboard.writeText(preview)
+      setCopiedByMethod((current) => updateMethodValue(current, mode, true))
+    } catch {
+      setCopiedByMethod((current) => updateMethodValue(current, mode, false))
+    }
+  }
+  const downloadJson = () => {
+    if (!isValid) return
+    const url = URL.createObjectURL(new Blob([preview], { type: 'application/json' }))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `nexora-savedata-${mode}.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  return <section className="panel overflow-hidden"><div className="border-b border-slate-200 bg-slate-50/60 p-5 sm:p-6"><div className="flex flex-col justify-between gap-4 md:flex-row md:items-start"><div><div className="eyebrow mb-2">Integración empresarial · {mode === 'manual' ? 'Manual' : 'Gemini'}</div><h2 className="font-display text-xl font-extrabold tracking-tight text-ink">Exportación empresarial</h2><p className="mt-1.5 max-w-2xl text-sm text-slate-500">Prepara los registros para SaveData. Estos campos son independientes de los datos bancarios extraídos y requieren revisión explícita.</p></div><div className="flex shrink-0 items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700"><CircleHelp size={14} />Pendiente de conectar</div></div></div><div className="grid gap-5 p-5 sm:p-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(360px,.8fr)]"><div><div className="mb-3 flex items-center justify-between gap-3"><div><h3 className="text-sm font-bold text-ink">Registros validados · {mode === 'manual' ? 'Manual' : 'Gemini'}</h3><p className="mt-1 text-[11px] text-slate-400">Ejemplo editable. No se deriva automáticamente del estado de cuenta.</p></div><button type="button" onClick={addRecord} className="btn-soft px-3 py-2 text-xs"><Plus size={14} />Agregar registro</button></div><div className="space-y-3">{records.map((record, index) => <div key={index} className="rounded-xl border border-slate-200 bg-white p-3"><div className="mb-3 flex items-center justify-between"><span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Registro {index + 1}</span><button type="button" onClick={() => removeRecord(index)} className="rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600" aria-label={`Eliminar registro ${index + 1}`}><Trash2 size={14} /></button></div><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><EnterpriseField label="Sucursal" value={record.Sucursal} type="number" onChange={(value) => updateRecord(index, 'Sucursal', value)} /><EnterpriseField label="Articulo" value={record.Articulo} onChange={(value) => updateRecord(index, 'Articulo', value)} /><EnterpriseField label="Saldo" value={record.Saldo} type="number" step="any" onChange={(value) => updateRecord(index, 'Saldo', value)} /><EnterpriseField label="Clave" value={record.Clave} onChange={(value) => updateRecord(index, 'Clave', value)} /></div></div>)}{records.length === 0 && <div className="rounded-xl border border-dashed border-slate-300 p-8 text-center text-xs text-slate-400">Agrega un registro para construir Saldos.</div>}</div><label className="mt-4 flex items-center gap-2 text-xs font-semibold text-slate-600"><input type="checkbox" checked={cargaInicial} onChange={(event) => updateCargaInicial(event.target.checked)} className="h-4 w-4 rounded border-slate-300 text-coral focus:ring-coral" />CargaInicial</label>{visibleValidationErrors.length > 0 && <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700"><div className="mb-1 font-bold">Revisa los campos obligatorios:</div><div className="space-y-1">{visibleValidationErrors.map((error) => <div key={error}>{error}</div>)}</div></div>}</div><div className="min-w-0"><div className="mb-3 flex items-center justify-between"><div><h3 className="text-sm font-bold text-ink">Vista previa del JSON · {mode === 'manual' ? 'Manual' : 'Gemini'}</h3><p className="mt-1 text-[11px] text-slate-400">Cuerpo listo para el futuro backend FastAPI.</p></div><Code2 size={17} className="text-slate-400" /></div><pre className="scrollbar-thin min-h-[300px] overflow-auto rounded-xl bg-ink p-4 text-[11px] leading-5 text-slate-200">{preview}</pre><div className="mt-3 flex flex-wrap gap-2"><button type="button" onClick={() => void copyJson()} disabled={!isValid} className="btn-primary px-3 py-2 text-xs"><Copy size={14} />{copied ? 'JSON copiado' : 'Copiar JSON'}</button><button type="button" onClick={downloadJson} disabled={!isValid} className="btn-soft px-3 py-2 text-xs"><ArrowDownToLine size={14} />Descargar JSON</button></div><SaveDataAttemptPanel attempt={attempt} /><div className="mt-4 flex items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-[11px] leading-5 text-slate-500"><ShieldCheck size={15} className="mt-0.5 shrink-0 text-emerald-600" /><span><strong className="text-slate-700">Envío real bloqueado:</strong> requiere JSON válido, backend FastAPI disponible y autorización explícita para el entorno de pruebas.</span></div><button type="button" disabled={!canSend} className="btn-soft mt-3 w-full justify-center text-xs"><Send size={14} />Enviar al sistema</button></div></div></section>
+}
+
+function EnterpriseField({ label, value, type = 'text', step, onChange }: { label: string; value: string; type?: 'text' | 'number'; step?: string; onChange: (value: string) => void }) {
+  return <label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">{label}</span><input type={type} step={step} value={value} onChange={(event) => onChange(event.target.value)} className="input" /></label>
+}
+
+function SaveDataAttemptPanel({ attempt }: { attempt: SaveDataAttempt }) {
+  const statusLabel = { idle: 'Pendiente', sending: 'Enviando', success: 'Éxito', error: 'Error' }[attempt.status]
+  const statusClass = { idle: 'bg-slate-100 text-slate-600', sending: 'bg-blue-50 text-blue-700', success: 'bg-emerald-50 text-emerald-700', error: 'bg-red-50 text-red-700' }[attempt.status]
+  const attemptedAt = attempt.attemptedAt ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'medium' }).format(new Date(attempt.attemptedAt)) : '—'
+  return <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3"><div className="mb-3 flex items-center justify-between gap-3"><div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Resultado del intento</div><span className={`rounded-full px-2 py-1 text-[10px] font-bold ${statusClass}`}>{statusLabel}</span></div><dl className="grid gap-2 text-xs sm:grid-cols-3"><div><dt className="text-[10px] font-semibold text-slate-400">Código HTTP</dt><dd className="mt-0.5 font-bold text-ink">{attempt.httpStatus ?? '—'}</dd></div><div><dt className="text-[10px] font-semibold text-slate-400">Fecha y hora</dt><dd className="mt-0.5 font-semibold text-slate-600">{attemptedAt}</dd></div><div className="sm:col-span-3"><dt className="text-[10px] font-semibold text-slate-400">Respuesta del servidor</dt><dd className="mt-0.5 break-words text-slate-600">{attempt.message}</dd></div></dl></div>
 }
 
 function ExtractionWithProgress() {
@@ -393,27 +809,21 @@ function ExtractionPage({ onModeChange }: { onModeChange?: (mode: ExtractionMode
   const [saved, setSaved] = useState(false)
   const [activeTxn, setActiveTxn] = useState(0)
   const [manualTransactions, setManualTransactions] = useState<Transaction[]>(baseTransactions)
-  const [geminiTransactions, setGeminiTransactions] = useState<Transaction[]>(baseTransactions.map((item) => ({ ...item, amount: '48,250.00', status: 'Revisar' as TransactionStatus })))
+  const [geminiTransactions, setGeminiTransactions] = useState<Transaction[]>([])
   const transactions = mode === 'manual' ? manualTransactions : geminiTransactions
   const setTransactions: Dispatch<SetStateAction<Transaction[]>> = mode === 'manual' ? setManualTransactions : setGeminiTransactions
   const selectedIndex = Math.min(activeTxn, Math.max(0, transactions.length - 1))
   const current = transactions[selectedIndex]
   const setField = (field: keyof Transaction, value: string) => setTransactions((items) => items.map((item, index) => index === selectedIndex ? { ...item, [field]: value } : item))
-  const runGemini = () => {
-    setGeminiTransactions([
-      { ...baseTransactions[0], bank: 'Banco del Centro', sender: 'ACME Servicios, S.A.', beneficiary: 'Nexora Operaciones', amount: '48,250.00', currency: 'MXN', concept: 'Pago factura AC-1842', status: 'Revisar' },
-      { ...baseTransactions[1], bank: 'Banco del Centro', sender: 'Logística Norte', beneficiary: 'Nexora Operaciones', amount: '16,800.00', currency: 'MXN', concept: 'Servicios de abril', status: 'Revisar' },
-    ])
-    setMode('gemini')
-  }
+  const runGemini = () => setMode('gemini')
   return <><PageHeading eyebrow="Revisión de comprobantes" title="Extracción" description="Revisa los datos del documento y guarda una versión independiente por método."><button className="btn-soft" onClick={() => navigate('/emails')}><ArrowLeft size={15} />Volver a correos</button><button className="btn-primary" onClick={() => setSaved(true)}><Check size={15} />Guardar resultado</button></PageHeading>{saved && <Notice text={`Resultado ${mode === 'gemini' ? 'Gemini' : 'manual'} guardado en Historial.`} onClose={() => setSaved(false)} />}<div className="mb-5 flex flex-col gap-3 rounded-xl border border-blue-100 bg-blue-50/60 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-center gap-3"><div className="flex h-8 w-8 items-center justify-center rounded-lg bg-white text-blue-600"><FileText size={16} /></div><div><div className="text-xs font-bold text-ink">Comprobante_transferencia_1842.pdf</div><div className="text-[11px] text-slate-500">PDF · 1 página · Última actualización hoy, 09:42</div></div></div><div className="flex items-center gap-2 text-[11px] text-blue-700"><ShieldCheck size={14} />Los métodos se guardan por separado</div></div><div className="grid gap-5 xl:grid-cols-[minmax(440px,1fr)_minmax(480px,1.08fr)]"><DocumentViewer page={page} setPage={setPage} /><div className="panel min-h-[650px] overflow-hidden"><div className="flex flex-col justify-between gap-3 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:px-5"><div><div className="font-semibold text-ink">Datos de la transacción</div><div className="mt-1 text-[11px] text-slate-400">{mode === 'gemini' ? 'Extracción asistida por Gemini' : 'Captura manual'}</div></div><div className="flex rounded-lg bg-slate-100 p-1"><button onClick={() => setMode('manual')} className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold ${mode === 'manual' ? 'bg-white text-ink shadow-sm' : 'text-slate-500'}`}><UserRound size={13} />Manual</button><button onClick={runGemini} className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold ${mode === 'gemini' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><Sparkles size={13} />Gemini</button></div></div>{mode === 'gemini' && <div className="mx-5 mt-4 flex items-center justify-between rounded-lg border border-violet-100 bg-violet-50/70 px-3 py-2.5"><div className="flex items-center gap-2 text-xs text-violet-800"><Sparkles size={14} /><span>Extracción completada en 2.4s</span></div><span className="rounded-full bg-white px-2 py-1 text-[10px] font-bold text-violet-700">87% confianza global</span></div>}<div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><div className="flex items-center gap-2"><span className="text-xs font-bold text-ink">Movimiento {activeTxn + 1} de {transactions.length}</span><span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${current.status === 'Revisar' ? 'bg-amber-50 text-amber-700' : 'bg-slate-100 text-slate-500'}`}>{current.status}</span></div><div className="flex gap-1"><button disabled={activeTxn === 0} onClick={() => setActiveTxn((value) => value - 1)} className="rounded border border-slate-200 p-1.5 text-slate-500 disabled:opacity-40"><ChevronLeft size={14} /></button><button disabled={activeTxn === transactions.length - 1} onClick={() => setActiveTxn((value) => value + 1)} className="rounded border border-slate-200 p-1.5 text-slate-500 disabled:opacity-40"><ChevronRight size={14} /></button><button onClick={() => setTransactions([...transactions, { ...baseTransactions[0], id: `txn-${transactions.length + 1}`, status: 'Borrador' }])} className="ml-1 rounded border border-slate-200 p-1.5 text-slate-500 hover:text-ink"><Plus size={14} /></button></div></div><div className="grid max-h-[465px] grid-cols-1 gap-x-4 gap-y-4 overflow-y-auto p-5 scrollbar-thin sm:grid-cols-2">{(['date', 'bank', 'sender', 'beneficiary', 'origin', 'destination', 'reference', 'concept', 'operation', 'amount', 'currency', 'status'] as (keyof Transaction)[]).map((field) => <Field key={field} field={field} value={current[field]} mode={mode} onChange={(value) => setField(field, value)} />)}</div><div className="border-t border-slate-200 bg-slate-50/50 px-5 py-3 text-[11px] text-slate-400"><div className="flex items-center gap-1.5"><CircleHelp size={13} />Puedes editar cualquier dato antes de guardar.</div></div></div></div></>
 }
 
-function Field({ field, value, mode, onChange }: { field: keyof Transaction; value: string; mode: ExtractionMode; onChange: (value: string) => void }) {
-  const labels: Record<keyof Transaction, string> = { id: 'ID', date: 'Fecha', bank: 'Banco', sender: 'Emisor u ordenante', beneficiary: 'Beneficiario', origin: 'Cuenta de origen', destination: 'Cuenta de destino', reference: 'Referencia', concept: 'Concepto', operation: 'Tipo de operación', amount: 'Importe', currency: 'Moneda', status: 'Estado de la transacción' }
+function Field({ field, value, mode, onChange }: { field: keyof Transaction; value: string | undefined; mode: ExtractionMode; onChange: (value: string) => void }) {
+  const labels: Record<keyof Transaction, string> = { id: 'ID', date: 'Fecha', bank: 'Banco', sender: 'Emisor u ordenante', beneficiary: 'Beneficiario', origin: 'Cuenta de origen', destination: 'Cuenta de destino', reference: 'Referencia', concept: 'Concepto', operation: 'Tipo de operación', amount: 'Importe', debit: 'Cargo', credit: 'Abono', balance: 'Saldo', currency: 'Moneda', status: 'Estado de la transacción' }
   if (field === 'id') return null
   const selectFields = field === 'operation' || field === 'currency' || field === 'status'
-  return <label className={`${field === 'concept' ? 'sm:col-span-2' : ''} block`}><div className="mb-1.5 flex items-center justify-between text-[11px] font-bold text-slate-500"><span>{labels[field]}</span>{mode === 'gemini' && ['date', 'bank', 'amount', 'concept'].includes(field) && <span className="flex items-center gap-1 text-[9px] font-medium text-emerald-600"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />92%</span>}</div>{selectFields ? <select value={value} onChange={(e) => onChange(e.target.value)} className="input"><option>{value}</option><option>{field === 'status' ? 'Validada' : field === 'currency' ? 'USD' : field === 'operation' ? 'Transferencia interna' : 'Pendiente'}</option></select> : <input value={value} onChange={(e) => onChange(e.target.value)} className={`input ${mode === 'gemini' && ['date', 'bank', 'amount', 'concept'].includes(field) ? 'border-emerald-200 bg-emerald-50/20' : ''}`} />}</label>
+  return <label className={`${field === 'concept' ? 'sm:col-span-2' : ''} block`}><div className="mb-1.5 flex items-center justify-between text-[11px] font-bold text-slate-500"><span>{labels[field]}</span>{mode === 'gemini' && ['date', 'bank', 'amount', 'concept', 'debit', 'credit', 'balance'].includes(field) && <span className="flex items-center gap-1 text-[9px] font-medium text-emerald-600"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />Documento</span>}</div>{selectFields ? <select value={value ?? ''} onChange={(e) => onChange(e.target.value)} className="input"><option>{value ?? ''}</option><option>{field === 'status' ? 'Validada' : field === 'currency' ? 'USD' : field === 'operation' ? 'Transferencia interna' : 'Pendiente'}</option></select> : <input value={value ?? ''} onChange={(e) => onChange(e.target.value)} className={`input ${mode === 'gemini' && ['date', 'bank', 'amount', 'concept', 'debit', 'credit', 'balance'].includes(field) ? 'border-emerald-200 bg-emerald-50/20' : ''}`} />}</label>
 }
 
 function DocumentViewer({ page, setPage }: { page: number; setPage: (page: number) => void }) {

@@ -10,8 +10,8 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import settings
-from .gemini import GeminiSettings
-from .gmail import GmailClient, GmailNotConfiguredError, GmailNotConnectedError
+from .gemini import GeminiRequestError, GeminiSettings, GeminiUnavailableError
+from .gmail import GmailAttachmentError, GmailClient, GmailNotConfiguredError, GmailNotConnectedError
 
 
 logger = logging.getLogger("nexora.gmail")
@@ -33,6 +33,11 @@ oauth_states: dict[str, datetime] = {}
 class GeminiConfigRequest(BaseModel):
     apiKey: str | None = Field(default=None, min_length=10)
     model: str = Field(min_length=1)
+
+
+class GeminiExtractionRequest(BaseModel):
+    messageId: str = Field(min_length=1)
+    attachmentId: str = Field(min_length=1)
 
 
 @app.get("/api/health")
@@ -105,6 +110,50 @@ def save_gemini_config(payload: GeminiConfigRequest) -> dict[str, Any]:
 def disable_gemini_config() -> dict[str, Any]:
     logger.info("Gemini integration disabled")
     return gemini.disable()
+
+
+@app.post("/api/gemini/extract")
+def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
+    try:
+        data, media_type, filename = gmail.attachment(payload.messageId, payload.attachmentId)
+        logger.info(
+            "Gemini extraction input message_id=%s attachment_id=%s filename=%s size=%d mime_type=%s pdf_signature=%s",
+            payload.messageId,
+            payload.attachmentId,
+            filename,
+            len(data),
+            media_type,
+            data.startswith(b"%PDF-"),
+        )
+        result = gemini.extract_document(data, media_type, filename)
+        logger.info(
+            "Gemini extraction result attachment_id=%s result=success transactions=%d balance_consistent=%s",
+            payload.attachmentId,
+            len(result.get("transactions", [])),
+            result.get("balanceValidation", {}).get("consistent"),
+        )
+        return result
+    except GmailNotConnectedError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    except GmailAttachmentError as error:
+        logger.warning(
+            "Gemini extraction input rejected message_id=%s attachment_id=%s reason=%s",
+            payload.messageId,
+            payload.attachmentId,
+            error,
+        )
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except GeminiUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except GeminiRequestError as error:
+        logger.exception("Gemini document extraction failed for filename=%s", payload.attachmentId)
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error), "retryable": error.retryable},
+        ) from error
+    except Exception as error:
+        logger.exception("Document extraction failed for message=%s attachment=%s", payload.messageId, payload.attachmentId)
+        raise HTTPException(status_code=502, detail=f"No se pudo extraer el documento: {error}") from error
 
 
 @app.get("/api/gmail/messages")

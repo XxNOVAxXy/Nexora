@@ -25,6 +25,9 @@ export type Transaction = {
   concept: string
   operation: string
   amount: string
+  debit?: string
+  credit?: string
+  balance?: string
   currency: string
   status: TransactionStatus
 }

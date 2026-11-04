@@ -7,6 +7,7 @@ import mimetypes
 import re
 from datetime import datetime, timezone
 from email.utils import parseaddr
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from googleapiclient.discovery import Resource, build
 from .config import settings
 
 
+logger = logging.getLogger("nexora.gmail")
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 
@@ -26,6 +28,10 @@ class GmailNotConfiguredError(RuntimeError):
 
 
 class GmailNotConnectedError(RuntimeError):
+    pass
+
+
+class GmailAttachmentError(RuntimeError):
     pass
 
 
@@ -147,8 +153,9 @@ class GmailClient:
         return self._serialize_message(raw_message)
 
     def attachment(self, message_id: str, attachment_id: str) -> tuple[bytes, str, str]:
+        service = self.service()
         message = (
-            self.service()
+            service
             .users()
             .messages()
             .get(userId="me", id=message_id, format="full")
@@ -159,7 +166,7 @@ class GmailClient:
             None,
         )
         response = (
-            self.service()
+            service
             .users()
             .messages()
             .attachments()
@@ -170,14 +177,20 @@ class GmailClient:
         try:
             filename = attachment_info["filename"] if attachment_info else "attachment"
             declared_type = attachment_info["mimeType"] if attachment_info else ""
+            document = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
             media_type = _media_type_for(filename, declared_type)
-            return (
-                base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)),
+            document, media_type = validate_attachment_payload(document, media_type, filename)
+            logger.info(
+                "Gmail attachment validated message_id=%s attachment_id=%s size=%d mime_type=%s pdf_signature=%s",
+                message_id,
+                attachment_id,
+                len(document),
                 media_type,
-                filename,
+                document.startswith(b"%PDF-"),
             )
+            return document, media_type, filename
         except (binascii.Error, ValueError) as error:
-            raise GmailNotConnectedError("Gmail devolvió un adjunto inválido.") from error
+            raise GmailAttachmentError("Gmail devolvio un adjunto invalido.") from error
 
     def _save_credentials(self, credentials: Credentials) -> None:
         self.token_path.parent.mkdir(parents=True, exist_ok=True)
@@ -268,3 +281,16 @@ def _media_type_for(filename: str, declared_type: str) -> str:
     if declared_type and declared_type != "application/octet-stream":
         return declared_type
     return guessed_type or "application/octet-stream"
+
+
+def validate_attachment_payload(data: bytes, media_type: str, filename: str) -> tuple[bytes, str]:
+    """Validate the bytes received from Gmail before passing them to Gemini."""
+    if not data:
+        raise GmailAttachmentError("Gmail devolvio un adjunto vacio.")
+    has_pdf_signature = data.startswith(b"%PDF-")
+    is_pdf = filename.lower().endswith(".pdf") or media_type == "application/pdf" or has_pdf_signature
+    if is_pdf:
+        if not data.startswith(b"%PDF-"):
+            raise GmailAttachmentError("El adjunto se anuncio como PDF, pero no comienza con la firma %PDF-.")
+        return data, "application/pdf"
+    return data, media_type
