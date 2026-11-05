@@ -5,6 +5,9 @@ import binascii
 import html
 import mimetypes
 import re
+import threading
+import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from email.utils import parseaddr
 import logging
@@ -15,12 +18,19 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import Resource, build
+from googleapiclient.errors import HttpError
 
 from .config import settings
 
 
 logger = logging.getLogger("nexora.gmail")
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+# googleapiclient retries 429 and 403 rateLimitExceeded/userRateLimitExceeded with exponential backoff.
+GMAIL_NUM_RETRIES = 3
+RATE_LIMIT_REASONS = {"rateLimitExceeded", "userRateLimitExceeded"}
+PROFILE_TTL_SECONDS = 60
+MESSAGE_CACHE_ITEMS = 500
+ATTACHMENT_CACHE_BYTES = 64 * 1024 * 1024
 
 
 class GmailNotConfiguredError(RuntimeError):
@@ -33,6 +43,70 @@ class GmailNotConnectedError(RuntimeError):
 
 class GmailAttachmentError(RuntimeError):
     pass
+
+
+class GmailRateLimitError(RuntimeError):
+    pass
+
+
+def _is_rate_limited(error: HttpError) -> bool:
+    status = getattr(error.resp, "status", None)
+    if status == 429:
+        return True
+    if status != 403:
+        return False
+    details = error.error_details if isinstance(error.error_details, list) else []
+    reasons = {detail.get("reason") for detail in details if isinstance(detail, dict)}
+    return bool(reasons & RATE_LIMIT_REASONS) or "Quota exceeded" in str(error)
+
+
+def _execute(request: Any) -> Any:
+    try:
+        return request.execute(num_retries=GMAIL_NUM_RETRIES)
+    except HttpError as error:
+        if _is_rate_limited(error):
+            logger.warning("Gmail rate limit reached after retries: %s", error)
+            raise GmailRateLimitError(
+                "Gmail está limitando las consultas de esta cuenta. Espera un minuto e inténtalo de nuevo."
+            ) from error
+        raise
+
+
+class _LruCache:
+    """Thread-safe LRU bounded by item count and/or total size."""
+
+    def __init__(self, max_items: int | None = None, max_bytes: int | None = None) -> None:
+        self._items: OrderedDict[Any, tuple[Any, int]] = OrderedDict()
+        self._max_items = max_items
+        self._max_bytes = max_bytes
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: Any) -> Any:
+        with self._lock:
+            entry = self._items.get(key)
+            if entry is None:
+                return None
+            self._items.move_to_end(key)
+            return entry[0]
+
+    def put(self, key: Any, value: Any, size: int = 0) -> None:
+        with self._lock:
+            if key in self._items:
+                self._bytes -= self._items.pop(key)[1]
+            self._items[key] = (value, size)
+            self._bytes += size
+            while self._items and (
+                (self._max_items is not None and len(self._items) > self._max_items)
+                or (self._max_bytes is not None and self._bytes > self._max_bytes)
+            ):
+                _, (_, evicted_size) = self._items.popitem(last=False)
+                self._bytes -= evicted_size
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+            self._bytes = 0
 
 
 def _client_config() -> dict[str, Any]:
@@ -54,6 +128,12 @@ def _client_config() -> dict[str, Any]:
 class GmailClient:
     def __init__(self, token_path: Path | None = None) -> None:
         self.token_path = token_path or settings.token_path
+        self._messages = _LruCache(max_items=MESSAGE_CACHE_ITEMS)
+        self._attachments = _LruCache(max_bytes=ATTACHMENT_CACHE_BYTES)
+        self._profile: tuple[float, dict[str, Any]] | None = None
+        self._cache_lock = threading.Lock()
+        # Striped locks so concurrent requests for the same message/attachment hit Gmail once.
+        self._stripes = [threading.Lock() for _ in range(64)]
 
     def create_flow(self, state: str | None = None) -> Flow:
         flow = Flow.from_client_config(
@@ -80,10 +160,12 @@ class GmailClient:
         flow = self.create_flow(state=state)
         flow.fetch_token(code=code)
         self._save_credentials(flow.credentials)
+        self.clear_cache()
 
     def disconnect(self) -> None:
         if self.token_path.exists():
             self.token_path.unlink()
+        self.clear_cache()
 
     def credentials(self) -> Credentials:
         if not self.token_path.exists():
@@ -110,14 +192,34 @@ class GmailClient:
         )
 
     def profile(self) -> dict[str, Any]:
-        response = self.service().users().getProfile(userId="me").execute()
-        return {
+        with self._cache_lock:
+            if self._profile and time.monotonic() - self._profile[0] < PROFILE_TTL_SECONDS:
+                return self._profile[1]
+        try:
+            response = _execute(self.service().users().getProfile(userId="me"))
+        except GmailRateLimitError:
+            # Prefer a slightly stale profile over reporting the account as disconnected.
+            with self._cache_lock:
+                if self._profile:
+                    return self._profile[1]
+            raise
+        profile = {
             "email": response.get("emailAddress"),
             "messagesTotal": response.get("messagesTotal", 0),
             "threadsTotal": response.get("threadsTotal", 0),
         }
+        with self._cache_lock:
+            self._profile = (time.monotonic(), profile)
+        return profile
 
     def list_messages(self, folder: str, max_results: int = 25) -> list[dict[str, Any]]:
+        """List a folder spending ~10 quota units once its messages are cached.
+
+        Message content never changes, so each message is fetched once (5 units) and reused.
+        The UNREAD flag does change, so it is refreshed with a second id-only listing
+        restricted to ``is:unread``: any unread message among the newest ``limit`` has
+        at most ``limit - 1`` newer unread messages, so the same limit is exact.
+        """
         service = self.service()
         query = {
             "inbox": "in:inbox",
@@ -125,61 +227,51 @@ class GmailClient:
             "archive": "-in:inbox -in:sent -in:trash",
             "trash": "in:trash",
         }.get(folder, "in:inbox")
-        response = (
-            service.users()
-            .messages()
-            .list(userId="me", q=query, maxResults=min(max_results, 50))
-            .execute()
+        limit = min(max_results, 50)
+        listing = _execute(service.users().messages().list(userId="me", q=query, maxResults=limit))
+        message_ids = [item["id"] for item in listing.get("messages", [])]
+        if not message_ids:
+            return []
+        unread_listing = _execute(
+            service.users().messages().list(userId="me", q=f"{query} is:unread", maxResults=limit)
         )
-        messages = []
-        for message in response.get("messages", []):
-            raw_message = (
-                service.users()
-                .messages()
-                .get(userId="me", id=message["id"], format="full")
-                .execute()
-            )
-            messages.append(self._serialize_message(raw_message))
-        return messages
+        unread_ids = {item["id"] for item in unread_listing.get("messages", [])}
+        return [
+            _with_unread(self._message(service, message_id), message_id in unread_ids)
+            for message_id in message_ids
+        ]
 
     def get_message(self, message_id: str) -> dict[str, Any]:
-        raw_message = (
-            self.service()
-            .users()
-            .messages()
-            .get(userId="me", id=message_id, format="full")
-            .execute()
-        )
-        return self._serialize_message(raw_message)
+        return self._message(self.service(), message_id)
 
     def attachment(self, message_id: str, attachment_id: str) -> tuple[bytes, str, str]:
+        key = (message_id, attachment_id)
+        cached = self._attachments.get(key)
+        if cached is not None:
+            return cached
         service = self.service()
-        message = (
-            service
-            .users()
-            .messages()
-            .get(userId="me", id=message_id, format="full")
-            .execute()
-        )
-        attachment_info = next(
-            (item for item in _attachments(message.get("payload", {})) if item["id"] == attachment_id),
-            None,
-        )
-        response = (
-            service
-            .users()
-            .messages()
-            .attachments()
-            .get(userId="me", messageId=message_id, id=attachment_id)
-            .execute()
-        )
-        data = response.get("data", "")
-        try:
-            filename = attachment_info["filename"] if attachment_info else "attachment"
-            declared_type = attachment_info["mimeType"] if attachment_info else ""
-            document = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
-            media_type = _media_type_for(filename, declared_type)
-            document, media_type = validate_attachment_payload(document, media_type, filename)
+        # Resolved before taking the attachment lock so the two lock kinds never nest.
+        message = self._message(service, message_id)
+        with self._key_lock(("attachment", *key)):
+            cached = self._attachments.get(key)
+            if cached is not None:
+                return cached
+            attachment_info = next(
+                (item for item in message.get("attachments", []) if item["id"] == attachment_id),
+                None,
+            )
+            response = _execute(
+                service.users().messages().attachments().get(userId="me", messageId=message_id, id=attachment_id)
+            )
+            data = response.get("data", "")
+            try:
+                filename = attachment_info["filename"] if attachment_info else "attachment"
+                declared_type = attachment_info["mimeType"] if attachment_info else ""
+                document = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+                media_type = _media_type_for(filename, declared_type)
+                document, media_type = validate_attachment_payload(document, media_type, filename)
+            except (binascii.Error, ValueError) as error:
+                raise GmailAttachmentError("Gmail devolvio un adjunto invalido.") from error
             logger.info(
                 "Gmail attachment validated message_id=%s attachment_id=%s size=%d mime_type=%s pdf_signature=%s",
                 message_id,
@@ -188,9 +280,31 @@ class GmailClient:
                 media_type,
                 document.startswith(b"%PDF-"),
             )
-            return document, media_type, filename
-        except (binascii.Error, ValueError) as error:
-            raise GmailAttachmentError("Gmail devolvio un adjunto invalido.") from error
+            result = (document, media_type, filename)
+            self._attachments.put(key, result, size=len(document))
+            return result
+
+    def clear_cache(self) -> None:
+        self._messages.clear()
+        self._attachments.clear()
+        with self._cache_lock:
+            self._profile = None
+
+    def _message(self, service: Resource, message_id: str) -> dict[str, Any]:
+        cached = self._messages.get(message_id)
+        if cached is not None:
+            return cached
+        with self._key_lock(("message", message_id)):
+            cached = self._messages.get(message_id)
+            if cached is not None:
+                return cached
+            raw = _execute(service.users().messages().get(userId="me", id=message_id, format="full"))
+            message = self._serialize_message(raw)
+            self._messages.put(message_id, message)
+            return message
+
+    def _key_lock(self, key: tuple[str, ...]) -> threading.Lock:
+        return self._stripes[hash(key) % len(self._stripes)]
 
     def _save_credentials(self, credentials: Credentials) -> None:
         self.token_path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,6 +331,13 @@ class GmailClient:
             "attachments": _attachments(payload),
             "labels": raw.get("labelIds", []),
         }
+
+
+def _with_unread(message: dict[str, Any], unread: bool) -> dict[str, Any]:
+    labels = [label for label in message.get("labels", []) if label != "UNREAD"]
+    if unread:
+        labels.append("UNREAD")
+    return {**message, "unread": unread, "labels": labels}
 
 
 def _received_at(timestamp: str | None) -> str | None:

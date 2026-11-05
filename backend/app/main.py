@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from .config import settings
 from .gemini import GeminiRequestError, GeminiSettings, GeminiUnavailableError
-from .gmail import GmailAttachmentError, GmailClient, GmailNotConfiguredError, GmailNotConnectedError
+from .gmail import GmailAttachmentError, GmailClient, GmailNotConfiguredError, GmailNotConnectedError, GmailRateLimitError
 
 
 logger = logging.getLogger("nexora.gmail")
@@ -28,6 +28,10 @@ app.add_middleware(
 gmail = GmailClient()
 gemini = GeminiSettings()
 oauth_states: dict[str, datetime] = {}
+
+
+def _rate_limited(error: GmailRateLimitError) -> HTTPException:
+    return HTTPException(status_code=429, detail=str(error), headers={"Retry-After": "60"})
 
 
 class GeminiConfigRequest(BaseModel):
@@ -84,6 +88,9 @@ def gmail_status() -> dict[str, Any]:
         return {"connected": True, "provider": "gmail", **profile}
     except GmailNotConnectedError:
         return {"connected": False, "provider": "gmail", "email": None}
+    except GmailRateLimitError as error:
+        # The token is valid; Gmail is only throttling. Don't report the account as disconnected.
+        return {"connected": True, "provider": "gmail", "email": None, "error": str(error)}
     except Exception as error:
         logger.exception("Gmail status check failed")
         return {"connected": False, "provider": "gmail", "email": None, "error": str(error)}
@@ -135,6 +142,8 @@ def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
         return result
     except GmailNotConnectedError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
+    except GmailRateLimitError as error:
+        raise _rate_limited(error) from error
     except GmailAttachmentError as error:
         logger.warning(
             "Gemini extraction input rejected message_id=%s attachment_id=%s reason=%s",
@@ -165,6 +174,8 @@ def list_gmail_messages(
         messages = gmail.list_messages(folder=folder, max_results=limit)
     except GmailNotConnectedError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
+    except GmailRateLimitError as error:
+        raise _rate_limited(error) from error
     except Exception as error:
         logger.exception("Gmail message listing failed for folder=%s", folder)
         raise HTTPException(status_code=502, detail=f"No se pudieron consultar los mensajes de Gmail: {error}") from error
@@ -177,6 +188,8 @@ def get_gmail_message(message_id: str) -> dict[str, Any]:
         return gmail.get_message(message_id)
     except GmailNotConnectedError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
+    except GmailRateLimitError as error:
+        raise _rate_limited(error) from error
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"No se pudo leer el mensaje: {error}") from error
 
@@ -187,6 +200,8 @@ def download_gmail_attachment(message_id: str, attachment_id: str) -> StreamingR
         data, media_type, filename = gmail.attachment(message_id, attachment_id)
     except GmailNotConnectedError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
+    except GmailRateLimitError as error:
+        raise _rate_limited(error) from error
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"No se pudo descargar el adjunto: {error}") from error
     return StreamingResponse(
