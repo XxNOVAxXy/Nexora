@@ -1,0 +1,877 @@
+{
+  "_descripcion": "Casos compartidos por backend/tests/test_contabilidad_compartida.py y src/services/contabilidad.test.ts. Generado con expectativas escritas a mano.",
+  "parse_money": [
+    {
+      "texto": "1,234.56",
+      "formato": null,
+      "valor": "1234.56",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1,234,567.89",
+      "formato": null,
+      "valor": "1234567.89",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "$1,234.56 MXN",
+      "formato": null,
+      "valor": "1234.56",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1.234,56",
+      "formato": null,
+      "valor": "1234.56",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1.234.567,89",
+      "formato": null,
+      "valor": "1234567.89",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "\u20ac 12,50",
+      "formato": null,
+      "valor": "12.50",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1 234,56",
+      "formato": null,
+      "valor": "1234.56",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1\u00a0234,56",
+      "formato": null,
+      "valor": "1234.56",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1\u202f234\u2009567.89",
+      "formato": null,
+      "valor": "1234567.89",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "12 34,56",
+      "formato": null,
+      "valor": null,
+      "dudoso": true,
+      "indicador": null
+    },
+    {
+      "texto": "-1,234.56",
+      "formato": null,
+      "valor": "-1234.56",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1,234.56-",
+      "formato": null,
+      "valor": "-1234.56",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "(1,234.56)",
+      "formato": null,
+      "valor": "-1234.56",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "($1,234.56)",
+      "formato": null,
+      "valor": "-1234.56",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "\u22121,234.56",
+      "formato": null,
+      "valor": "-1234.56",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "(-1,234.56)",
+      "formato": null,
+      "valor": null,
+      "dudoso": true,
+      "indicador": null
+    },
+    {
+      "texto": "1,234.56 CR",
+      "formato": null,
+      "valor": "1234.56",
+      "dudoso": false,
+      "indicador": "abono"
+    },
+    {
+      "texto": "1,234.56CR",
+      "formato": null,
+      "valor": "1234.56",
+      "dudoso": false,
+      "indicador": "abono"
+    },
+    {
+      "texto": "500.00 DR",
+      "formato": null,
+      "valor": "500.00",
+      "dudoso": false,
+      "indicador": "cargo"
+    },
+    {
+      "texto": "500.00 cargo",
+      "formato": null,
+      "valor": "500.00",
+      "dudoso": false,
+      "indicador": "cargo"
+    },
+    {
+      "texto": "1.234,56 ABONO",
+      "formato": null,
+      "valor": "1234.56",
+      "dudoso": false,
+      "indicador": "abono"
+    },
+    {
+      "texto": "-500.00 CR",
+      "formato": null,
+      "valor": "-500.00",
+      "dudoso": true,
+      "indicador": "abono"
+    },
+    {
+      "texto": "1,5",
+      "formato": null,
+      "valor": "1.5",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "0,500",
+      "formato": null,
+      "valor": "0.500",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1234.567",
+      "formato": null,
+      "valor": "1234.567",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1,234",
+      "formato": null,
+      "valor": null,
+      "dudoso": true,
+      "indicador": null
+    },
+    {
+      "texto": "1.234",
+      "formato": null,
+      "valor": null,
+      "dudoso": true,
+      "indicador": null
+    },
+    {
+      "texto": "1,234",
+      "formato": "us",
+      "valor": "1234",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1.234",
+      "formato": "us",
+      "valor": "1.234",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1.234",
+      "formato": "eu",
+      "valor": "1234",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "1,234",
+      "formato": "eu",
+      "valor": "1.234",
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "",
+      "formato": null,
+      "valor": null,
+      "dudoso": false,
+      "indicador": null
+    },
+    {
+      "texto": "N/D",
+      "formato": null,
+      "valor": null,
+      "dudoso": true,
+      "indicador": null
+    },
+    {
+      "texto": "1,23,456",
+      "formato": null,
+      "valor": null,
+      "dudoso": true,
+      "indicador": null
+    }
+  ],
+  "validacion": [
+    {
+      "nombre": "cuadra",
+      "formato": null,
+      "resumen": {
+        "saldo_inicial": "10000.00",
+        "total_cargos": "1500.00",
+        "total_abonos": "2000.00",
+        "saldo_final": "10500.00"
+      },
+      "transacciones": [
+        {
+          "id": "t1",
+          "concepto": "DEPOSITO",
+          "cargo": "",
+          "abono": "2000.00",
+          "saldo": "12000.00"
+        },
+        {
+          "id": "t2",
+          "concepto": "PAGO PROVEEDOR",
+          "cargo": "1000.00",
+          "abono": "",
+          "saldo": "11000.00"
+        },
+        {
+          "id": "t3",
+          "concepto": "COMISION",
+          "cargo": "500.00",
+          "abono": "",
+          "saldo": "10500.00"
+        }
+      ],
+      "esperado": {
+        "cuadra": true,
+        "suma_cargos": "1500.00",
+        "suma_abonos": "2000.00",
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "total_abonos": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "saldo_final": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "continuidad": {
+            "estado": "ok",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [],
+        "filas_excluidas": [],
+        "importes_invalidos": []
+      }
+    },
+    {
+      "nombre": "movimiento omitido",
+      "formato": null,
+      "resumen": {
+        "saldo_inicial": "10000.00",
+        "total_cargos": "1500.00",
+        "total_abonos": "2000.00",
+        "saldo_final": "10500.00"
+      },
+      "transacciones": [
+        {
+          "id": "t1",
+          "concepto": "DEPOSITO",
+          "cargo": "",
+          "abono": "2000.00",
+          "saldo": "12000.00"
+        },
+        {
+          "id": "t2",
+          "concepto": "PAGO PROVEEDOR",
+          "cargo": "1000.00",
+          "abono": "",
+          "saldo": "11000.00"
+        }
+      ],
+      "esperado": {
+        "cuadra": false,
+        "suma_cargos": "1000.00",
+        "suma_abonos": "2000.00",
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "diferencia",
+            "diferencia": "-500.00"
+          },
+          "total_abonos": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "saldo_final": {
+            "estado": "diferencia",
+            "diferencia": "500.00"
+          },
+          "continuidad": {
+            "estado": "ok",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [],
+        "filas_excluidas": [],
+        "importes_invalidos": []
+      }
+    },
+    {
+      "nombre": "continuidad rota",
+      "formato": null,
+      "resumen": {
+        "saldo_inicial": "10000.00",
+        "total_cargos": "1500.00",
+        "total_abonos": "2000.00",
+        "saldo_final": "10500.00"
+      },
+      "transacciones": [
+        {
+          "id": "t1",
+          "concepto": "DEPOSITO",
+          "cargo": "",
+          "abono": "2000.00",
+          "saldo": "12000.00"
+        },
+        {
+          "id": "t2",
+          "concepto": "PAGO PROVEEDOR",
+          "cargo": "1000.00",
+          "abono": "",
+          "saldo": "11100.00"
+        },
+        {
+          "id": "t3",
+          "concepto": "COMISION",
+          "cargo": "500.00",
+          "abono": "",
+          "saldo": "10500.00"
+        }
+      ],
+      "esperado": {
+        "cuadra": false,
+        "suma_cargos": "1500.00",
+        "suma_abonos": "2000.00",
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "total_abonos": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "saldo_final": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "continuidad": {
+            "estado": "diferencia",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [
+          {
+            "id": "t2",
+            "indice": 1,
+            "saldo_esperado": "11000.00",
+            "saldo_reportado": "11100.00",
+            "diferencia": "100.00"
+          },
+          {
+            "id": "t3",
+            "indice": 2,
+            "saldo_esperado": "10600.00",
+            "saldo_reportado": "10500.00",
+            "diferencia": "-100.00"
+          }
+        ],
+        "filas_excluidas": [],
+        "importes_invalidos": []
+      }
+    },
+    {
+      "nombre": "filas de saldo anterior excluidas de las sumas",
+      "formato": null,
+      "resumen": {
+        "saldo_inicial": "10000.00",
+        "total_cargos": "1500.00",
+        "total_abonos": "2000.00",
+        "saldo_final": "10500.00"
+      },
+      "transacciones": [
+        {
+          "id": "s0",
+          "concepto": "SALDO ANTERIOR",
+          "cargo": "",
+          "abono": "",
+          "saldo": "10000.00"
+        },
+        {
+          "id": "t1",
+          "concepto": "DEPOSITO",
+          "cargo": "",
+          "abono": "2000.00",
+          "saldo": "12000.00"
+        },
+        {
+          "id": "s1",
+          "concepto": "Saldo anterior al 30/09",
+          "cargo": "",
+          "abono": "10000.00",
+          "saldo": ""
+        },
+        {
+          "id": "t2",
+          "concepto": "PAGO",
+          "cargo": "1500.00",
+          "abono": "",
+          "saldo": "10500.00"
+        }
+      ],
+      "esperado": {
+        "cuadra": true,
+        "suma_cargos": "1500.00",
+        "suma_abonos": "2000.00",
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "total_abonos": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "saldo_final": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "continuidad": {
+            "estado": "ok",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [],
+        "filas_excluidas": [
+          "s0",
+          "s1"
+        ],
+        "importes_invalidos": []
+      }
+    },
+    {
+      "nombre": "importe ambiguo sin formato queda sin verificar",
+      "formato": null,
+      "resumen": {
+        "saldo_inicial": "5000.00",
+        "total_cargos": "1234.00",
+        "total_abonos": "",
+        "saldo_final": "3766.00"
+      },
+      "transacciones": [
+        {
+          "id": "t1",
+          "concepto": "PAGO",
+          "cargo": "1,234",
+          "abono": "",
+          "saldo": ""
+        }
+      ],
+      "esperado": {
+        "cuadra": null,
+        "suma_cargos": null,
+        "suma_abonos": null,
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "total_abonos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "saldo_final": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "continuidad": {
+            "estado": "no_verificable",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [],
+        "filas_excluidas": [],
+        "importes_invalidos": [
+          {
+            "id": "t1",
+            "campo": "cargo"
+          }
+        ]
+      }
+    },
+    {
+      "nombre": "importe ambiguo resuelto con el formato del documento",
+      "formato": "us",
+      "resumen": {
+        "saldo_inicial": "5000.00",
+        "total_cargos": "1234.00",
+        "total_abonos": "",
+        "saldo_final": "3766.00"
+      },
+      "transacciones": [
+        {
+          "id": "t1",
+          "concepto": "PAGO",
+          "cargo": "1,234",
+          "abono": "",
+          "saldo": ""
+        }
+      ],
+      "esperado": {
+        "cuadra": true,
+        "suma_cargos": "1234.00",
+        "suma_abonos": "0.00",
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "total_abonos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "saldo_final": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "continuidad": {
+            "estado": "no_verificable",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [],
+        "filas_excluidas": [],
+        "importes_invalidos": []
+      }
+    },
+    {
+      "nombre": "importe europeo editado a mano en documento europeo",
+      "formato": "eu",
+      "resumen": {
+        "saldo_inicial": "1.000,00",
+        "total_cargos": "",
+        "total_abonos": "2.500",
+        "saldo_final": "3.500,00"
+      },
+      "transacciones": [
+        {
+          "id": "t1",
+          "concepto": "DEPOSITO",
+          "cargo": "",
+          "abono": "2.500",
+          "saldo": ""
+        }
+      ],
+      "esperado": {
+        "cuadra": true,
+        "suma_cargos": "0.00",
+        "suma_abonos": "2500.00",
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "total_abonos": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "saldo_final": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "continuidad": {
+            "estado": "no_verificable",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [],
+        "filas_excluidas": [],
+        "importes_invalidos": []
+      }
+    },
+    {
+      "nombre": "cargo y abono en la misma fila",
+      "formato": null,
+      "resumen": {
+        "saldo_inicial": "0.00",
+        "total_cargos": "",
+        "total_abonos": "",
+        "saldo_final": "50.00"
+      },
+      "transacciones": [
+        {
+          "id": "t1",
+          "concepto": "AJUSTE",
+          "cargo": "100.00",
+          "abono": "50.00",
+          "saldo": ""
+        }
+      ],
+      "esperado": {
+        "cuadra": null,
+        "suma_cargos": null,
+        "suma_abonos": null,
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "total_abonos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "saldo_final": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "continuidad": {
+            "estado": "no_verificable",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [],
+        "filas_excluidas": [],
+        "importes_invalidos": [
+          {
+            "id": "t1",
+            "campo": "cargo_y_abono"
+          }
+        ]
+      }
+    },
+    {
+      "nombre": "diferencia dentro de la tolerancia",
+      "formato": null,
+      "resumen": {
+        "saldo_inicial": "100.00",
+        "total_cargos": "",
+        "total_abonos": "",
+        "saldo_final": "150.01"
+      },
+      "transacciones": [
+        {
+          "id": "t1",
+          "concepto": "DEPOSITO",
+          "cargo": "",
+          "abono": "50.00",
+          "saldo": ""
+        }
+      ],
+      "esperado": {
+        "cuadra": true,
+        "suma_cargos": "0.00",
+        "suma_abonos": "50.00",
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "total_abonos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "saldo_final": {
+            "estado": "ok",
+            "diferencia": "-0.01"
+          },
+          "continuidad": {
+            "estado": "no_verificable",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [],
+        "filas_excluidas": [],
+        "importes_invalidos": []
+      }
+    },
+    {
+      "nombre": "diferencia fuera de la tolerancia",
+      "formato": null,
+      "resumen": {
+        "saldo_inicial": "100.00",
+        "total_cargos": "",
+        "total_abonos": "",
+        "saldo_final": "150.02"
+      },
+      "transacciones": [
+        {
+          "id": "t1",
+          "concepto": "DEPOSITO",
+          "cargo": "",
+          "abono": "50.00",
+          "saldo": ""
+        }
+      ],
+      "esperado": {
+        "cuadra": false,
+        "suma_cargos": "0.00",
+        "suma_abonos": "50.00",
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "total_abonos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "saldo_final": {
+            "estado": "diferencia",
+            "diferencia": "-0.02"
+          },
+          "continuidad": {
+            "estado": "no_verificable",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [],
+        "filas_excluidas": [],
+        "importes_invalidos": []
+      }
+    },
+    {
+      "nombre": "filas sin saldo intermedias en la continuidad",
+      "formato": null,
+      "resumen": {
+        "saldo_inicial": "1000.00",
+        "total_cargos": "300.00",
+        "total_abonos": "",
+        "saldo_final": "700.00"
+      },
+      "transacciones": [
+        {
+          "id": "t1",
+          "concepto": "PAGO A",
+          "cargo": "100.00",
+          "abono": "",
+          "saldo": ""
+        },
+        {
+          "id": "t2",
+          "concepto": "PAGO B",
+          "cargo": "200.00",
+          "abono": "",
+          "saldo": "700.00"
+        }
+      ],
+      "esperado": {
+        "cuadra": true,
+        "suma_cargos": "300.00",
+        "suma_abonos": "0.00",
+        "comprobaciones": {
+          "total_cargos": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "total_abonos": {
+            "estado": "no_verificable",
+            "diferencia": null
+          },
+          "saldo_final": {
+            "estado": "ok",
+            "diferencia": "0.00"
+          },
+          "continuidad": {
+            "estado": "ok",
+            "diferencia": null
+          }
+        },
+        "filas_discontinuas": [],
+        "filas_excluidas": [],
+        "importes_invalidos": []
+      }
+    }
+  ],
+  "fila_de_saldo": [
+    {
+      "concepto": "SALDO INICIAL",
+      "esperado": true
+    },
+    {
+      "concepto": "Saldo inicial del per\u00edodo",
+      "esperado": true
+    },
+    {
+      "concepto": "Saldo anterior al 30/09",
+      "esperado": true
+    },
+    {
+      "concepto": "SALDO ANTERIOR",
+      "esperado": true
+    },
+    {
+      "concepto": "Saldo previo",
+      "esperado": true
+    },
+    {
+      "concepto": "  saldo   al corte ",
+      "esperado": true
+    },
+    {
+      "concepto": "SALDO FINAL",
+      "esperado": true
+    },
+    {
+      "concepto": "SALDO A FAVOR CLIENTE",
+      "esperado": false
+    },
+    {
+      "concepto": "PAGO SALDO ANTERIOR TARJETA",
+      "esperado": false
+    },
+    {
+      "concepto": "DEPOSITO",
+      "esperado": false
+    },
+    {
+      "concepto": "",
+      "esperado": false
+    }
+  ]
+}

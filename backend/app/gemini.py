@@ -8,13 +8,20 @@ import os
 import re
 import threading
 import time
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .config import settings
+from .contabilidad import (
+    CAMPOS_MONTO_RESUMEN,
+    CAMPOS_MONTO_TRANSACCION,
+    detectar_formato,
+    es_fila_de_saldo,
+    normalizar_monto,
+    validar_contabilidad,
+)
 
 
 logger = logging.getLogger("nexora.gemini")
@@ -32,45 +39,46 @@ class GeminiRequestError(RuntimeError):
         self.retryable = retryable
 
 
-class StatementMetadata(BaseModel):
+# Cambia esta versión cada vez que cambie el prompt o el esquema: invalida los resultados en caché.
+PROMPT_VERSION = "2026-11-05.2"
+CACHE_MAX_ITEMS = 16
+
+
+class ResumenExtraido(BaseModel):
+    """Encabezado del estado de cuenta tal como lo devuelve Gemini (también es su esquema de salida)."""
+
     model_config = ConfigDict(extra="ignore")
 
-    bank: str = ""
-    account_holder: str = ""
-    account_number: str = ""
-    statement_period: str = ""
-    currency: str = ""
-    opening_balance: str = ""
-    closing_balance: str = ""
-    total_credits: str = ""
-    total_debits: str = ""
+    banco: str = ""
+    titular: str = ""
+    cuenta: str = ""
+    periodo: str = ""
+    moneda: str = ""
+    saldo_inicial: str = ""
+    total_cargos: str = ""
+    total_abonos: str = ""
+    saldo_final: str = ""
 
 
-class ExtractedTransaction(BaseModel):
+class TransaccionExtraida(BaseModel):
+    """Movimiento tal como lo devuelve Gemini: los montos llegan como texto impreso en el documento."""
+
     model_config = ConfigDict(extra="ignore")
 
-    date: str = ""
-    bank: str = ""
-    sender: str = ""
-    beneficiary: str = ""
-    origin: str = ""
-    destination: str = ""
-    reference: str = ""
-    concept: str = ""
-    operation: str = ""
-    amount: str = ""
-    debit: str = ""
-    credit: str = ""
-    balance: str = ""
-    currency: str = ""
+    fecha: str = ""
+    concepto: str = ""
+    referencia: str = ""
+    cargo: str = ""
+    abono: str = ""
+    saldo: str = ""
 
 
 class StatementExtraction(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    statement: StatementMetadata = Field(default_factory=StatementMetadata)
-    transactions: list[ExtractedTransaction] = Field(default_factory=list)
-    notes: list[str] = Field(default_factory=list)
+    resumen: ResumenExtraido = Field(default_factory=ResumenExtraido)
+    transacciones: list[TransaccionExtraida] = Field(default_factory=list)
+    notas: list[str] = Field(default_factory=list)
 
 
 class GeminiSettings:
@@ -103,7 +111,12 @@ class GeminiSettings:
         self._write(values)
         return self.status()
 
-    def extract_document(self, data: bytes, mime_type: str, filename: str) -> dict[str, Any]:
+    def extract_document(self, data: bytes, mime_type: str, filename: str, forzar: bool = False) -> dict[str, Any]:
+        """Extrae el documento con Gemini.
+
+        El resultado se guarda en caché por (documento, modelo configurado, PROMPT_VERSION). Con ``forzar``
+        se ignora la caché y el resultado nuevo reemplaza la entrada anterior.
+        """
         values = self._read()
         api_key = values.get("apiKey", "")
         if not api_key or not values.get("enabled", False):
@@ -119,16 +132,19 @@ class GeminiSettings:
             data.startswith(b"%PDF-"),
         )
 
-        document_hash = hashlib.sha256(data).hexdigest()
+        model = values.get("model", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
+        document_hash = _cache_key(data, model)
         with self._lock:
-            cached = self._cache.get(document_hash)
+            cached = None if forzar else self._cache.get(document_hash)
             if cached is not None:
                 return copy.deepcopy(cached)
+            # Una extracción en curso del mismo documento ya es un resultado nuevo: se comparte también al forzar.
             event = self._inflight.get(document_hash)
             owner = event is None
             if owner:
                 event = threading.Event()
                 self._inflight[document_hash] = event
+                self._inflight_errors.pop(document_hash, None)
 
         if not owner:
             if not event.wait(timeout=120):
@@ -143,12 +159,13 @@ class GeminiSettings:
             raise GeminiRequestError("Gemini no produjo un resultado reutilizable.", code="invalid_response")
 
         try:
-            model = values.get("model", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
             extracted, used_model = self._generate(data, mime_type, filename, api_key, model)
             result = _build_result(filename, extracted, used_model)
             with self._lock:
+                # pop + asignación: la entrada reemplazada pasa a ser la más reciente.
+                self._cache.pop(document_hash, None)
                 self._cache[document_hash] = copy.deepcopy(result)
-                if len(self._cache) > 16:
+                while len(self._cache) > CACHE_MAX_ITEMS:
                     self._cache.pop(next(iter(self._cache)))
             return result
         except GeminiRequestError as error:
@@ -261,11 +278,13 @@ def _validate_document_input(data: bytes, mime_type: str, filename: str) -> tupl
 def _extraction_prompt(filename: str) -> str:
     return f"""Analiza el estado de cuenta bancario adjunto llamado {filename!r}.
 
-Devuelve unicamente un objeto JSON que cumpla el esquema recibido. Extrae el encabezado del estado de cuenta y TODOS los movimientos visibles. No inventes datos, no completes texto con conocimiento externo y no conviertas un valor ilegible en cero. Usa cadenas vacias para valores no visibles o no aplicables.
+Devuelve unicamente un objeto JSON que cumpla el esquema recibido. Extrae el resumen del estado de cuenta y TODOS los movimientos visibles. No inventes datos, no completes texto con conocimiento externo y no conviertas un valor ilegible en cero. Usa cadenas vacias para valores no visibles o no aplicables.
 
-Para cada movimiento conserva exactamente la fecha, concepto, referencia, cargo, abono, saldo, moneda, ordenante, beneficiario, cuentas y tipo de operacion tal como aparecen. No conviertas la fila `SALDO INICIAL` en un movimiento: usa ese valor solo como `opening_balance`. Para el encabezado conserva el banco, titular, cuenta, periodo, saldos y totales visibles. `total_credits` representa abonos/depositos y `total_debits` representa cargos/retiros.
+Resumen: `banco`, `titular`, `cuenta`, `periodo`, `moneda`, `saldo_inicial`, `total_cargos` (cargos/retiros), `total_abonos` (abonos/depositos) y `saldo_final`, tal como aparecen en el documento.
 
-El documento puede tener varias paginas. Cuenta cada movimiento una sola vez. Si una fila no es legible, conserva la fila y deja vacios solo los campos ilegibles. Incluye en notes cualquier advertencia de lectura, pagina o discrepancia evidente."""
+Movimientos: para cada uno conserva `fecha`, `concepto`, `referencia`, `cargo`, `abono` y `saldo`. Copia los importes EXACTAMENTE como estan impresos, con sus separadores de miles y decimales, signos, parentesis y sufijos (CR, DR, etc.); no los reformatees ni los calcules. Un movimiento lleva importe en `cargo` o en `abono`, segun la columna donde aparece; deja vacia la otra. `saldo` es el saldo despues del movimiento, si el documento lo muestra. No conviertas la fila `SALDO INICIAL` en un movimiento: usa ese valor solo como `saldo_inicial`.
+
+El documento puede tener varias paginas. Cuenta cada movimiento una sola vez. Si una fila no es legible, conserva la fila y deja vacios solo los campos ilegibles. Incluye en `notas` cualquier advertencia de lectura, pagina o discrepancia evidente."""
 
 
 def _parse_extraction(value: str) -> StatementExtraction:
@@ -275,67 +294,88 @@ def _parse_extraction(value: str) -> StatementExtraction:
         raise GeminiRequestError("Gemini no devolvio una extraccion bancaria estructurada valida.", code="invalid_response") from error
 
 
-def _build_result(filename: str, extraction: StatementExtraction, model: str) -> dict[str, Any]:
-    statement = extraction.statement.model_dump()
-    transactions: list[dict[str, str]] = []
-    movement_index = 0
-    for item in extraction.transactions:
-        if _is_opening_balance_row(item):
-            continue
-        transaction = item.model_dump()
-        transaction["bank"] = transaction["bank"] or statement["bank"]
-        transaction["currency"] = transaction["currency"] or statement["currency"]
-        movement_index += 1
-        transaction["id"] = f"gemini-{movement_index}"
-        transaction["status"] = "Revisar"
-        transactions.append(transaction)
+def _cache_key(data: bytes, model: str) -> str:
+    digest = hashlib.sha256(data).hexdigest()
+    return f"{digest}:{model.strip()}:{PROMPT_VERSION}"
 
-    validation = _validate_balances(statement)
-    warnings = list(extraction.notes)
-    if validation["consistent"] is False:
-        warnings.append(validation["message"])
-    if validation["consistent"] is None:
-        warnings.append(validation["message"])
+
+def _huella(fecha: str, concepto: str, referencia: str, cargo: str, abono: str) -> str:
+    """Identifica un movimiento entre extracciones del mismo documento (se calcula antes de cualquier edición)."""
+    partes = [re.sub(r"\s+", " ", valor.strip().casefold()) for valor in (fecha, concepto, referencia, cargo, abono)]
+    return hashlib.sha256("|".join(partes).encode("utf-8")).hexdigest()[:16]
+
+
+def _build_result(filename: str, extraction: StatementExtraction, model: str) -> dict[str, Any]:
+    # El formato numérico se decide con todos los importes del documento para resolver casos como "1,234".
+    textos = [getattr(extraction.resumen, campo) for campo in CAMPOS_MONTO_RESUMEN]
+    textos += [getattr(item, campo) for item in extraction.transacciones for campo in CAMPOS_MONTO_TRANSACCION]
+    formato, conflicto = detectar_formato(textos)
+    warnings = list(extraction.notas)
+    if conflicto:
+        warnings.append("El documento mezcla formatos numericos (1,234.56 y 1.234,56); los importes ambiguos quedan marcados como dudosos.")
+
+    resumen: dict[str, Any] = extraction.resumen.model_dump()
+    resumen_dudosos: list[str] = []
+    for campo in CAMPOS_MONTO_RESUMEN:
+        original = resumen[campo]
+        normalizado, _, dudoso = normalizar_monto(campo, original, formato)
+        resumen[campo] = normalizado
+        resumen[f"{campo}_original"] = original
+        if dudoso:
+            resumen_dudosos.append(campo)
+    resumen["dudosos"] = resumen_dudosos
+
+    transacciones: list[dict[str, Any]] = []
+    dudosos_total = len(resumen_dudosos)
+    filas_de_saldo_con_importe = 0
+    for item in extraction.transacciones:
+        fila_de_saldo = es_fila_de_saldo(item.concepto)
+        if fila_de_saldo and not item.cargo.strip() and not item.abono.strip():
+            # Fila informativa (SALDO INICIAL / ANTERIOR / FINAL): no es un movimiento.
+            continue
+        transaccion: dict[str, Any] = {
+            "id": f"ia-{len(transacciones) + 1}",
+            "fecha": item.fecha,
+            "concepto": item.concepto,
+            "referencia": item.referencia,
+        }
+        dudosos: list[str] = []
+        for campo in CAMPOS_MONTO_TRANSACCION:
+            original = getattr(item, campo)
+            normalizado, _, dudoso = normalizar_monto(campo, original, formato)
+            transaccion[campo] = normalizado
+            transaccion[f"{campo}_original"] = original
+            if dudoso:
+                dudosos.append(campo)
+        transaccion["origen"] = "ia"
+        transaccion["dudosos"] = dudosos
+        transaccion["huella"] = _huella(item.fecha, item.concepto, item.referencia, transaccion["cargo"], transaccion["abono"])
+        if fila_de_saldo:
+            # Una fila de saldo con importe se conserva, pero no se suma y requiere revision.
+            transaccion["revision"] = "fila_de_saldo_con_importe"
+            filas_de_saldo_con_importe += 1
+        dudosos_total += len(dudosos)
+        transacciones.append(transaccion)
+
+    if dudosos_total:
+        warnings.append(f"{dudosos_total} importe(s) quedaron marcados como dudosos y requieren revision.")
+    if filas_de_saldo_con_importe:
+        warnings.append(f"{filas_de_saldo_con_importe} fila(s) de saldo traen importe: no se suman y requieren revision.")
+    validacion = validar_contabilidad(resumen, transacciones, formato)
+    if validacion["cuadra"] is False:
+        warnings.append("La validacion contable encontro diferencias.")
+    elif validacion["cuadra"] is None:
+        warnings.append("La validacion contable no pudo completarse con los datos extraidos.")
     return {
         "filename": filename,
         "model": model,
-        "statement": statement,
-        "transactions": transactions,
-        "balanceValidation": validation,
+        "prompt_version": PROMPT_VERSION,
+        "formato_numerico": formato,
+        "resumen": resumen,
+        "transacciones": transacciones,
+        "validacion": validacion,
         "warnings": _unique_text(warnings),
     }
-
-
-def _is_opening_balance_row(item: ExtractedTransaction) -> bool:
-    concept = re.sub(r"\s+", " ", item.concept.strip().casefold())
-    return concept in {"saldo inicial", "saldo inicial del periodo", "saldo inicial del período"}
-
-
-def _validate_balances(statement: dict[str, str]) -> dict[str, Any]:
-    opening = _parse_money(statement.get("opening_balance", ""))
-    credits = _parse_money(statement.get("total_credits", ""))
-    debits = _parse_money(statement.get("total_debits", ""))
-    closing = _parse_money(statement.get("closing_balance", ""))
-    if None in (opening, credits, debits, closing):
-        return {"consistent": None, "difference": "", "message": "No se pudo validar el saldo: falta uno o mas totales en el documento."}
-    difference = closing - (opening + credits - debits)
-    rounded = difference.quantize(Decimal("0.01"))
-    consistent = abs(rounded) <= Decimal("0.01")
-    message = "Los saldos y totales son consistentes." if consistent else f"La conciliacion presenta una diferencia de {rounded:.2f}."
-    return {"consistent": consistent, "difference": f"{rounded:.2f}", "message": message}
-
-
-def _parse_money(value: Any) -> Decimal | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    cleaned = value.strip().replace(",", "")
-    cleaned = re.sub(r"[^0-9.\-()]", "", cleaned)
-    if cleaned.startswith("(") and cleaned.endswith(")"):
-        cleaned = f"-{cleaned[1:-1]}"
-    try:
-        return Decimal(cleaned)
-    except InvalidOperation:
-        return None
 
 
 def _model_candidates(model: str) -> list[str]:

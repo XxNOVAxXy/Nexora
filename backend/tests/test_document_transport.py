@@ -46,9 +46,9 @@ class DocumentTransportTests(unittest.TestCase):
                 return expected_bytes, "application/pdf", "Estado_de_Cuenta_Prueba_Nexora.pdf"
 
         class FakeGemini:
-            def extract_document(self, data: bytes, mime_type: str, filename: str) -> dict[str, object]:
+            def extract_document(self, data: bytes, mime_type: str, filename: str, forzar: bool = False) -> dict[str, object]:
                 self.received = (data, mime_type, filename)
-                return {"filename": filename, "transactions": [], "balanceValidation": {"consistent": None}}
+                return {"filename": filename, "transacciones": [], "validacion": {"cuadra": None}}
 
         fake_gemini = FakeGemini()
         with patch.object(main, "gmail", FakeGmail()), patch.object(main, "gemini", fake_gemini):
@@ -63,7 +63,7 @@ class DocumentTransportTests(unittest.TestCase):
 
     def test_sdk_receives_pdf_as_document_part_not_prompt_text(self) -> None:
         captured: dict[str, object] = {}
-        response = type("Response", (), {"text": '{"statement": {}, "transactions": [], "notes": []}'})()
+        response = type("Response", (), {"text": '{"resumen": {}, "transacciones": [], "notas": []}'})()
 
         class FakeModels:
             def generate_content(self, **kwargs: object) -> object:
@@ -88,26 +88,27 @@ class DocumentTransportTests(unittest.TestCase):
     def test_opening_balance_row_is_not_counted_as_movement(self) -> None:
         extraction = StatementExtraction.model_validate(
             {
-                "statement": {
-                    "opening_balance": "25,000.00",
-                    "total_credits": "18,750.00",
-                    "total_debits": "9,425.50",
-                    "closing_balance": "34,324.50",
+                "resumen": {
+                    "saldo_inicial": "25,000.00",
+                    "total_abonos": "18,750.00",
+                    "total_cargos": "9,425.50",
+                    "saldo_final": "34,324.50",
                 },
-                "transactions": [
-                    {"date": "01/10/2026", "concept": "SALDO INICIAL", "balance": "25,000.00"},
-                    {"date": "03/10/2026", "concept": "TRANSFERENCIA RECIBIDA", "credit": "12,000.00"},
-                    {"date": "07/10/2026", "concept": "PAGO A PROVEEDOR", "debit": "4,250.00"},
-                    {"date": "12/10/2026", "concept": "DEPOSITO REFERENCIADO", "credit": "6,750.00"},
-                    {"date": "18/10/2026", "concept": "PAGO SERVICIOS", "debit": "1,875.50"},
-                    {"date": "24/10/2026", "concept": "TRANSFERENCIA SALIENTE", "debit": "3,300.00"},
+                "transacciones": [
+                    {"fecha": "01/10/2026", "concepto": "SALDO INICIAL", "saldo": "25,000.00"},
+                    {"fecha": "03/10/2026", "concepto": "TRANSFERENCIA RECIBIDA", "abono": "12,000.00"},
+                    {"fecha": "07/10/2026", "concepto": "PAGO A PROVEEDOR", "cargo": "4,250.00"},
+                    {"fecha": "12/10/2026", "concepto": "DEPOSITO REFERENCIADO", "abono": "6,750.00"},
+                    {"fecha": "18/10/2026", "concepto": "PAGO SERVICIOS", "cargo": "1,875.50"},
+                    {"fecha": "24/10/2026", "concepto": "TRANSFERENCIA SALIENTE", "cargo": "3,300.00"},
                 ],
             }
         )
         result = _build_result("Estado_de_Cuenta_Prueba_Nexora.pdf", extraction, "test-model")
-        self.assertEqual(len(result["transactions"]), 5)
-        self.assertEqual(result["balanceValidation"]["difference"], "0.00")
-        self.assertTrue(result["balanceValidation"]["consistent"])
+        self.assertEqual(len(result["transacciones"]), 5)
+        saldo_final = next(item for item in result["validacion"]["comprobaciones"] if item["id"] == "saldo_final")
+        self.assertEqual(saldo_final["diferencia"], "0.00")
+        self.assertTrue(result["validacion"]["cuadra"])
 
 
 if __name__ == "__main__":
