@@ -7,8 +7,10 @@ export type PreliminaryDetection = {
   matched: boolean
   matchedTerms: string[]
   hasDocumentAttachment: boolean
-  /** Tiene un PDF adjunto (las imágenes no cuentan para la clasificación automática). */
+  /** Tiene un PDF adjunto. */
   hasPdfAttachment: boolean
+  /** Tiene una imagen que Gemini puede extraer (PNG, JPG, WebP): hay estados de cuenta que llegan solo como imagen. */
+  hasImageAttachment: boolean
   /** El backend comprobó que la dirección del remitente coincide con un remitente configurado. */
   senderMatches: boolean
   /** El backend comprobó que el asunto contiene una frase de estado de cuenta (filtro automático). */
@@ -37,6 +39,7 @@ const statementTerms = [
 
 const normalize = (value: string) => value.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
 const esPdf = (attachment: GmailMessage['attachments'][number]) => attachment.mimeType.toLowerCase() === 'application/pdf' || /\.pdf$/i.test(attachment.filename)
+const esImagenExtraible = (attachment: GmailMessage['attachments'][number]) => ['image/png', 'image/jpeg', 'image/webp'].includes(attachment.mimeType.toLowerCase()) || /\.(png|jpe?g|webp)$/i.test(attachment.filename)
 
 export function detectStatementEmail(message: MensajeClasificable): PreliminaryDetection {
   const searchableText = normalize([
@@ -57,17 +60,20 @@ export function detectStatementEmail(message: MensajeClasificable): PreliminaryD
       return mimeType === 'application/pdf' || mimeType.startsWith('image/') || /\.(pdf|png|jpe?g|webp|gif)$/i.test(attachment.filename)
     }),
     hasPdfAttachment: message.attachments.some(esPdf),
+    hasImageAttachment: message.attachments.some(esImagenExtraible),
     senderMatches: message.remitenteCoincide === true,
     subjectMatches: message.asuntoCoincide === true,
   }
 }
 
 /**
- * (Asunto de estado de cuenta o remitente configurado) + PDF adjunto => estado de cuenta por defecto. Las palabras clave solo apoyan:
- * con remitente sin PDF (p. ej. una imagen), palabras clave o un documento, queda pendiente de verificar.
+ * Estado de cuenta por defecto: asunto de estado de cuenta + PDF o imagen, o remitente configurado + PDF.
+ * Las palabras clave solo apoyan: con remitente sin PDF (p. ej. una imagen), palabras clave o un documento, queda
+ * pendiente de verificar.
  */
 export function preliminaryClassification(detection: PreliminaryDetection): EmailClassification {
-  if ((detection.senderMatches || detection.subjectMatches) && detection.hasPdfAttachment) return 'ESTADO_DE_CUENTA'
+  if (detection.subjectMatches && (detection.hasPdfAttachment || detection.hasImageAttachment)) return 'ESTADO_DE_CUENTA'
+  if (detection.senderMatches && detection.hasPdfAttachment) return 'ESTADO_DE_CUENTA'
   return detection.senderMatches || detection.matched || detection.hasDocumentAttachment ? 'REQUIERE_REVISION' : 'NO_ES_ESTADO_DE_CUENTA'
 }
 
@@ -117,7 +123,8 @@ export function classifyMessagesWithCache(messages: GmailMessage[], previousCach
     const fingerprint = emailClassificationFingerprint(message)
     const previous = previousCache[message.id]
     // Las coincidencias de remitente y asunto las decide el backend: si cambian, se reclasifica aunque el correo no cambie.
-    cache[message.id] = previous?.fingerprint === fingerprint && previous.senderMatches === (message.remitenteCoincide === true) && previous.subjectMatches === (message.asuntoCoincide === true) ? previous : classifyEmailPreliminarily(message, analyzedAt)
+    // Las entradas sin hasImageAttachment se guardaron con las reglas anteriores (solo PDF): también se reclasifican.
+    cache[message.id] = previous?.fingerprint === fingerprint && previous.hasImageAttachment !== undefined && previous.senderMatches === (message.remitenteCoincide === true) && previous.subjectMatches === (message.asuntoCoincide === true) ? previous : classifyEmailPreliminarily(message, analyzedAt)
     return cache
   }, { ...previousCache })
 }

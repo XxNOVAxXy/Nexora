@@ -1,8 +1,9 @@
-"""Filtro automático de estados de cuenta: asunto + PDF adjunto, de cualquier remitente.
+"""Filtro automático de estados de cuenta: asunto + documento adjunto (PDF o imagen), de cualquier remitente.
 
-El usuario no configura nada. Gmail recibe una búsqueda amplia (carpeta + PDF adjunto + términos en el asunto)
-y después el backend vuelve a comprobar cada resultado con :func:`asunto_coincide`, porque la búsqueda de Gmail
-es por palabras sueltas y puede devolver asuntos que no contienen la frase completa.
+El usuario no configura nada. Gmail recibe una búsqueda amplia (carpeta + términos en el asunto) y después el
+backend vuelve a comprobar cada resultado con :func:`asunto_coincide`, porque la búsqueda de Gmail es por palabras
+sueltas, y con :func:`tiene_documento`. La búsqueda no usa ``has:attachment``: Gmail no cuenta como adjunto una
+imagen insertada en el cuerpo, y hay bancos que mandan el estado de cuenta solo como imagen.
 
 Para cubrir un banco que use otra frase en el asunto, se agrega a ``TERMINOS_ASUNTO`` (y a ``TERMINOS_GMAIL``
 si Gmail no la encontraría con los términos actuales).
@@ -45,7 +46,11 @@ TERMINOS_GMAIL: tuple[str, ...] = (
     "statement",
 )
 
-FIRMA_FILTRO = "asunto-" + hashlib.sha256("\n".join(TERMINOS_ASUNTO).encode("utf-8")).hexdigest()[:12]
+# Tipos que Gemini puede extraer. Cambiar esta lista o los términos cambia la firma (y se reconsulta Gmail).
+TIPOS_EXTRAIBLES: tuple[str, ...] = ("application/pdf", "image/png", "image/jpeg", "image/webp")
+EXTENSIONES_EXTRAIBLES: tuple[str, ...] = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
+
+FIRMA_FILTRO = "asunto-" + hashlib.sha256("\n".join((*TERMINOS_ASUNTO, *TIPOS_EXTRAIBLES)).encode("utf-8")).hexdigest()[:12]
 
 
 def normalizar_asunto(asunto: str) -> str:
@@ -73,6 +78,16 @@ def tiene_pdf(adjuntos: Iterable[dict[str, Any]]) -> bool:
     )
 
 
+def es_documento_extraible(adjunto: dict[str, Any]) -> bool:
+    mime = str(adjunto.get("mimeType", "")).lower()
+    return mime in TIPOS_EXTRAIBLES or str(adjunto.get("filename", "")).lower().endswith(EXTENSIONES_EXTRAIBLES)
+
+
+def tiene_documento(adjuntos: Iterable[dict[str, Any]]) -> bool:
+    """PDF o imagen (PNG, JPG, WebP): un estado de cuenta puede llegar solo como imagen."""
+    return any(es_documento_extraible(adjunto) for adjunto in adjuntos or [])
+
+
 def construir_query(folder: str) -> str:
-    """Consulta de Gmail: carpeta + PDF adjunto + alguno de los términos en el asunto."""
-    return f"{CONSULTAS_CARPETA.get(folder, 'in:inbox')} has:attachment filename:pdf subject:({' OR '.join(TERMINOS_GMAIL)})"
+    """Consulta de Gmail: carpeta + alguno de los términos en el asunto. El documento lo comprueba el backend."""
+    return f"{CONSULTAS_CARPETA.get(folder, 'in:inbox')} subject:({' OR '.join(TERMINOS_GMAIL)})"

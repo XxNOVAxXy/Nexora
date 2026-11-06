@@ -31,7 +31,7 @@ export type GmailMessage = {
   terminoAsunto?: string | null
 }
 
-/** `estados`: automático por asunto + PDF (por defecto). `remitentes`: por lista configurada. `todos`: sin filtro. */
+/** `estados`: automático por asunto + PDF o imagen (por defecto). `remitentes`: por lista configurada. `todos`: sin filtro. */
 export type FiltroCorreo = 'estados' | 'remitentes' | 'todos'
 
 /** Una página del listado de Gmail. */

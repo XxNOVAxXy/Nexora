@@ -201,8 +201,8 @@ def list_gmail_messages(
 ) -> dict[str, Any]:
     """Una página de correos.
 
-    - ``filtro=estados`` (por defecto): estados de cuenta de cualquier remitente. Gmail busca PDF adjunto + términos
-      en el asunto, y aquí se descartan los que no tienen la frase completa en el asunto o no traen PDF.
+    - ``filtro=estados`` (por defecto): estados de cuenta de cualquier remitente. Gmail busca términos en el asunto,
+      y aquí se descartan los que no tienen la frase completa en el asunto o no traen un PDF o una imagen.
     - ``filtro=remitentes``: búsqueda con ``from:`` y ``has:attachment``; se descartan los falsos positivos con la
       comparación exacta del remitente.
     - ``filtro=todos``: la carpeta sin filtro.
@@ -238,8 +238,8 @@ def list_gmail_messages(
         if filtro == "remitentes" and regla is None:
             descartados += 1  # Gmail lo devolvió (p. ej. por el nombre visible) pero la dirección no coincide.
             continue
-        if filtro == "estados" and (termino is None or not filtro_estados.tiene_pdf(message.get("attachments", []))):
-            descartados += 1  # Gmail coincide por palabras sueltas; aquí se exige la frase completa y un PDF.
+        if filtro == "estados" and (termino is None or not filtro_estados.tiene_documento(message.get("attachments", []))):
+            descartados += 1  # Gmail coincide por palabras sueltas; aquí se exige la frase completa y un PDF o imagen.
             continue
         messages.append({**message, "remitenteCoincide": regla is not None, "reglaRemitente": regla, "asuntoCoincide": termino is not None, "terminoAsunto": termino})
     return {**base, "sinRemitentes": False, "messages": messages, "nextPageToken": pagina["nextPageToken"], "descartados": descartados, "count": len(messages)}

@@ -9,11 +9,13 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from backend.app import main
-from backend.app.filtro_estados import FIRMA_FILTRO, asunto_coincide, construir_query, normalizar_asunto, tiene_pdf
+from backend.app.filtro_estados import FIRMA_FILTRO, asunto_coincide, construir_query, normalizar_asunto, tiene_documento, tiene_pdf
 from backend.app.preferencias import AlmacenClasificaciones, ConfiguracionCuenta
 
 PDF = {"mimeType": "application/pdf", "filename": "EdoCta.pdf"}
 IMAGEN = {"mimeType": "image/png", "filename": "promo.png"}
+JPG = {"mimeType": "image/jpeg", "filename": "estado_octubre.jpg"}
+OTRO = {"mimeType": "application/zip", "filename": "archivo.zip"}
 
 
 class AsuntoTests(unittest.TestCase):
@@ -51,9 +53,21 @@ class AsuntoTests(unittest.TestCase):
         self.assertFalse(tiene_pdf([IMAGEN]))
         self.assertFalse(tiene_pdf([]))
 
+    def test_tiene_documento_acepta_pdf_e_imagenes(self) -> None:
+        self.assertTrue(tiene_documento([PDF]))
+        self.assertTrue(tiene_documento([IMAGEN]))
+        self.assertTrue(tiene_documento([JPG]))
+        self.assertTrue(tiene_documento([{"mimeType": "image/webp", "filename": ""}]))
+        self.assertTrue(tiene_documento([{"mimeType": "application/octet-stream", "filename": "foto.JPEG"}]))
+        self.assertFalse(tiene_documento([OTRO, {"mimeType": "image/gif", "filename": "anim.gif"}]))
+        self.assertFalse(tiene_documento([]))
+
     def test_query_de_gmail(self) -> None:
         query = construir_query("inbox")
-        self.assertTrue(query.startswith("in:inbox has:attachment filename:pdf subject:("))
+        # Sin has:attachment ni filename:pdf: Gmail no cuenta las imágenes insertadas en el cuerpo como adjuntos.
+        self.assertTrue(query.startswith("in:inbox subject:("))
+        self.assertNotIn("filename:pdf", query)
+        self.assertNotIn("has:attachment", query)
         self.assertIn('"estado de cuenta"', query)
         self.assertIn(" OR ", query)
         self.assertTrue(construir_query("trash").startswith("in:trash "))
@@ -72,7 +86,9 @@ class FakeGmail:
             {"id": "ok-bbva", "subject": "Tu estado de cuenta", "senderEmail": "avisos@bbva.mx", "attachments": [PDF]},
             {"id": "ok-mp", "subject": "Resumen de cuenta octubre", "senderEmail": "info@mercadopago.com", "attachments": [PDF]},
             {"id": "sin-frase", "subject": "Cuenta nueva: tu estado", "senderEmail": "x@banco.com", "attachments": [PDF]},
-            {"id": "sin-pdf", "subject": "Estado de cuenta", "senderEmail": "x@banco.com", "attachments": [IMAGEN]},
+            {"id": "solo-imagen", "subject": "Estado de cuenta", "senderEmail": "x@banco.com", "attachments": [JPG]},
+            {"id": "sin-documento", "subject": "Estado de cuenta", "senderEmail": "x@banco.com", "attachments": [OTRO]},
+            {"id": "sin-adjuntos", "subject": "Estado de cuenta", "senderEmail": "x@banco.com", "attachments": []},
         ]
         return {"messages": mensajes, "nextPageToken": None}
 
@@ -93,13 +109,13 @@ class RutaEstadosTests(unittest.TestCase):
             self.addCleanup(parche.stop)
         self.api = TestClient(main.app)
 
-    def test_por_defecto_filtra_por_asunto_y_pdf_sin_remitentes_configurados(self) -> None:
+    def test_por_defecto_filtra_por_asunto_y_documento_sin_remitentes_configurados(self) -> None:
         respuesta = self.api.get("/api/gmail/messages").json()
         self.assertEqual(respuesta["filtro"], "estados")
         self.assertFalse(respuesta["sinRemitentes"])
         self.assertEqual(self.gmail.consultas[0]["query"], construir_query("inbox"))
-        self.assertEqual([m["id"] for m in respuesta["messages"]], ["ok-bbva", "ok-mp"])
-        self.assertEqual(respuesta["descartados"], 2)
+        self.assertEqual([m["id"] for m in respuesta["messages"]], ["ok-bbva", "ok-mp", "solo-imagen"])
+        self.assertEqual(respuesta["descartados"], 3)
         self.assertEqual(respuesta["firmaFiltro"], FIRMA_FILTRO)
         self.assertTrue(all(m["asuntoCoincide"] for m in respuesta["messages"]))
         self.assertEqual(respuesta["messages"][1]["terminoAsunto"], "resumen de cuenta")

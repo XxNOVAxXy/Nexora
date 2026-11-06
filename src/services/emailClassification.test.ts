@@ -114,12 +114,28 @@ describe('clasificación por remitente configurado', () => {
 
 describe('filtro automático por asunto', () => {
   const pdf = { id: 'a-1', filename: 'EdoCta.pdf', mimeType: 'application/pdf', size: 1000, partId: '1' }
+  const imagen = { id: 'a-2', filename: 'estado_octubre.jpg', mimeType: 'image/jpeg', size: 1000, partId: '1' }
 
   it('asunto validado por el backend + PDF es estado de cuenta, sin remitente configurado', () => {
     const detection = detectStatementEmail(message({ subject: 'Tu estado de cuenta', asuntoCoincide: true, attachments: [pdf] }))
     expect(detection.subjectMatches).toBe(true)
     expect(detection.senderMatches).toBe(false)
     expect(preliminaryClassification(detection)).toBe('ESTADO_DE_CUENTA')
+  })
+
+  it('asunto de estado de cuenta con solo una imagen: estado de cuenta', () => {
+    const detection = detectStatementEmail(message({ subject: 'Estado de cuenta', asuntoCoincide: true, attachments: [imagen] }))
+    expect(detection.hasImageAttachment).toBe(true)
+    expect(detection.hasPdfAttachment).toBe(false)
+    expect(preliminaryClassification(detection)).toBe('ESTADO_DE_CUENTA')
+  })
+
+  it('una clasificación guardada con las reglas anteriores (solo PDF) se recalcula', () => {
+    const correo = message({ subject: 'Estado de cuenta', asuntoCoincide: true, attachments: [imagen] })
+    const viejo = classifyMessagesWithCache([correo], {})
+    const { hasImageAttachment: _omitido, ...sinCampo } = viejo['message-1']
+    const despues = classifyMessagesWithCache([correo], { 'message-1': { ...sinCampo, classification: 'REQUIERE_REVISION' } as never })
+    expect(despues['message-1'].classification).toBe('ESTADO_DE_CUENTA')
   })
 
   it('asunto validado sin PDF queda pendiente de verificar', () => {
