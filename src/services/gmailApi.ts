@@ -26,9 +26,13 @@ export type GmailMessage = {
   /** El backend comprobó que la dirección del remitente coincide con un remitente configurado. */
   remitenteCoincide?: boolean
   reglaRemitente?: string | null
+  /** Filtro automático: el asunto contiene una frase de estado de cuenta (ver backend/app/filtro_estados.py). */
+  asuntoCoincide?: boolean
+  terminoAsunto?: string | null
 }
 
-export type FiltroCorreo = 'remitentes' | 'todos'
+/** `estados`: automático por asunto + PDF (por defecto). `remitentes`: por lista configurada. `todos`: sin filtro. */
+export type FiltroCorreo = 'estados' | 'remitentes' | 'todos'
 
 /** Una página del listado de Gmail. */
 export type PaginaGmail = {

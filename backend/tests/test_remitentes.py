@@ -123,7 +123,7 @@ class RutasTests(unittest.TestCase):
         return self.api.put("/api/configuracion/remitentes", json={"remitentes": remitentes})
 
     def test_sin_remitentes_no_consulta_gmail_y_lo_indica(self) -> None:
-        respuesta = self.api.get("/api/gmail/messages").json()
+        respuesta = self.api.get("/api/gmail/messages?filtro=remitentes").json()
         self.assertTrue(respuesta["sinRemitentes"])
         self.assertEqual((respuesta["messages"], respuesta["nextPageToken"]), ([], None))
         self.assertEqual(self.gmail.consultas, [])
@@ -133,12 +133,12 @@ class RutasTests(unittest.TestCase):
 
     def test_filtro_en_gmail_paginacion_sin_duplicados_y_falsos_positivos_descartados(self) -> None:
         self.assertEqual(self.poner_remitentes(["Estados@Banco.com", "@otrobanco.mx"]).status_code, 200)
-        primera = self.api.get("/api/gmail/messages").json()
+        primera = self.api.get("/api/gmail/messages?filtro=remitentes").json()
         self.assertEqual(self.gmail.consultas[0]["query"], 'in:inbox has:attachment (from:"estados@banco.com" OR from:"otrobanco.mx")')
         self.assertEqual([m["id"] for m in primera["messages"]], ["m1", "m2"])
         self.assertEqual(primera["nextPageToken"], "tok-2")
         self.assertEqual(primera["messages"][1]["reglaRemitente"], "@otrobanco.mx")
-        segunda = self.api.get("/api/gmail/messages?pageToken=tok-2").json()
+        segunda = self.api.get("/api/gmail/messages?filtro=remitentes&pageToken=tok-2").json()
         self.assertEqual(self.gmail.consultas[1]["page_token"], "tok-2")
         self.assertEqual([m["id"] for m in segunda["messages"]], ["m3"])
         self.assertEqual(segunda["descartados"], 1)  # "spoof" lo devolvió Gmail pero la dirección no coincide
@@ -148,9 +148,9 @@ class RutasTests(unittest.TestCase):
 
     def test_cambiar_remitentes_cambia_la_firma_del_filtro(self) -> None:
         self.poner_remitentes(["estados@banco.com"])
-        firma_a = self.api.get("/api/gmail/messages").json()["firmaFiltro"]
+        firma_a = self.api.get("/api/gmail/messages?filtro=remitentes").json()["firmaFiltro"]
         self.poner_remitentes(["estados@banco.com", "@otrobanco.mx"])
-        firma_b = self.api.get("/api/gmail/messages").json()["firmaFiltro"]
+        firma_b = self.api.get("/api/gmail/messages?filtro=remitentes").json()["firmaFiltro"]
         self.assertNotEqual(firma_a, firma_b)
         self.assertEqual(self.api.get("/api/configuracion/remitentes").json()["firma"], firma_b)
 
@@ -184,7 +184,7 @@ class RutasTests(unittest.TestCase):
         self.api.put("/api/clasificaciones/m1", json={"classification": "ESTADO_DE_CUENTA", "fingerprint": "v2:abc"})
         EMAIL_ACTUAL[0] = "b@example.com"
         self.assertEqual(self.api.get("/api/configuracion/remitentes").json()["remitentes"], [])
-        self.assertTrue(self.api.get("/api/gmail/messages").json()["sinRemitentes"])
+        self.assertTrue(self.api.get("/api/gmail/messages?filtro=remitentes").json()["sinRemitentes"])
         self.assertEqual(self.api.get("/api/clasificaciones").json()["clasificaciones"], {})
         self.assertFalse(self.api.post("/api/clasificaciones/migrar", json={"clasificaciones": {}}).json()["ya_migrado"])
         EMAIL_ACTUAL[0] = "A@example.com"

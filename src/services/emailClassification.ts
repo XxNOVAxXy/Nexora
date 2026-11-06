@@ -11,6 +11,8 @@ export type PreliminaryDetection = {
   hasPdfAttachment: boolean
   /** El backend comprobó que la dirección del remitente coincide con un remitente configurado. */
   senderMatches: boolean
+  /** El backend comprobó que el asunto contiene una frase de estado de cuenta (filtro automático). */
+  subjectMatches: boolean
 }
 
 export type PreliminaryClassificationResult = PreliminaryDetection & {
@@ -21,7 +23,7 @@ export type PreliminaryClassificationResult = PreliminaryDetection & {
 }
 
 export type ClassificationCache = Record<string, PreliminaryClassificationResult>
-type MensajeClasificable = Pick<GmailMessage, 'subject' | 'sender' | 'senderEmail' | 'body' | 'snippet' | 'attachments'> & Partial<Pick<GmailMessage, 'remitenteCoincide'>>
+type MensajeClasificable = Pick<GmailMessage, 'subject' | 'sender' | 'senderEmail' | 'body' | 'snippet' | 'attachments'> & Partial<Pick<GmailMessage, 'remitenteCoincide' | 'asuntoCoincide'>>
 
 const statementTerms = [
   'estado de cuenta',
@@ -56,15 +58,16 @@ export function detectStatementEmail(message: MensajeClasificable): PreliminaryD
     }),
     hasPdfAttachment: message.attachments.some(esPdf),
     senderMatches: message.remitenteCoincide === true,
+    subjectMatches: message.asuntoCoincide === true,
   }
 }
 
 /**
- * Remitente configurado + PDF adjunto => estado de cuenta por defecto. Las palabras clave solo apoyan:
+ * (Asunto de estado de cuenta o remitente configurado) + PDF adjunto => estado de cuenta por defecto. Las palabras clave solo apoyan:
  * con remitente sin PDF (p. ej. una imagen), palabras clave o un documento, queda pendiente de verificar.
  */
 export function preliminaryClassification(detection: PreliminaryDetection): EmailClassification {
-  if (detection.senderMatches && detection.hasPdfAttachment) return 'ESTADO_DE_CUENTA'
+  if ((detection.senderMatches || detection.subjectMatches) && detection.hasPdfAttachment) return 'ESTADO_DE_CUENTA'
   return detection.senderMatches || detection.matched || detection.hasDocumentAttachment ? 'REQUIERE_REVISION' : 'NO_ES_ESTADO_DE_CUENTA'
 }
 
@@ -113,8 +116,8 @@ export function classifyMessagesWithCache(messages: GmailMessage[], previousCach
   return messages.reduce<ClassificationCache>((cache, message) => {
     const fingerprint = emailClassificationFingerprint(message)
     const previous = previousCache[message.id]
-    // La coincidencia de remitente depende de la configuración: si cambia, se reclasifica aunque el correo no cambie.
-    cache[message.id] = previous?.fingerprint === fingerprint && previous.senderMatches === (message.remitenteCoincide === true) ? previous : classifyEmailPreliminarily(message, analyzedAt)
+    // Las coincidencias de remitente y asunto las decide el backend: si cambian, se reclasifica aunque el correo no cambie.
+    cache[message.id] = previous?.fingerprint === fingerprint && previous.senderMatches === (message.remitenteCoincide === true) && previous.subjectMatches === (message.asuntoCoincide === true) ? previous : classifyEmailPreliminarily(message, analyzedAt)
     return cache
   }, { ...previousCache })
 }

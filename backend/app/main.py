@@ -13,6 +13,7 @@ from .adjuntos import content_disposition
 from .config import settings
 from .preferencias import AlmacenClasificaciones, ClasificacionRequest, ConfiguracionCuenta, MigracionRequest, RemitentesRequest
 from .remitentes import CONSULTAS_CARPETA, ListaRemitentesInvalida, coincide, construir_query
+from . import filtro_estados
 from .savedata import EnvioRequest, NoSePuedeEnviar, SaveDataConfig, SaveDataConfigRequest, ServicioEnvio
 from .extracciones import ID_DOCUMENTO_SEGURO, AlmacenExtracciones, ConflictoVersion, EnvioEnCurso, ExtraccionDanada, GuardarExtraccionRequest, RevisionConProblemas, cuenta_id
 from .gemini import GeminiRequestError, GeminiSettings, GeminiUnavailableError
@@ -195,19 +196,31 @@ def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
 def list_gmail_messages(
     folder: str = Query("inbox", pattern="^(inbox|sent|archive|trash)$"),
     limit: int = Query(25, ge=1, le=50),
-    filtro: str = Query("remitentes", pattern="^(remitentes|todos)$"),
+    filtro: str = Query("estados", pattern="^(estados|remitentes|todos)$"),
     pageToken: str | None = Query(None, max_length=500, pattern=r"^[A-Za-z0-9_-]+$"),
 ) -> dict[str, Any]:
-    """Una página de correos. Con ``filtro=remitentes`` la búsqueda se hace en Gmail con ``from:`` y
-    ``has:attachment``; después se descartan los falsos positivos con la comparación exacta del remitente."""
+    """Una página de correos.
+
+    - ``filtro=estados`` (por defecto): estados de cuenta de cualquier remitente. Gmail busca PDF adjunto + términos
+      en el asunto, y aquí se descartan los que no tienen la frase completa en el asunto o no traen PDF.
+    - ``filtro=remitentes``: búsqueda con ``from:`` y ``has:attachment``; se descartan los falsos positivos con la
+      comparación exacta del remitente.
+    - ``filtro=todos``: la carpeta sin filtro.
+    """
     email = _cuenta_actual()
     config = configuracion.leer(email)
     reglas = config["remitentes"]
-    base = {"folder": folder, "filtro": filtro, "firmaFiltro": config["firma"], "remitentes": len(reglas)}
+    firma = filtro_estados.FIRMA_FILTRO if filtro == "estados" else config["firma"]
+    base = {"folder": folder, "filtro": filtro, "firmaFiltro": firma, "remitentes": len(reglas)}
     if filtro == "remitentes" and not reglas:
         # Sin remitentes no se consulta Gmail: la interfaz pide configurarlos o ver todos los correos.
         return {**base, "sinRemitentes": True, "messages": [], "nextPageToken": None, "descartados": 0, "count": 0}
-    query = construir_query(folder, reglas) if filtro == "remitentes" else CONSULTAS_CARPETA[folder]
+    if filtro == "estados":
+        query = filtro_estados.construir_query(folder)
+    elif filtro == "remitentes":
+        query = construir_query(folder, reglas)
+    else:
+        query = CONSULTAS_CARPETA[folder]
     try:
         pagina = gmail.list_messages(folder=folder, max_results=limit, page_token=pageToken, query=query)
     except GmailNotConnectedError as error:
@@ -221,10 +234,14 @@ def list_gmail_messages(
     descartados = 0
     for message in pagina["messages"]:
         regla = coincide(message.get("senderEmail", ""), reglas)
+        termino = filtro_estados.asunto_coincide(message.get("subject", ""))
         if filtro == "remitentes" and regla is None:
             descartados += 1  # Gmail lo devolvió (p. ej. por el nombre visible) pero la dirección no coincide.
             continue
-        messages.append({**message, "remitenteCoincide": regla is not None, "reglaRemitente": regla})
+        if filtro == "estados" and (termino is None or not filtro_estados.tiene_pdf(message.get("attachments", []))):
+            descartados += 1  # Gmail coincide por palabras sueltas; aquí se exige la frase completa y un PDF.
+            continue
+        messages.append({**message, "remitenteCoincide": regla is not None, "reglaRemitente": regla, "asuntoCoincide": termino is not None, "terminoAsunto": termino})
     return {**base, "sinRemitentes": False, "messages": messages, "nextPageToken": pagina["nextPageToken"], "descartados": descartados, "count": len(messages)}
 
 

@@ -111,3 +111,27 @@ describe('clasificación por remitente configurado', () => {
     expect(despues['message-1'].classification).toBe('ESTADO_DE_CUENTA')
   })
 })
+
+describe('filtro automático por asunto', () => {
+  const pdf = { id: 'a-1', filename: 'EdoCta.pdf', mimeType: 'application/pdf', size: 1000, partId: '1' }
+
+  it('asunto validado por el backend + PDF es estado de cuenta, sin remitente configurado', () => {
+    const detection = detectStatementEmail(message({ subject: 'Tu estado de cuenta', asuntoCoincide: true, attachments: [pdf] }))
+    expect(detection.subjectMatches).toBe(true)
+    expect(detection.senderMatches).toBe(false)
+    expect(preliminaryClassification(detection)).toBe('ESTADO_DE_CUENTA')
+  })
+
+  it('asunto validado sin PDF queda pendiente de verificar', () => {
+    const detection = detectStatementEmail(message({ subject: 'Tu estado de cuenta', asuntoCoincide: true, attachments: [] }))
+    expect(preliminaryClassification(detection)).toBe('REQUIERE_REVISION')
+  })
+
+  it('reclasifica si cambia la coincidencia de asunto aunque el correo sea igual', () => {
+    const correo = message({ subject: 'Documentos', attachments: [pdf] })
+    const antes = classifyMessagesWithCache([correo], {})
+    expect(antes[correo.id].classification).toBe('REQUIERE_REVISION')
+    const despues = classifyMessagesWithCache([{ ...correo, asuntoCoincide: true }], antes)
+    expect(despues[correo.id].classification).toBe('ESTADO_DE_CUENTA')
+  })
+})

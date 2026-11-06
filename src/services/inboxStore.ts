@@ -36,7 +36,7 @@ const inflightListados = new Map<string, Promise<Listado>>()
 let inflightStatus: Promise<GmailStatus> | null = null
 let lastStatus: GmailStatus | null = null
 let lastFolder: MailFolder = 'inbox'
-let lastFiltro: FiltroCorreo = 'remitentes'
+let lastFiltro: FiltroCorreo = 'estados'
 let classificationCache: ClassificationCache = {}
 let estados: { cuentaId: string; mapa: EstadosExtraccion; fetchedAt: number } | null = null
 let inflightEstados: Promise<EstadosExtraccion> | null = null
@@ -76,8 +76,8 @@ const limpiarCuenta = () => {
 }
 
 export const claveEstado = (messageId: string, partId: string) => `${messageId}__${partId}`
-/** La clave del listado incluye carpeta, filtro y la firma de los remitentes con que se filtró. */
-export const claveListado = (folder: MailFolder, filtro: FiltroCorreo, firma: string | null) => `${folder}|${filtro}|${filtro === 'todos' ? '-' : firma ?? '?'}`
+/** La clave del listado incluye carpeta, filtro y, con el filtro por remitentes, la firma de la lista con que se filtró. */
+export const claveListado = (folder: MailFolder, filtro: FiltroCorreo, firma: string | null) => `${folder}|${filtro}|${filtro === 'remitentes' ? firma ?? '?' : '-'}`
 
 function guardarPagina(clave: string, folder: MailFolder, filtro: FiltroCorreo, pagina: Awaited<ReturnType<typeof gmailApi.listar>>, previo: Listado | null, token: string | null): Listado {
   const vistos = new Set(previo?.messages.map((message) => message.id) ?? [])
