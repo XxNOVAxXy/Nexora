@@ -20,6 +20,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 
+from .adjuntos import TIPOS_DOCUMENTALES, nombre_desde_cabeceras, nombre_seguro
 from .config import settings
 from .remitentes import CONSULTAS_CARPETA
 
@@ -264,8 +265,9 @@ class GmailClient:
             )
             data = response.get("data", "")
             try:
-                filename = attachment_info["filename"] if attachment_info else "attachment"
                 declared_type = attachment_info["mimeType"] if attachment_info else ""
+                # El nombre del listado ya está saneado; sin listado se usa un nombre genérico seguro.
+                filename = attachment_info["filename"] if attachment_info else nombre_seguro("", declared_type)
                 document = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
                 media_type = _media_type_for(filename, declared_type)
                 document, media_type = validate_attachment_payload(document, media_type, filename)
@@ -378,14 +380,19 @@ def _attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
 
     def collect(part: dict[str, Any]) -> None:
-        filename = part.get("filename")
         body = part.get("body", {})
-        if filename and body.get("attachmentId"):
+        declared_type = part.get("mimeType", "")
+        # Gmail puede dejar ``filename`` vacío cuando el nombre viene con RFC 2231 en las cabeceras de la parte.
+        raw_name = part.get("filename") or nombre_desde_cabeceras(part.get("headers"))
+        # Las partes sin nombre solo se listan si son documentos (PDF o imagen): un cuerpo HTML grande
+        # también llega con attachmentId y no es un adjunto.
+        if body.get("attachmentId") and (raw_name or declared_type.lower() in TIPOS_DOCUMENTALES):
+            filename = nombre_seguro(raw_name, declared_type)
             result.append(
                 {
                     "id": body["attachmentId"],
                     "filename": filename,
-                    "mimeType": _media_type_for(filename, part.get("mimeType", "")),
+                    "mimeType": _media_type_for(filename, declared_type),
                     "size": body.get("size", 0),
                     # Estable entre consultas (el attachmentId no lo es): clave del guardado.
                     "partId": part.get("partId", ""),

@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from .adjuntos import content_disposition
 from .config import settings
 from .preferencias import AlmacenClasificaciones, ClasificacionRequest, ConfiguracionCuenta, MigracionRequest, RemitentesRequest
 from .remitentes import CONSULTAS_CARPETA, ListaRemitentesInvalida, coincide, construir_query
@@ -44,9 +45,13 @@ def _rate_limited(error: GmailRateLimitError) -> HTTPException:
     return HTTPException(status_code=429, detail=str(error), headers={"Retry-After": "60"})
 
 
+GEMINI_API_KEY_MIN = 10
+
+
 class GeminiConfigRequest(BaseModel):
-    apiKey: str | None = Field(default=None, min_length=10)
-    model: str = Field(min_length=1)
+    # Vacía, solo espacios o ausente: se conserva la key guardada (p. ej. al cambiar solo el modelo).
+    apiKey: str | None = Field(default=None, max_length=512)
+    model: str = Field(min_length=1, max_length=200)
 
 
 class GeminiExtractionRequest(BaseModel):
@@ -122,8 +127,16 @@ def gemini_status() -> dict[str, Any]:
 
 @app.post("/api/gemini/config")
 def save_gemini_config(payload: GeminiConfigRequest) -> dict[str, Any]:
-    logger.info("Gemini configuration saved with model=%s", payload.model)
-    return gemini.save(payload.apiKey, payload.model)
+    api_key = (payload.apiKey or "").strip() or None
+    model = payload.model.strip()
+    if not model:
+        raise HTTPException(status_code=422, detail="Selecciona un modelo de Gemini.")
+    if api_key is not None and len(api_key) < GEMINI_API_KEY_MIN:
+        raise HTTPException(status_code=422, detail="La API key de Gemini es demasiado corta; revisa que este completa.")
+    if api_key is None and not gemini.status()["configured"]:
+        raise HTTPException(status_code=422, detail="Escribe una API key de Gemini para activar la integracion.")
+    logger.info("Gemini configuration saved with model=%s new_key=%s", model, api_key is not None)
+    return gemini.save(api_key, model)
 
 
 @app.delete("/api/gemini/config")
@@ -235,12 +248,20 @@ def download_gmail_attachment(message_id: str, attachment_id: str) -> StreamingR
         raise HTTPException(status_code=401, detail=str(error)) from error
     except GmailRateLimitError as error:
         raise _rate_limited(error) from error
+    except GmailAttachmentError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"No se pudo descargar el adjunto: {error}") from error
+    try:
+        disposicion = content_disposition(filename, media_type)
+    except Exception:
+        # Último recurso: un nombre que no se pudo procesar nunca debe producir un 500.
+        logger.exception("No se pudo construir Content-Disposition para el adjunto %s", attachment_id)
+        disposicion = content_disposition("", media_type)
     return StreamingResponse(
         iter([data]),
         media_type=media_type,
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        headers={"Content-Disposition": disposicion},
     )
 
 

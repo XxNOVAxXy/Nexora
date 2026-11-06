@@ -42,6 +42,26 @@ class GeminiRequestError(RuntimeError):
 # Cambia esta versión cada vez que cambie el prompt o el esquema: invalida los resultados en caché.
 PROMPT_VERSION = "2026-11-05.2"
 CACHE_MAX_ITEMS = 16
+# Máximo de los modelos Flash actuales. Los tokens de razonamiento también cuentan contra este límite.
+MAX_OUTPUT_TOKENS_PREDETERMINADO = 65536
+# Códigos de error que indican que la respuesta no está completa: nunca se reintentan ni se guardan en caché.
+CODIGOS_RESPUESTA_INCOMPLETA = {"invalid_response", "respuesta_truncada", "respuesta_incompleta"}
+
+
+def max_output_tokens() -> int:
+    """Límite de salida de Gemini, configurable con GEMINI_MAX_OUTPUT_TOKENS (entero positivo)."""
+    valor = os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "").strip()
+    if not valor:
+        return MAX_OUTPUT_TOKENS_PREDETERMINADO
+    try:
+        tokens = int(valor)
+    except ValueError:
+        logger.warning("GEMINI_MAX_OUTPUT_TOKENS no es un entero (%r); se usa %d.", valor, MAX_OUTPUT_TOKENS_PREDETERMINADO)
+        return MAX_OUTPUT_TOKENS_PREDETERMINADO
+    if tokens <= 0:
+        logger.warning("GEMINI_MAX_OUTPUT_TOKENS debe ser positivo (%d); se usa %d.", tokens, MAX_OUTPUT_TOKENS_PREDETERMINADO)
+        return MAX_OUTPUT_TOKENS_PREDETERMINADO
+    return tokens
 
 
 class ResumenExtraido(BaseModel):
@@ -188,7 +208,7 @@ class GeminiSettings:
                     return _parse_extraction(text), candidate
                 except GeminiRequestError as error:
                     last_error = error
-                    if error.code == "invalid_response":
+                    if error.code in CODIGOS_RESPUESTA_INCOMPLETA:
                         raise
                     if not error.retryable:
                         if _is_model_error(str(error)) and candidate != candidates[-1]:
@@ -236,11 +256,15 @@ def _call_gemini_sdk(api_key: str, model: str, data: bytes, mime_type: str, file
             ],
             config=types.GenerateContentConfig(
                 temperature=0,
-                max_output_tokens=8192,
+                max_output_tokens=max_output_tokens(),
                 response_mime_type="application/json",
                 response_schema=StatementExtraction,
             ),
         )
+        _registrar_uso(model, response)
+        # Antes de leer el texto: una respuesta cortada nunca se trata como extracción completa,
+        # aunque el JSON parcial se pueda leer.
+        _verificar_finalizacion(response)
         text = getattr(response, "text", None)
         if not isinstance(text, str) or not text.strip():
             raise GeminiRequestError("Gemini devolvio una respuesta vacia.", code="invalid_response")
@@ -259,6 +283,48 @@ def _call_gemini_sdk(api_key: str, model: str, data: bytes, mime_type: str, file
         if "404" in lowered or "not found" in lowered or "model" in lowered and "not" in lowered:
             raise GeminiRequestError(f"El modelo de Gemini no esta disponible: {model}.", code="model_unavailable", status_code=502, retryable=False) from error
         raise GeminiRequestError(f"No se pudo completar la solicitud a Gemini: {message}", code="request", retryable=True) from error
+
+
+def _nombre_finalizacion(response: Any) -> str | None:
+    """Nombre de ``finish_reason`` del primer candidato ("STOP", "MAX_TOKENS"…), o None si no viene."""
+    candidatos = getattr(response, "candidates", None) or []
+    if not candidatos:
+        return None
+    razon = getattr(candidatos[0], "finish_reason", None)
+    if razon is None:
+        return None
+    nombre = getattr(razon, "name", None) or str(razon)
+    return nombre.rsplit(".", 1)[-1].upper()
+
+
+def _verificar_finalizacion(response: Any) -> None:
+    razon = _nombre_finalizacion(response)
+    if razon is None or razon in {"STOP", "FINISH_REASON_UNSPECIFIED"}:
+        return
+    if razon == "MAX_TOKENS":
+        raise GeminiRequestError(
+            "El estado de cuenta es demasiado largo: la respuesta de Gemini se corto por el limite de salida "
+            f"({max_output_tokens()} tokens) y no se uso. Ninguna extraccion parcial se trata como completa.",
+            code="respuesta_truncada",
+            status_code=422,
+        )
+    raise GeminiRequestError(
+        f"Gemini termino la respuesta antes de completarla (motivo: {razon}); la extraccion no se uso.",
+        code="respuesta_incompleta",
+        status_code=502,
+    )
+
+
+def _registrar_uso(model: str, response: Any) -> None:
+    uso = getattr(response, "usage_metadata", None)
+    logger.info(
+        "Gemini response model=%s finish_reason=%s output_tokens=%s thoughts_tokens=%s limit=%d",
+        model,
+        _nombre_finalizacion(response),
+        getattr(uso, "candidates_token_count", None),
+        getattr(uso, "thoughts_token_count", None),
+        max_output_tokens(),
+    )
 
 
 def _validate_document_input(data: bytes, mime_type: str, filename: str) -> tuple[bytes, str]:

@@ -14,18 +14,38 @@ from backend.app.gemini import StatementExtraction, _build_result, _call_gemini_
 from backend.app.gmail import GmailAttachmentError, validate_attachment_payload
 
 
-REAL_PDF = Path.home() / "Downloads" / "Estado_de_Cuenta_Prueba_Nexora.pdf"
+# Estado de cuenta ficticio versionado en el repo (lo genera fixtures/generar_pdf_prueba.py).
+REAL_PDF = Path(__file__).parent / "fixtures" / "estado_cuenta_ficticio.pdf"
 
 
 class DocumentTransportTests(unittest.TestCase):
     def test_real_pdf_has_pdf_signature_and_is_forced_to_pdf_mime(self) -> None:
-        if not REAL_PDF.exists():
-            self.skipTest(f"No existe el fixture local: {REAL_PDF}")
+        self.assertTrue(REAL_PDF.exists(), f"Falta el fixture {REAL_PDF}")
         data = REAL_PDF.read_bytes()
         validated, mime_type = validate_attachment_payload(data, "application/octet-stream", REAL_PDF.name)
         self.assertEqual(validated[:5], b"%PDF-")
         self.assertEqual(mime_type, "application/pdf")
         self.assertGreater(len(validated), 1000)
+
+    def test_fixture_pdf_is_structurally_valid_and_matches_generator(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("generar_pdf_prueba", REAL_PDF.with_name("generar_pdf_prueba.py"))
+        assert spec is not None and spec.loader is not None
+        generador = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generador)
+        construir_pdf = generador.construir_pdf
+
+        data = REAL_PDF.read_bytes()
+        # Si git hubiera convertido saltos de línea, los offsets de la tabla xref dejarían de apuntar a los objetos.
+        self.assertEqual(data, construir_pdf())
+        inicio_xref = int(data.rsplit(b"startxref", 1)[1].split()[0])
+        self.assertTrue(data[inicio_xref:].startswith(b"xref"))
+        entradas = data[inicio_xref:].splitlines()[3:9]
+        for numero, entrada in enumerate(entradas, start=1):
+            offset = int(entrada.split()[0])
+            self.assertTrue(data[offset:].startswith(b"%d 0 obj" % numero), numero)
+        self.assertTrue(data.rstrip().endswith(b"%%EOF"))
 
     def test_pdf_signature_wins_when_gmail_metadata_is_generic(self) -> None:
         validated, mime_type = validate_attachment_payload(b"%PDF-1.7\nbody", "application/octet-stream", "attachment")

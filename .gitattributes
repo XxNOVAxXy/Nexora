@@ -1,0 +1,3 @@
+# Los PDF de prueba no tienen bytes NUL: sin esto, core.autocrlf cambiaría los saltos de línea y
+# rompería la tabla xref.
+*.pdf binary
