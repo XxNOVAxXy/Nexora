@@ -98,6 +98,21 @@ class SerializacionTests(unittest.TestCase):
 
 
 class EnvioTests(unittest.TestCase):
+    def assertCuerpoCompleto(self, cuerpo: str) -> None:
+        """{"data": "<string>"} con solo nuestra extracción limpia, sin la estructura CargaInicial/Saldos."""
+        externo = json.loads(cuerpo)
+        self.assertEqual(list(externo), ["data"])
+        self.assertIsInstance(externo["data"], str)
+        interno = json.loads(externo["data"])
+        self.assertEqual(list(interno), ["Archivo", "Resumen", "Transacciones", "Validacion"])
+        self.assertEqual(interno["Archivo"], "estado.pdf")
+        self.assertEqual(interno["Resumen"]["saldo_final"], RESUMEN["saldo_final"])
+        self.assertEqual(interno["Transacciones"], [
+            {"fecha": "02/10", "concepto": "DEPOSITO", "referencia": "", "cargo": "", "abono": "10.00", "saldo": ""},
+            {"fecha": "05/10", "concepto": "COMISION", "referencia": "", "cargo": "2.00", "abono": "", "saldo": ""},
+        ])
+        self.assertEqual(interno["Validacion"], {"cuadra": True, "suma_cargos": "2.00", "suma_abonos": "10.00"})
+
     def setUp(self) -> None:
         self.directorio = tempfile.TemporaryDirectory()
         self.addCleanup(self.directorio.cleanup)
@@ -135,7 +150,7 @@ class EnvioTests(unittest.TestCase):
         self.assertEqual(respuesta.status_code, 200, respuesta.text)
         self.assertEqual(len(self.servidor.recibidos), 1)
         recibido = self.servidor.recibidos[0]
-        self.assertEqual(recibido["cuerpo"].decode(), json.dumps({"data": EJEMPLO_INTERNO}))
+        self.assertCuerpoCompleto(recibido["cuerpo"].decode())
         self.assertEqual(recibido["content_type"], "application/json")
         self.assertEqual(recibido["ruta"], "/V3/Pruebas/SaveData")
         documento = self.documento()
@@ -143,7 +158,7 @@ class EnvioTests(unittest.TestCase):
         self.assertIsNotNone(documento["enviado_en"])
         intento = documento["envios"][0]
         self.assertEqual((intento["resultado"], intento["http_status"], intento["error"]), ("exito", 200, None))
-        self.assertEqual(intento["cuerpo"], json.dumps({"data": EJEMPLO_INTERNO}))
+        self.assertEqual(intento["cuerpo"], recibido["cuerpo"].decode())
         self.assertEqual(json.loads(intento["respuesta"]), RESPUESTA_EXITO)
         self.assertEqual(intento["version_extraccion"], version)
         self.assertEqual(documento["version"], version)  # enviar no altera el contenido ni su versión
@@ -260,7 +275,7 @@ class EnvioTests(unittest.TestCase):
     def test_vista_previa_muestra_cuerpo_exacto_sin_contactar_savedata(self) -> None:
         self.guardar(estado="borrador")
         previa = self.api.post("/api/extracciones/m1/1/enviar/vista-previa", json={"sucursal": 3102, "articulo": "10000453"}).json()
-        self.assertEqual(previa["cuerpo"], json.dumps({"data": EJEMPLO_INTERNO}))
+        self.assertCuerpoCompleto(previa["cuerpo"])
         self.assertEqual(previa["totales"], {"abonos": "10.00", "cargos": "2.00"})
         self.assertFalse(previa["puede_enviar"])
         self.assertTrue(any("revisado" in motivo for motivo in previa["motivos"]))

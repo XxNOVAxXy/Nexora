@@ -198,9 +198,33 @@ def _requiere_confirmar_reenvio(documento: dict[str, Any]) -> dict[str, Any] | N
     return previos[-1] if previos else None
 
 
+CAMPOS_RESUMEN = ("banco", "titular", "cuenta", "periodo", "moneda", "saldo_inicial", "total_cargos", "total_abonos", "saldo_final")
+CAMPOS_TRANSACCION = ("fecha", "concepto", "referencia", "cargo", "abono", "saldo")
+
+
+def datos_documento(documento: dict[str, Any], totales: TotalesEnvio) -> dict[str, Any]:
+    """Nuestra extracción revisada, limpia: solo datos del estado de cuenta.
+
+    Sin campos internos de Nexora (id, huella, origen, dudosos, *_original) y sin filas vacías.
+    """
+    resumen = documento.get("resumen") or {}
+    transacciones = [
+        {campo: str(fila.get(campo) or "") for campo in CAMPOS_TRANSACCION}
+        for fila in documento.get("transacciones") or []
+    ]
+    validacion = documento.get("validacion") or {}
+    return {
+        "Archivo": documento.get("filename"),
+        "Resumen": {campo: resumen.get(campo, "") for campo in CAMPOS_RESUMEN},
+        "Transacciones": [fila for fila in transacciones if any(valor.strip() for valor in fila.values())],
+        "Validacion": {"cuadra": validacion.get("cuadra"), "suma_cargos": formatear_decimal(totales.cargos), "suma_abonos": formatear_decimal(totales.abonos)},
+    }
+
+
 def preparar_envio(documento: dict[str, Any], *, sucursal: int, articulo: str, carga_inicial: bool) -> dict[str, Any]:
+    # Se envía solo nuestra extracción. construir_saldos() (formato H/S de SaveData) queda disponible pero no se usa.
     totales = totales_de(documento)
-    interno = construir_saldos(totales, sucursal, articulo, carga_inicial)
+    interno = datos_documento(documento, totales)
     return {"interno": interno, "cuerpo": serializar_cuerpo(interno), "totales": {"abonos": formatear_decimal(totales.abonos), "cargos": formatear_decimal(totales.cargos)}}
 
 

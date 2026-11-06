@@ -13,7 +13,12 @@ export type DatosEnvio = { sucursal: number; articulo: string; carga_inicial: bo
 export type VistaPreviaEnvio = {
   /** Cuerpo exacto que se enviaría a SaveData. */
   cuerpo: string
-  interno: { CargaInicial: boolean; Saldos: { Sucursal: number; Articulo: string; Saldo: number; Clave: string }[] }
+  interno: {
+    Archivo: string | null
+    Resumen: Record<string, string>
+    Transacciones: { fecha: string; concepto: string; referencia: string; cargo: string; abono: string; saldo: string }[]
+    Validacion: { cuadra: boolean | null; suma_cargos: string; suma_abonos: string }
+  }
   totales: { abonos: string; cargos: string }
   version: number
   estado: string
