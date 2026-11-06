@@ -22,6 +22,12 @@ class Settings:
     port: int = int(os.getenv("PORT", "8000"))
     token_path: Path = PROJECT_ROOT / "backend" / "data" / "gmail_token.json"
     gemini_settings_path: Path = PROJECT_ROOT / "backend" / "data" / "gemini_settings.json"
+    extracciones_path: Path = PROJECT_ROOT / "backend" / "data" / "extracciones"
+    savedata_settings_path: Path = PROJECT_ROOT / "backend" / "data" / "savedata_settings.json"
+    configuracion_path: Path = PROJECT_ROOT / "backend" / "data" / "configuracion"
+    clasificaciones_path: Path = PROJECT_ROOT / "backend" / "data" / "clasificaciones"
+    # URL del servicio SaveData; el frontend nunca la llama directamente.
+    savedata_url: str = os.getenv("SAVEDATA_URL", "")
 
 
 settings = Settings()

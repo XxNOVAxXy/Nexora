@@ -56,7 +56,7 @@ class FakeService:
     def attachments(self) -> "FakeService":
         return self
 
-    def list(self, userId: str, q: str, maxResults: int) -> _Request:
+    def list(self, userId: str, q: str, maxResults: int, pageToken: str | None = None) -> _Request:
         ids = self.unread if "is:unread" in q else self.ids
         return _Request(self, "list", self.error or {"messages": [{"id": item} for item in ids]})
 
@@ -76,13 +76,13 @@ class GmailCacheTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_second_listing_only_spends_list_calls_and_refreshes_unread(self) -> None:
-        first = self.client.list_messages("inbox")
+        first = self.client.list_messages("inbox")["messages"]
         self.assertEqual(self.service.calls.count("get"), 2)
         self.assertEqual([m["unread"] for m in first], [True, False])
 
         self.service.calls.clear()
         self.service.unread = []  # m1 was read in Gmail meanwhile
-        second = self.client.list_messages("inbox")
+        second = self.client.list_messages("inbox")["messages"]
         self.assertEqual(self.service.calls, ["list", "list"])
         self.assertEqual([m["unread"] for m in second], [False, False])
         self.assertNotIn("UNREAD", second[0]["labels"])
@@ -109,11 +109,14 @@ class GmailCacheTests(unittest.TestCase):
 class RateLimitRouteTests(unittest.TestCase):
     def test_listing_returns_429_with_retry_after(self) -> None:
         class ThrottledGmail:
-            def list_messages(self, folder: str, max_results: int) -> list[dict[str, Any]]:
+            def profile(self) -> dict[str, Any]:
+                return {"email": "a@example.com"}
+
+            def list_messages(self, folder: str, max_results: int, page_token: str | None = None, query: str | None = None) -> dict[str, Any]:
                 raise GmailRateLimitError("Gmail está limitando las consultas.")
 
         with patch.object(main, "gmail", ThrottledGmail()):
-            response = TestClient(main.app).get("/api/gmail/messages")
+            response = TestClient(main.app).get("/api/gmail/messages?filtro=todos")
         self.assertEqual(response.status_code, 429)
         self.assertEqual(response.headers.get("retry-after"), "60")
 

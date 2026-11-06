@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { GmailMessage } from './gmailApi'
-import { classifyMessagesWithCache, detectStatementEmail, preliminaryClassification } from './emailClassification'
+import { classifyMessagesWithCache, detectStatementEmail, emailClassificationFingerprint, preliminaryClassification } from './emailClassification'
 
 const message = (overrides: Partial<GmailMessage> = {}): GmailMessage => ({
   id: 'message-1',
@@ -31,7 +31,7 @@ describe('detección preliminar de estados de cuenta', () => {
     const detection = detectStatementEmail(message({
       senderEmail: 'notices@bank.example',
       body: 'Your account statement is ready.',
-      attachments: [{ id: 'attachment-1', filename: 'statement-april.pdf', mimeType: 'application/pdf', size: 1000 }],
+      attachments: [{ id: 'attachment-1', filename: 'statement-april.pdf', mimeType: 'application/pdf', size: 1000, partId: '1' }],
     }))
 
     expect(detection.matchedTerms).toContain('account statement')
@@ -59,7 +59,7 @@ describe('detección preliminar de estados de cuenta', () => {
   it('deja pendiente un PDF genérico para la futura verificación de Gemini', () => {
     const detection = detectStatementEmail(message({
       subject: 'Documentos del mes',
-      attachments: [{ id: 'attachment-1', filename: 'documento.pdf', mimeType: 'application/pdf', size: 5000 }],
+      attachments: [{ id: 'attachment-1', filename: 'documento.pdf', mimeType: 'application/pdf', size: 5000, partId: '1' }],
     }))
 
     expect(detection.matched).toBe(false)
@@ -75,5 +75,39 @@ describe('detección preliminar de estados de cuenta', () => {
     expect(second['message-1']).toBe(first['message-1'])
     expect(changed['message-1']).not.toBe(first['message-1'])
     expect(changed['message-1'].fingerprint).not.toBe(first['message-1'].fingerprint)
+  })
+})
+
+describe('clasificación por remitente configurado', () => {
+  const pdf = { id: 'att-rotativo-1', filename: 'estado.pdf', mimeType: 'application/pdf', size: 1000, partId: '1' }
+  const imagen = { id: 'att-2', filename: 'estado.jpg', mimeType: 'image/jpeg', size: 1000, partId: '1' }
+
+  it('remitente configurado con PDF: estado de cuenta por defecto, aunque no haya palabras clave', () => {
+    const detection = detectStatementEmail(message({ subject: 'Documentos', remitenteCoincide: true, attachments: [pdf] }))
+    expect(detection.matched).toBe(false)
+    expect(preliminaryClassification(detection)).toBe('ESTADO_DE_CUENTA')
+  })
+
+  it('remitente configurado con imagen y sin PDF: pendiente de verificar', () => {
+    expect(preliminaryClassification(detectStatementEmail(message({ remitenteCoincide: true, attachments: [imagen] })))).toBe('REQUIERE_REVISION')
+  })
+
+  it('palabras clave y PDF sin remitente configurado: solo apoyo, queda pendiente', () => {
+    expect(preliminaryClassification(detectStatementEmail(message({ subject: 'Estado de cuenta', remitenteCoincide: false, attachments: [pdf] })))).toBe('REQUIERE_REVISION')
+  })
+
+  it('la huella usa partId: no cambia cuando Gmail rota el id del adjunto', () => {
+    const a = emailClassificationFingerprint(message({ attachments: [pdf] }))
+    const b = emailClassificationFingerprint(message({ attachments: [{ ...pdf, id: 'att-rotativo-2' }] }))
+    expect(a).toBe(b)
+    expect(a.startsWith('v2:')).toBe(true)
+    expect(emailClassificationFingerprint(message({ attachments: [{ ...pdf, partId: '2' }] }))).not.toBe(a)
+  })
+
+  it('cambiar la coincidencia de remitente reclasifica aunque el correo no cambie', () => {
+    const antes = classifyMessagesWithCache([message({ attachments: [pdf], remitenteCoincide: false })], {})
+    const despues = classifyMessagesWithCache([message({ attachments: [pdf], remitenteCoincide: true })], antes)
+    expect(antes['message-1'].classification).toBe('REQUIERE_REVISION')
+    expect(despues['message-1'].classification).toBe('ESTADO_DE_CUENTA')
   })
 })

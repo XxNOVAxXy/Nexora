@@ -21,6 +21,7 @@ from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 
 from .config import settings
+from .remitentes import CONSULTAS_CARPETA
 
 
 logger = logging.getLogger("nexora.gmail")
@@ -31,6 +32,7 @@ RATE_LIMIT_REASONS = {"rateLimitExceeded", "userRateLimitExceeded"}
 PROFILE_TTL_SECONDS = 60
 MESSAGE_CACHE_ITEMS = 500
 ATTACHMENT_CACHE_BYTES = 64 * 1024 * 1024
+UNREAD_IDS_LIMIT = 500
 
 
 class GmailNotConfiguredError(RuntimeError):
@@ -212,34 +214,31 @@ class GmailClient:
             self._profile = (time.monotonic(), profile)
         return profile
 
-    def list_messages(self, folder: str, max_results: int = 25) -> list[dict[str, Any]]:
-        """List a folder spending ~10 quota units once its messages are cached.
+    def list_messages(self, folder: str, max_results: int = 25, page_token: str | None = None, query: str | None = None) -> dict[str, Any]:
+        """Una página de la carpeta (o de ``query``, que ya incluye la carpeta) y el token de la siguiente.
 
         Message content never changes, so each message is fetched once (5 units) and reused.
-        The UNREAD flag does change, so it is refreshed with a second id-only listing
-        restricted to ``is:unread``: any unread message among the newest ``limit`` has
-        at most ``limit - 1`` newer unread messages, so the same limit is exact.
+        The UNREAD flag does change: it is refreshed with one id-only listing ``<query> is:unread``
+        of up to 500 ids (5 units). Limitación documentada: es exacto mientras la búsqueda tenga
+        500 correos no leídos o menos; más allá, un correo no leído antiguo puede mostrarse como leído.
         """
         service = self.service()
-        query = {
-            "inbox": "in:inbox",
-            "sent": "in:sent",
-            "archive": "-in:inbox -in:sent -in:trash",
-            "trash": "in:trash",
-        }.get(folder, "in:inbox")
+        consulta = query or CONSULTAS_CARPETA.get(folder, "in:inbox")
         limit = min(max_results, 50)
-        listing = _execute(service.users().messages().list(userId="me", q=query, maxResults=limit))
-        message_ids = [item["id"] for item in listing.get("messages", [])]
+        parametros: dict[str, Any] = {"userId": "me", "q": consulta, "maxResults": limit}
+        if page_token:
+            parametros["pageToken"] = page_token
+        listing = _execute(service.users().messages().list(**parametros))
+        message_ids = list(dict.fromkeys(item["id"] for item in listing.get("messages", [])))
+        siguiente = listing.get("nextPageToken")
         if not message_ids:
-            return []
-        unread_listing = _execute(
-            service.users().messages().list(userId="me", q=f"{query} is:unread", maxResults=limit)
-        )
+            return {"messages": [], "nextPageToken": siguiente}
+        unread_listing = _execute(service.users().messages().list(userId="me", q=f"{consulta} is:unread", maxResults=UNREAD_IDS_LIMIT))
         unread_ids = {item["id"] for item in unread_listing.get("messages", [])}
-        return [
-            _with_unread(self._message(service, message_id), message_id in unread_ids)
-            for message_id in message_ids
-        ]
+        return {
+            "messages": [_with_unread(self._message(service, message_id), message_id in unread_ids) for message_id in message_ids],
+            "nextPageToken": siguiente,
+        }
 
     def get_message(self, message_id: str) -> dict[str, Any]:
         return self._message(self.service(), message_id)
@@ -388,6 +387,8 @@ def _attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "filename": filename,
                     "mimeType": _media_type_for(filename, part.get("mimeType", "")),
                     "size": body.get("size", 0),
+                    # Estable entre consultas (el attachmentId no lo es): clave del guardado.
+                    "partId": part.get("partId", ""),
                 }
             )
         for child in part.get("parts", []):

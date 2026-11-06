@@ -7,6 +7,10 @@ export type PreliminaryDetection = {
   matched: boolean
   matchedTerms: string[]
   hasDocumentAttachment: boolean
+  /** Tiene un PDF adjunto (las imágenes no cuentan para la clasificación automática). */
+  hasPdfAttachment: boolean
+  /** El backend comprobó que la dirección del remitente coincide con un remitente configurado. */
+  senderMatches: boolean
 }
 
 export type PreliminaryClassificationResult = PreliminaryDetection & {
@@ -17,6 +21,7 @@ export type PreliminaryClassificationResult = PreliminaryDetection & {
 }
 
 export type ClassificationCache = Record<string, PreliminaryClassificationResult>
+type MensajeClasificable = Pick<GmailMessage, 'subject' | 'sender' | 'senderEmail' | 'body' | 'snippet' | 'attachments'> & Partial<Pick<GmailMessage, 'remitenteCoincide'>>
 
 const statementTerms = [
   'estado de cuenta',
@@ -28,9 +33,10 @@ const statementTerms = [
   'account statement',
 ]
 
-const normalize = (value: string) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+const normalize = (value: string) => value.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+const esPdf = (attachment: GmailMessage['attachments'][number]) => attachment.mimeType.toLowerCase() === 'application/pdf' || /\.pdf$/i.test(attachment.filename)
 
-export function detectStatementEmail(message: Pick<GmailMessage, 'subject' | 'sender' | 'senderEmail' | 'body' | 'snippet' | 'attachments'>): PreliminaryDetection {
+export function detectStatementEmail(message: MensajeClasificable): PreliminaryDetection {
   const searchableText = normalize([
     message.subject,
     message.sender,
@@ -48,25 +54,51 @@ export function detectStatementEmail(message: Pick<GmailMessage, 'subject' | 'se
       const mimeType = attachment.mimeType.toLowerCase()
       return mimeType === 'application/pdf' || mimeType.startsWith('image/') || /\.(pdf|png|jpe?g|webp|gif)$/i.test(attachment.filename)
     }),
+    hasPdfAttachment: message.attachments.some(esPdf),
+    senderMatches: message.remitenteCoincide === true,
   }
 }
 
+/**
+ * Remitente configurado + PDF adjunto => estado de cuenta por defecto. Las palabras clave solo apoyan:
+ * con remitente sin PDF (p. ej. una imagen), palabras clave o un documento, queda pendiente de verificar.
+ */
 export function preliminaryClassification(detection: PreliminaryDetection): EmailClassification {
-  return detection.matched || detection.hasDocumentAttachment ? 'REQUIERE_REVISION' : 'NO_ES_ESTADO_DE_CUENTA'
+  if (detection.senderMatches && detection.hasPdfAttachment) return 'ESTADO_DE_CUENTA'
+  return detection.senderMatches || detection.matched || detection.hasDocumentAttachment ? 'REQUIERE_REVISION' : 'NO_ES_ESTADO_DE_CUENTA'
 }
 
-export function emailClassificationFingerprint(message: Pick<GmailMessage, 'subject' | 'sender' | 'senderEmail' | 'body' | 'snippet' | 'attachments'>): string {
-  return JSON.stringify({
+/** Hash no criptográfico de 64 bits (cyrb53 doble) para huellas compactas. */
+function hash64(texto: string): string {
+  let h1 = 0xdeadbeef
+  let h2 = 0x41c6ce57
+  for (let i = 0; i < texto.length; i += 1) {
+    const ch = texto.charCodeAt(i)
+    h1 = Math.imul(h1 ^ ch, 2654435761)
+    h2 = Math.imul(h2 ^ ch, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  return `${(h2 >>> 0).toString(16).padStart(8, '0')}${(h1 >>> 0).toString(16).padStart(8, '0')}`
+}
+
+/** Huella que detecta cambios del correo. Usa `partId` (estable), no el id de adjunto que Gmail rota. */
+export const FINGERPRINT_PREFIX = 'v2:'
+/** Clasificación migrada sin huella moderna: se adopta la huella actual la primera vez que se ve el correo. */
+export const FINGERPRINT_LEGADO = 'legado'
+
+export function emailClassificationFingerprint(message: MensajeClasificable): string {
+  return FINGERPRINT_PREFIX + hash64(JSON.stringify({
     subject: message.subject,
     sender: message.sender,
     senderEmail: message.senderEmail,
     body: message.body,
     snippet: message.snippet,
-    attachments: message.attachments.map((attachment) => ({ id: attachment.id, filename: attachment.filename, mimeType: attachment.mimeType, size: attachment.size })),
-  })
+    attachments: message.attachments.map((attachment) => ({ partId: attachment.partId, filename: attachment.filename, mimeType: attachment.mimeType, size: attachment.size })),
+  }))
 }
 
-export function classifyEmailPreliminarily(message: Pick<GmailMessage, 'subject' | 'sender' | 'senderEmail' | 'body' | 'snippet' | 'attachments'>, analyzedAt = new Date().toISOString()): PreliminaryClassificationResult {
+export function classifyEmailPreliminarily(message: MensajeClasificable, analyzedAt = new Date().toISOString()): PreliminaryClassificationResult {
   const detection = detectStatementEmail(message)
   return {
     ...detection,
@@ -81,7 +113,8 @@ export function classifyMessagesWithCache(messages: GmailMessage[], previousCach
   return messages.reduce<ClassificationCache>((cache, message) => {
     const fingerprint = emailClassificationFingerprint(message)
     const previous = previousCache[message.id]
-    cache[message.id] = previous?.fingerprint === fingerprint ? previous : classifyEmailPreliminarily(message, analyzedAt)
+    // La coincidencia de remitente depende de la configuración: si cambia, se reclasifica aunque el correo no cambie.
+    cache[message.id] = previous?.fingerprint === fingerprint && previous.senderMatches === (message.remitenteCoincide === true) ? previous : classifyEmailPreliminarily(message, analyzedAt)
     return cache
   }, { ...previousCache })
 }

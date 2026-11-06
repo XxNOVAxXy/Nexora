@@ -6,6 +6,8 @@ export type GmailAttachment = {
   filename: string
   mimeType: string
   size: number
+  /** Estable entre consultas (el id del adjunto no lo es): identifica el documento guardado. */
+  partId: string
 }
 
 export type GmailMessage = {
@@ -21,12 +23,34 @@ export type GmailMessage = {
   unread: boolean
   attachments: GmailAttachment[]
   labels: string[]
+  /** El backend comprobó que la dirección del remitente coincide con un remitente configurado. */
+  remitenteCoincide?: boolean
+  reglaRemitente?: string | null
+}
+
+export type FiltroCorreo = 'remitentes' | 'todos'
+
+/** Una página del listado de Gmail. */
+export type PaginaGmail = {
+  folder: string
+  filtro: FiltroCorreo
+  /** Identifica la configuración de remitentes con que se filtró (clave de caché). */
+  firmaFiltro: string
+  remitentes: number
+  /** No hay remitentes configurados: no se consultó Gmail. */
+  sinRemitentes: boolean
+  messages: GmailMessage[]
+  nextPageToken: string | null
+  /** Correos que Gmail devolvió pero cuya dirección no coincide exactamente con un remitente. */
+  descartados: number
 }
 
 export type GmailStatus = {
   connected: boolean
   provider: 'gmail'
   email?: string | null
+  /** Hash de la cuenta conectada; separa datos locales y guardados entre cuentas. */
+  cuentaId?: string | null
   messagesTotal?: number
   threadsTotal?: number
   error?: string
@@ -52,7 +76,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const gmailApi = {
   status: () => request<GmailStatus>('/gmail/status'),
-  messages: async (folder: string) => (await request<{ messages: GmailMessage[] }>(`/gmail/messages?folder=${folder}&limit=25`)).messages,
+  listar: (folder: string, { filtro, pageToken }: { filtro: FiltroCorreo; pageToken?: string | null }) =>
+    request<PaginaGmail>(`/gmail/messages?folder=${encodeURIComponent(folder)}&limit=25&filtro=${filtro}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`),
   message: (id: string) => request<GmailMessage>(`/gmail/messages/${encodeURIComponent(id)}`),
   disconnect: () => request<{ connected: boolean }>('/gmail/disconnect', { method: 'POST' }),
   startAuth: () => {
