@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type SetStateAction } from 'react'
 import { Link, NavLink, Route, Routes, useBlocker, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import type { CampoMonto, CampoMontoResumen, Resumen, Transaccion } from './types'
-import { combinarExtraccion, contarCorrecciones, editarCampo, etiquetaOrigen, nuevaTransaccion, type CampoEditable } from './services/transacciones'
+import { contarCorrecciones, editarCampo, etiquetaOrigen, nuevaTransaccion, type CampoEditable } from './services/transacciones'
 import { validarContabilidad, type ValidacionContable } from './services/contabilidad'
 import { crearControladorExtraccion, ejecutarExtraccion } from './services/extraccion'
 import { gmailApi, type FiltroCorreo, type GmailAttachment, type GmailMessage, type GmailStatus } from './services/gmailApi'
@@ -12,7 +12,7 @@ import { extraccionesApi, type EstadoExtraccion, type ExtraccionGuardada, type I
 import { crearColaExtraccion, type ColaExtraccion } from './services/colaExtraccion'
 import { estadoPestana, leerArchivos, urlExtraccionLote, type ArchivoExtraccion, type EstadoCola, type EstadoPestana } from './services/pestanasExtraccion'
 import { esSeleccionable, LIMITE_LOTE, seleccionAdjuntos } from './services/seleccionAdjuntos'
-import { borradoresLocales, claveBorrador, contarProblemas, documentoDesdeGuardado, documentoVacio, ejecutarGuardado, firmaContenido, hayCambios, type BorradorLocal, type DocumentoEditable } from './services/guardado'
+import { borradoresLocales, claveBorrador, contarProblemas, documentoDesdeExtraccion, documentoDesdeGuardado, documentoVacio, ejecutarGuardado, firmaContenido, hayCambios, type BorradorLocal, type DocumentoEditable } from './services/guardado'
 import {
   ArrowDownToLine,
   ArrowLeft,
@@ -365,6 +365,7 @@ export function ExtractionTabsWorkspace({ archivos, lote, mode, onModeChange }: 
   const salidas = useRef(new Map<string, () => void>())
   const colaRef = useRef<ColaExtraccion<ArchivoExtraccion, GeminiExtractionResponse> | null>(null)
   const archivosIniciales = useRef(archivos)
+  const cuentaRef = useRef<string | null>(inboxStore.cachedStatus()?.cuentaId ?? null)
 
   useEffect(() => {
     if (!lote) return
@@ -373,6 +374,8 @@ export function ExtractionTabsWorkspace({ archivos, lote, mode, onModeChange }: 
       tieneBorradorLocal: async (archivo) => {
         if (!archivo.partId) return false
         const status = await inboxStore.loadStatus().catch(() => inboxStore.cachedStatus())
+        // Cuenta con que se escribirán, al salir, los borradores locales de las pestañas que nunca se abrieron.
+        if (status?.cuentaId) cuentaRef.current = status.cuentaId
         return Boolean(status?.cuentaId && borradores.leer(claveBorrador(status.cuentaId, archivo.messageId, archivo.partId)))
       },
       extraer: async (archivo, signal) => {
@@ -416,34 +419,63 @@ export function ExtractionTabsWorkspace({ archivos, lote, mode, onModeChange }: 
     else salidas.current.delete(clave)
   }, [])
 
-  const conCambios = archivos.filter((archivo) => reportes[archivo.clave]?.sinGuardar)
+  // Resultado de Gemini que aún no aplicó ninguna pestaña: la pestaña nunca se abrió (o no terminó de cargar), así que
+  // no informa nada; el resultado solo vive aquí y también cuenta como cambio sin guardar.
+  const sinAbrirConResultado = (clave: string) => Boolean(resultados[clave]) && !reportes[clave]
+  const tieneCambios = (clave: string) => Boolean(reportes[clave]?.sinGuardar) || sinAbrirConResultado(clave)
+  const conCambios = archivos.filter((archivo) => tieneCambios(archivo.clave))
   const haySinGuardar = conCambios.length > 0
+  const porExtraer = archivos.filter((archivo) => cola[archivo.clave]?.estado === 'en_cola' || cola[archivo.clave]?.estado === 'extrayendo')
+  const hayQueAvisar = haySinGuardar || porExtraer.length > 0
   const estadoDe = (clave: string) => estadoPestana(cola[clave]?.estado, reportes[clave] ? reportes[clave].guardado : undefined, cola[clave]?.guardado ?? null)
 
-  // Aviso del navegador al recargar o cerrar con cambios pendientes en cualquier pestaña.
+  /** Escribe ya el borrador local de cada archivo con cambios: las pestañas abiertas el suyo; aquí, los no abiertos. */
+  const escribirBorradores = useRef<() => void>(() => undefined)
+  escribirBorradores.current = () => {
+    salidas.current.forEach((alSalir) => alSalir())
+    const cuenta = cuentaRef.current ?? inboxStore.cachedStatus()?.cuentaId ?? null
+    if (!cuenta) return
+    for (const archivo of archivos) {
+      const resultado = resultados[archivo.clave]
+      if (!resultado || !archivo.partId || !sinAbrirConResultado(archivo.clave)) continue
+      // Sin nada guardado en el backend (la cola no extrae lo guardado): el borrador parte de un documento vacío.
+      const { documento } = documentoDesdeExtraccion(resultado.datos, [], nuevoLoteExtraccion())
+      borradores.guardar(claveBorrador(cuenta, archivo.messageId, archivo.partId), { version_base: null, guardadoEn: new Date().toISOString(), documento })
+    }
+  }
+
+  // Al recargar o cerrar: el navegador muestra su aviso genérico (no permite texto propio) y, si de verdad se sale
+  // (pagehide), se escriben los borradores locales para no perder lo extraído.
   useEffect(() => {
-    if (!haySinGuardar) return
+    if (!hayQueAvisar) return
     const alSalir = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = '' }
+    const alOcultar = () => escribirBorradores.current()
     window.addEventListener('beforeunload', alSalir)
-    return () => window.removeEventListener('beforeunload', alSalir)
-  }, [haySinGuardar])
+    window.addEventListener('pagehide', alOcultar)
+    return () => { window.removeEventListener('beforeunload', alSalir); window.removeEventListener('pagehide', alOcultar) }
+  }, [hayQueAvisar])
 
   // Aviso al navegar dentro de la app (otra sección u otro lote). Cambiar de pestaña no cambia la URL.
-  const blocker = useBlocker(({ currentLocation, nextLocation }) => haySinGuardar && (currentLocation.pathname !== nextLocation.pathname || currentLocation.search !== nextLocation.search))
+  const blocker = useBlocker(({ currentLocation, nextLocation }) => hayQueAvisar && (currentLocation.pathname !== nextLocation.pathname || currentLocation.search !== nextLocation.search))
   const salirSinGuardar = () => {
-    // Cada pestaña escribe ya su borrador local (sin esperar el debounce) para no perder los últimos cambios.
-    salidas.current.forEach((alSalir) => alSalir())
+    // Borradores locales ya (sin esperar el debounce); al desmontar, la cola se cancela.
+    escribirBorradores.current()
     blocker.proceed?.()
   }
 
   if (archivos.length === 0) return <ExtractionReviewWorkspace archivo={null} mode={mode} onModeChange={onModeChange} />
 
-  const barra = <BarraPestanas archivos={archivos} activa={activa} onActivar={activar} estadoDe={estadoDe} sinGuardar={(clave) => Boolean(reportes[clave]?.sinGuardar)} />
+  const barra = <BarraPestanas archivos={archivos} activa={activa} onActivar={activar} estadoDe={estadoDe} sinGuardar={tieneCambios} />
   return <>
     {archivos.map((archivo, indice) => visitadas.includes(archivo.clave) && <div key={archivo.clave} role="tabpanel" id={`panel-extraccion-${indice}`} aria-labelledby={`pestana-extraccion-${indice}`} hidden={archivo.clave !== activa}>
       <ExtractionReviewWorkspace archivo={archivo} mode={mode} onModeChange={onModeChange} barraPestanas={archivo.clave === activa ? barra : null} cola={cola[archivo.clave]} resultadoCola={resultados[archivo.clave] ?? null} onReintentar={() => reintentar(archivo.clave)} onReporte={reportar} registrarSalida={registrarSalida} />
     </div>)}
-    {blocker.state === 'blocked' && <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/60 p-4"><div role="alertdialog" aria-modal="true" aria-labelledby="titulo-salir" className="w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl"><div id="titulo-salir" className="font-display text-lg font-bold text-ink">Hay cambios sin guardar</div><p className="mt-2 text-sm leading-6 text-slate-600">{conCambios.length === 1 ? <>Los cambios de <strong>{conCambios[0].filename}</strong> no están guardados en el backend.</> : <>{conCambios.length} archivos tienen cambios que no están guardados en el backend: {conCambios.map((archivo) => archivo.filename).join(', ')}.</>} Se conservarán como borrador local en este navegador y podrás restaurarlos al volver.</p><div className="mt-4 flex flex-wrap justify-end gap-2"><button type="button" onClick={() => blocker.reset?.()} className="btn-primary px-3 py-2 text-sm">Seguir editando</button><button type="button" onClick={salirSinGuardar} className="btn-soft px-3 py-2 text-sm">Salir sin guardar</button></div></div></div>}
+    {blocker.state === 'blocked' && <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/60 p-4"><div role="alertdialog" aria-modal="true" aria-labelledby="titulo-salir" className="w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl">
+      <div id="titulo-salir" className="font-display text-lg font-bold text-ink">{haySinGuardar ? 'Hay cambios sin guardar' : 'La extracción sigue en curso'}</div>
+      {haySinGuardar && <p className="mt-2 text-sm leading-6 text-slate-600">{conCambios.length === 1 ? <>Los cambios de <strong>{conCambios[0].filename}</strong> no están guardados en el backend.</> : <>{conCambios.length} archivos tienen cambios que no están guardados en el backend: {conCambios.map((archivo) => archivo.filename).join(', ')}.</>} Se conservarán como borrador local en este navegador y podrás restaurarlos al volver.</p>}
+      {porExtraer.length > 0 && <p className="mt-2 text-sm font-semibold leading-6 text-amber-800">Quedan {porExtraer.length} archivo{porExtraer.length === 1 ? '' : 's'} por extraer; se cancelarán.</p>}
+      <div className="mt-4 flex flex-wrap justify-end gap-2"><button type="button" onClick={() => blocker.reset?.()} className="btn-primary px-3 py-2 text-sm">{haySinGuardar ? 'Seguir editando' : 'Quedarme'}</button><button type="button" onClick={salirSinGuardar} className="btn-soft px-3 py-2 text-sm">{haySinGuardar ? 'Salir sin guardar' : 'Salir y cancelar'}</button></div>
+    </div></div>}
   </>
 }
 
@@ -471,6 +503,11 @@ type ListaDocumento = { documentKey: string | null; documento: DocumentoEditable
 type VersionGuardada = { documentKey: string; version: number; estado: EstadoExtraccion; actualizado: string; firma: string; envios: IntentoEnvio[]; enviado_en: string | null }
 type OfertaBorrador = { documentKey: string; borrador: BorradorLocal; versionGuardada: number | null }
 let loteExtraccion = 0
+/** Identificador del lote con que se marcan las filas de una extracción (lo usa combinarExtraccion). */
+function nuevoLoteExtraccion() {
+  loteExtraccion += 1
+  return `${Date.now().toString(36)}${loteExtraccion}`
+}
 const borradores = borradoresLocales()
 const listaVacia = (documentKey: string | null): ListaDocumento => ({ documentKey, documento: documentoVacio(), aviso: null, warnings: [] })
 const etiquetaEstado: Record<EstadoExtraccion, string> = { borrador: 'Borrador', revisado: 'Revisado', enviado: 'Enviado' }
@@ -698,16 +735,15 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const aplicarResultadoGemini = (result: GeminiExtractionResponse, forzar: boolean) => {
     if (!documentKey) return
     const clave = documentKey
-    loteExtraccion += 1
-    const lote = `${Date.now().toString(36)}${loteExtraccion}`
+    const lote = nuevoLoteExtraccion()
     // Updater puro. El resultado queda como borrador con cambios sin guardar hasta que el usuario pulse Guardar.
     setLista((prev) => {
       const base = prev.documentKey === clave ? prev : listaVacia(clave)
-      const combinacion = combinarExtraccion(base.documento.transacciones, result.transacciones, lote)
+      const { documento: combinado, combinacion } = documentoDesdeExtraccion(result, base.documento.transacciones, lote)
       const mostrarAviso = forzar || combinacion.conservadas > 0
       return {
         documentKey: clave,
-        documento: { estado: 'borrador', resumen: result.resumen, transacciones: combinacion.transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version },
+        documento: combinado,
         aviso: mostrarAviso ? { conservadas: combinacion.conservadas, noAparecen: combinacion.noAparecen } : null,
         warnings: result.warnings,
       }

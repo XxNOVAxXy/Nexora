@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Transaccion } from '../types'
 import { validarContabilidad } from './contabilidad'
 import { extraccionesApi, type SolicitudGuardado } from './extraccionesApi'
-import { borradoresLocales, claveBorrador, contarProblemas, documentoVacio, ejecutarGuardado, firmaContenido, hayCambios, type DocumentoEditable } from './guardado'
+import { borradoresLocales, claveBorrador, contarProblemas, documentoDesdeExtraccion, documentoVacio, ejecutarGuardado, firmaContenido, hayCambios, type DocumentoEditable } from './guardado'
 
 const solicitud: SolicitudGuardado = { version_base: null, estado: 'borrador', confirmar_problemas: false, transacciones: [], formato_numerico: null, modelo: null, prompt_version: null, filename: 'estado.pdf', attachmentId: 'a' }
 const guardarConFetch = () => ejecutarGuardado(() => extraccionesApi.guardar('m1', '1.2', solicitud))
@@ -116,3 +116,29 @@ describe('borrador local', () => {
   })
 })
 
+
+describe('resultado de Gemini → documento', () => {
+  const resultado = {
+    filename: 'estado.pdf', model: 'gemini-prueba', prompt_version: 'v9', formato_numerico: null,
+    resumen: { banco: 'Banco', titular: '', cuenta: '', periodo: '', moneda: 'MXN', saldo_inicial: '', total_cargos: '', total_abonos: '', saldo_final: '', dudosos: [] },
+    transacciones: [{ id: 'ia-1', fecha: '01/10', concepto: 'PAGO', referencia: '', cargo: '5.00', abono: '', saldo: '', origen: 'ia' as const, dudosos: [], huella: 'h1' }],
+    validacion: {} as never, warnings: [],
+  }
+
+  it('crea un borrador con los datos de la extracción', () => {
+    const { documento, combinacion } = documentoDesdeExtraccion(resultado, [], 'lote-1')
+    expect(documento.estado).toBe('borrador')
+    expect(documento.modelo).toBe('gemini-prueba')
+    expect(documento.prompt_version).toBe('v9')
+    expect(documento.resumen?.banco).toBe('Banco')
+    expect(documento.transacciones.map((fila) => fila.concepto)).toEqual(['PAGO'])
+    expect(combinacion.conservadas).toBe(0)
+  })
+
+  it('conserva las filas manuales vigentes', () => {
+    const manual: Transaccion = { id: 'm-1', fecha: '02/10', concepto: 'A MANO', referencia: '', cargo: '', abono: '1.00', saldo: '', origen: 'manual', dudosos: [] }
+    const { documento, combinacion } = documentoDesdeExtraccion(resultado, [manual], 'lote-2')
+    expect(documento.transacciones.map((fila) => fila.concepto).sort()).toEqual(['A MANO', 'PAGO'])
+    expect(combinacion.conservadas).toBe(1)
+  })
+})

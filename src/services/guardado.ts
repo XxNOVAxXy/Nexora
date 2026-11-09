@@ -1,6 +1,8 @@
 import type { Resumen, Transaccion } from '../types'
 import type { FormatoNumerico, ValidacionContable } from './contabilidad'
 import { ErrorApi, type EstadoExtraccion, type ExtraccionGuardada, type ProblemasRevision } from './extraccionesApi'
+import type { GeminiExtractionResponse } from './geminiApi'
+import { combinarExtraccion, type ResultadoCombinacion } from './transacciones'
 
 /** Lo que el usuario edita de un documento y se persiste en el backend. */
 export type DocumentoEditable = {
@@ -13,6 +15,19 @@ export type DocumentoEditable = {
 }
 
 export const documentoVacio = (): DocumentoEditable => ({ estado: 'borrador', resumen: null, transacciones: [], formato_numerico: null, modelo: null, prompt_version: null })
+
+/**
+ * Resultado de Gemini → documento editable, combinado con las filas vigentes (se conservan las manuales y las
+ * editadas). Queda como borrador. Lo usan la pestaña al aplicar una extracción y el contenedor al escribir el
+ * borrador local de una pestaña que nunca se abrió.
+ */
+export function documentoDesdeExtraccion(result: GeminiExtractionResponse, actuales: Transaccion[], lote: string): { documento: DocumentoEditable; combinacion: ResultadoCombinacion } {
+  const combinacion = combinarExtraccion(actuales, result.transacciones, lote)
+  return {
+    documento: { estado: 'borrador', resumen: result.resumen, transacciones: combinacion.transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version },
+    combinacion,
+  }
+}
 
 export const documentoDesdeGuardado = (guardado: ExtraccionGuardada): DocumentoEditable => ({
   estado: guardado.estado,
