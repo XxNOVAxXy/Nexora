@@ -13,6 +13,10 @@ import { crearColaExtraccion, type ColaExtraccion } from './services/colaExtracc
 import { estadoPestana, leerArchivos, urlExtraccionLote, type ArchivoExtraccion, type EstadoCola, type EstadoPestana } from './services/pestanasExtraccion'
 import { esSeleccionable, LIMITE_LOTE, seleccionAdjuntos } from './services/seleccionAdjuntos'
 import { borradoresLocales, claveBorrador, contarProblemas, documentoDesdeExtraccion, documentoDesdeGuardado, documentoVacio, ejecutarGuardado, firmaContenido, hayCambios, type BorradorLocal, type DocumentoEditable } from './services/guardado'
+import { detectarDatos } from './services/deteccionDocumento'
+import { tieneCapaDeTexto, type PaginaTexto } from './services/textoPdf'
+import { compatibles, ETIQUETA_CAMPO, movimientoDesdeFila, posicionParaInsertar, valorParaCaptura, verificar, type MarcaVerificacion } from './services/verificacion'
+import { PanelVerificacion, VisorPdf, type EstadoTextoDocumento, type Resaltado } from './VisorPdf'
 import {
   ArrowDownToLine,
   ArrowLeft,
@@ -498,6 +502,14 @@ function BarraPestanas({ archivos, activa, onActivar, estadoDe, sinGuardar }: { 
 
 type AvisoCombinacion = { conservadas: number; noAparecen: number }
 /** Una sola lista por documento: los modos manual y Gemini muestran y editan el mismo documento. */
+type CampoResumenEditable = 'banco' | 'titular' | 'cuenta' | 'periodo' | 'moneda' | CampoMontoResumen
+/** Celda a la que se copia el dato del documento al hacer clic en su recuadro. */
+type DestinoCaptura = { tipo: 'movimiento'; id: string; campo: CampoEditable } | { tipo: 'resumen'; campo: Exclude<CampoResumenEditable, 'banco'> }
+const resumenVacio = (): Resumen => ({ banco: '', titular: '', cuenta: '', periodo: '', moneda: '', saldo_inicial: '', total_cargos: '', total_abonos: '', saldo_final: '', dudosos: [] })
+const etiquetaResumen: Record<CampoResumenEditable, string> = { banco: 'Banco', titular: 'Titular', cuenta: 'Cuenta', periodo: 'Periodo', moneda: 'Moneda', saldo_inicial: 'Saldo inicial', total_abonos: 'Total abonos', total_cargos: 'Total cargos', saldo_final: 'Saldo final' }
+const camposResumen: CampoResumenEditable[] = ['banco', 'titular', 'cuenta', 'periodo', 'moneda', 'saldo_inicial', 'total_abonos', 'total_cargos', 'saldo_final']
+type VerificacionVisor = { estado: EstadoTextoDocumento; onTexto: (paginas: PaginaTexto[] | null) => void; marcas: MarcaVerificacion[]; disponible: boolean; visible: boolean; onAlternar: () => void; resaltado: Resaltado | null; onClicMarca: (marca: MarcaVerificacion) => void; panel: React.ReactNode }
+
 type ListaDocumento = { documentKey: string | null; documento: DocumentoEditable; aviso: AvisoCombinacion | null; warnings: string[] }
 /** Última versión confirmada por el backend para este documento. */
 type VersionGuardada = { documentKey: string; version: number; estado: EstadoExtraccion; actualizado: string; firma: string; envios: IntentoEnvio[]; enviado_en: string | null }
@@ -543,6 +555,13 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const [geminiStatus, setGeminiStatus] = useState<GeminiStatus | null>(null)
   const [geminiError, setGeminiError] = useState<string | null>(null)
   const [confirmandoReextraccion, setConfirmandoReextraccion] = useState(false)
+  // Verificación visual (solo de esta pestaña): texto del PDF, celda destino del clic, fila resaltada.
+  const [textoDocumento, setTextoDocumento] = useState<{ documentKey: string | null; estado: 'listo' | 'sin_texto' | 'error'; paginas: PaginaTexto[] } | null>(null)
+  const [verificacionVisible, setVerificacionVisible] = useState(true)
+  const [destino, setDestino] = useState<DestinoCaptura | null>(null)
+  const [resaltado, setResaltado] = useState<Resaltado | null>(null)
+  const [mensajeCaptura, setMensajeCaptura] = useState<{ tipo: 'info' | 'error'; texto: string } | null>(null)
+  const [filaPorAgregar, setFilaPorAgregar] = useState<number | null>(null)
   // Asocia cada extracción a su documento y descarta respuestas tardías de documentos anteriores.
   const [controlador] = useState(crearControladorExtraccion)
   const messageId = archivo?.messageId ?? null
@@ -577,6 +596,16 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const alertas = useMemo(() => alertasPorFila(validacion), [validacion])
   const problemas = useMemo(() => contarProblemas(validacion, documento.resumen, transactions), [validacion, documento.resumen, transactions])
 
+  // Verificación visual: se recalcula con cada edición; nada de esto se guarda.
+  const esPdf = filename.toLowerCase().endsWith('.pdf')
+  const esImagen = /\.(png|jpe?g|webp|gif)$/i.test(filename)
+  const textoActual = textoDocumento?.documentKey === documentKey ? textoDocumento : null
+  const estadoTexto: EstadoTextoDocumento = esImagen ? 'imagen' : !esPdf ? 'otro' : textoActual?.estado ?? 'cargando'
+  const datosDocumento = useMemo(() => (textoActual?.estado === 'listo' ? detectarDatos(textoActual.paginas) : null), [textoActual])
+  const verificacion = useMemo(() => (datosDocumento ? verificar(datosDocumento, { resumen: documento.resumen, transacciones: transactions, formato_numerico: documento.formato_numerico }) : null), [datosDocumento, documento.resumen, transactions, documento.formato_numerico])
+  const verificando = verificacionVisible && verificacion !== null
+  const sinRespaldo = useMemo(() => new Set(verificando ? verificacion!.sinRespaldo : []), [verificando, verificacion])
+
   const aplicadoCola = useRef<number | null>(null)
 
   useEffect(() => {
@@ -593,6 +622,10 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
     setExtracting(false)
     setProgress(0)
     aplicadoCola.current = null
+    setDestino(null)
+    setResaltado(null)
+    setMensajeCaptura(null)
+    setFilaPorAgregar(null)
     if (!documentKey) {
       setGeminiStatus(null)
       setCarga({ documentKey, estado: 'listo', error: null })
@@ -664,6 +697,71 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const cambiarCampo = (id: string, campo: CampoEditable, valor: string) => setTransactions((items) => items.map((item) => item.id === id ? editarCampo(item, campo, valor) : item))
   const eliminarTransaccion = (id: string) => setTransactions((items) => items.filter((item) => item.id !== id))
   const agregarTransaccion = () => setTransactions((items) => [...items, nuevaTransaccion()])
+  /** Edición del resumen: como cualquier cambio de contenido, vuelve el documento a borrador; el campo deja de ser dudoso. */
+  const cambiarResumen = (campo: CampoResumenEditable, valor: string) => setLista((prev) => {
+    const base = prev.documentKey === documentKey ? prev : listaVacia(documentKey)
+    const actual = base.documento.resumen ?? resumenVacio()
+    if (actual[campo] === valor) return base
+    return { ...base, documento: { ...base.documento, estado: 'borrador', resumen: { ...actual, [campo]: valor, dudosos: actual.dudosos.filter((dudoso) => dudoso !== campo) } } }
+  })
+
+  const textoRecibido = useCallback((paginas: PaginaTexto[] | null) => {
+    setTextoDocumento({ documentKey, estado: paginas === null ? 'error' : tieneCapaDeTexto(paginas) ? 'listo' : 'sin_texto', paginas: paginas ?? [] })
+  }, [documentKey])
+  const nombreDestino = (valor: DestinoCaptura) => {
+    if (valor.tipo === 'resumen') return `${etiquetaResumen[valor.campo]} del resumen`
+    const posicion = transactions.findIndex((transaccion) => transaccion.id === valor.id)
+    return `${ETIQUETA_CAMPO[valor.campo]} del movimiento ${posicion + 1}`
+  }
+  const enfocarCeldaMovimiento = (id: string, campo: CampoEditable) => {
+    setDestino({ tipo: 'movimiento', id, campo })
+    setResaltado({ transaccionId: id, filaDocumento: null, origen: 'tabla' })
+    setFilaPorAgregar(null)
+  }
+  const enfocarCampoResumen = (campo: CampoResumenEditable) => {
+    // El banco no se verifica en el documento: no tiene recuadro del que copiar.
+    setDestino(campo === 'banco' ? null : { tipo: 'resumen', campo })
+    setFilaPorAgregar(null)
+  }
+  /** Clic en un recuadro: copia a la celda destino, ofrece agregar un movimiento faltante o resalta su fila. */
+  const clicMarca = (marca: MarcaVerificacion) => {
+    setMensajeCaptura(null)
+    if (destino && verificacion) {
+      if (!compatibles(destino.campo, marca.campo)) {
+        setMensajeCaptura({ tipo: 'error', texto: `No se copió: ${marca.etiqueta.toLowerCase()} no corresponde a ${nombreDestino(destino).toLowerCase()}. Haz clic en ${destino.campo === 'fecha' ? 'una fecha' : ['cargo', 'abono', 'saldo', 'saldo_inicial', 'total_cargos', 'total_abonos', 'saldo_final'].includes(destino.campo) ? 'un importe' : 'un texto'} del documento.` })
+        return
+      }
+      const valor = valorParaCaptura(destino.campo, marca.textoDocumento, verificacion.formato)
+      if (!valor.ok) {
+        setMensajeCaptura({ tipo: 'error', texto: `No se copió: ${valor.mensaje}` })
+        return
+      }
+      if (destino.tipo === 'movimiento') cambiarCampo(destino.id, destino.campo, valor.valor)
+      else cambiarResumen(destino.campo, valor.valor)
+      setMensajeCaptura({ tipo: 'info', texto: `Copiado a ${nombreDestino(destino).toLowerCase()}: ${valor.valor}` })
+      setDestino(null)
+      return
+    }
+    if (marca.grupo === 'movimientos' && marca.filaDocumento !== null && marca.transaccionId === null && marca.estado === 'falta') {
+      setFilaPorAgregar(marca.filaDocumento)
+      setResaltado({ transaccionId: null, filaDocumento: marca.filaDocumento, origen: 'documento' })
+      return
+    }
+    if (marca.grupo === 'movimientos') setResaltado({ transaccionId: marca.transaccionId, filaDocumento: marca.filaDocumento, origen: 'documento' })
+  }
+  const agregarDesdeDocumento = () => {
+    const fila = filaPorAgregar === null ? null : datosDocumento?.filas[filaPorAgregar] ?? null
+    if (!fila || !verificacion) return
+    const nuevo = movimientoDesdeFila(fila, verificacion.formato)
+    const emparejamiento = verificacion.emparejamiento
+    setTransactions((items) => {
+      const posicion = posicionParaInsertar(fila.indice, emparejamiento, items)
+      return [...items.slice(0, posicion), nuevo, ...items.slice(posicion)]
+    })
+    setFilaPorAgregar(null)
+    setResaltado({ transaccionId: nuevo.id, filaDocumento: fila.indice, origen: 'documento' })
+    setMensajeCaptura({ tipo: 'info', texto: 'Movimiento agregado desde el documento.' })
+  }
   const selectMode = (nextMode: ExtractionMode) => onModeChange(nextMode)
 
   const restaurarBorrador = () => {
@@ -836,19 +934,29 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
       {avisoGuardado && avisoGuardado.tipo !== 'exito' && <div role="alert" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"><span>{avisoGuardado.mensaje}{avisoGuardado.tipo === 'conflicto' && ' Tus cambios se conservan como borrador local en este navegador.'}</span><span className="flex gap-2">{avisoGuardado.tipo === 'conflicto' && <button type="button" onClick={recargarGuardado} className="btn-soft px-3 py-1.5 text-xs"><RefreshCw size={13} />Cargar la versión guardada</button>}<button type="button" onClick={() => setResultadoGuardado(null)} aria-label="Cerrar error"><X size={16} /></button></span></div>}
     </section>
     <div className="grid min-h-0 gap-4 2xl:h-[calc(100vh-226px)] 2xl:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)]">
-      <section className="h-[75vh] min-h-[520px] min-w-0 overflow-hidden rounded-2xl 2xl:h-full"><DocumentViewer messageId={messageId} attachmentId={attachmentId} filename={filename} page={page} setPage={setPage} /></section>
+      <section className="h-[75vh] min-h-[520px] min-w-0 overflow-hidden rounded-2xl 2xl:h-full"><DocumentViewer messageId={messageId} attachmentId={attachmentId} filename={filename} page={page} setPage={setPage} verificacion={{
+        estado: estadoTexto,
+        onTexto: textoRecibido,
+        marcas: verificando ? verificacion!.marcas : [],
+        disponible: estadoTexto === 'listo',
+        visible: verificacionVisible,
+        onAlternar: () => { setVerificacionVisible((valor) => !valor); setDestino(null); setFilaPorAgregar(null) },
+        resaltado,
+        onClicMarca: clicMarca,
+        panel: <PanelVerificacion estado={estadoTexto} visible={verificacionVisible} resultado={verificacion} destino={destino ? nombreDestino(destino) : null} onCancelarDestino={() => setDestino(null)} mensaje={mensajeCaptura} onCerrarMensaje={() => setMensajeCaptura(null)} filaPorAgregar={filaPorAgregar === null ? null : datosDocumento?.filas[filaPorAgregar] ?? null} onAgregar={agregarDesdeDocumento} onCancelarAgregar={() => { setFilaPorAgregar(null); setResaltado(null) }} />,
+      }} /></section>
       <section className="panel flex min-h-[520px] min-w-0 flex-col overflow-hidden 2xl:min-h-0">
         <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-5"><div><div className="text-sm font-bold text-ink">Movimientos</div><div className="mt-0.5 text-[11px] text-slate-400">{versionGuardada ? `Guardado ${new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(versionGuardada.actualizado))}` : mode === 'gemini' ? 'Resultado del backend Gemini' : 'Captura manual'}</div></div><button type="button" onClick={agregarTransaccion} disabled={!cargaLista} className="btn-soft px-2.5 py-1.5 text-xs"><Plus size={14} />Agregar</button></div>
         {cargando && <div className="flex items-center justify-center gap-2 px-4 py-10 text-xs text-slate-400"><RefreshCw size={15} className="animate-spin" />Cargando la extracción guardada…</div>}
         {cargaLista && !versionGuardada && transactions.length === 0 && !extracting && !colaActiva && cola?.estado !== 'error' && <div className="border-b border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">Este documento no tiene una extracción guardada. {mode === 'gemini' ? <>Pulsa <strong>Extraer con Gemini</strong> para obtenerla.</> : <>Captura los movimientos con <strong>Agregar</strong> o cambia al modo Gemini para extraerlos.</>}</div>}
-        {!cargando && <div className="min-h-0 flex-1 overflow-auto scrollbar-thin"><TablaTransacciones transacciones={transactions} alertas={alertas} onCambiar={cambiarCampo} onEliminar={eliminarTransaccion} /></div>}
+        {!cargando && <div className="min-h-0 flex-1 overflow-auto scrollbar-thin"><TablaTransacciones transacciones={transactions} alertas={alertas} onCambiar={cambiarCampo} onEliminar={eliminarTransaccion} sinRespaldo={sinRespaldo} resaltado={resaltado} destino={verificando && destino?.tipo === 'movimiento' ? destino : null} onEnfocar={enfocarCeldaMovimiento} /></div>}
         <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-4 py-2.5 text-[11px] text-slate-400"><div className="flex flex-wrap items-center gap-1.5"><CircleHelp size={13} />{`${transactions.length} movimiento${transactions.length === 1 ? '' : 's'}.`}{dudososCount > 0 && <span className="font-semibold text-amber-700">{dudososCount} importe{dudososCount === 1 ? '' : 's'} dudoso{dudososCount === 1 ? '' : 's'}: revísalo{dudososCount === 1 ? '' : 's'} contra el documento.</span>}</div></div>
       </section>
     </div>
     {barraPestanas}
     <PanelValidacion validacion={validacion} transacciones={transactions} conResumen={documento.resumen !== null} />
     <PanelEnvioSaveData key={documentKey ?? 'sin-documento'} messageId={messageId} partId={partId} guardado={versionGuardada} sinGuardar={sinGuardar} modificadoTrasEnvio={modificadoTrasEnvio} onActualizado={alActualizarEnvio} />
-    {mode === 'gemini' && documento.resumen && <GeminiStatementSummary datos={{ filename, modelo: documento.modelo, resumen: documento.resumen, movimientos: transactions.length, warnings: deEsteDocumento ? lista.warnings : [] }} />}
+    <ResumenEditable filename={filename} modelo={documento.modelo} resumen={documento.resumen} movimientos={transactions.length} warnings={deEsteDocumento ? lista.warnings : []} habilitado={cargaLista} destino={verificando && destino?.tipo === 'resumen' ? destino.campo : null} onCambiar={cambiarResumen} onEnfocar={enfocarCampoResumen} />
   </div>
 }
 
@@ -877,20 +985,12 @@ function PanelValidacion({ validacion, transacciones, conResumen }: { validacion
   return <section className="panel overflow-hidden" aria-labelledby="titulo-validacion"><div className="flex flex-col justify-between gap-3 border-b border-slate-200 p-5 sm:flex-row sm:items-center sm:p-6"><div><div className="eyebrow mb-2">Validación contable · tolerancia {validacion.tolerancia}</div><h2 id="titulo-validacion" className="font-display text-xl font-extrabold tracking-tight text-ink">¿Cuadra la lista revisada?</h2><p className="mt-1.5 text-sm text-slate-500">Se recalcula al editar. {conResumen ? 'Compara los movimientos contra el resumen extraído del documento.' : 'Sin resumen del documento: solo se verifica la continuidad de saldos.'}</p></div><span className={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-bold ${general.clase}`}>{general.texto}</span></div><div className="grid gap-5 p-5 sm:p-6 lg:grid-cols-[minmax(0,1fr)_minmax(280px,.8fr)]"><div><dl className="mb-4 grid grid-cols-2 gap-3"><div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3"><dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Suma de cargos</dt><dd className="mt-1 text-sm font-semibold tabular-nums text-ink">{validacion.suma_cargos ?? '—'}</dd></div><div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3"><dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Suma de abonos</dt><dd className="mt-1 text-sm font-semibold tabular-nums text-ink">{validacion.suma_abonos ?? '—'}</dd></div></dl><ul className="space-y-2">{validacion.comprobaciones.map((item) => <li key={item.id} className="rounded-lg border border-slate-100 p-3"><div className="flex items-center justify-between gap-3"><span className="text-xs font-bold text-ink">{tituloComprobacion[item.id]}</span><span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${estiloComprobacion[item.estado].clase}`}>{estiloComprobacion[item.estado].etiqueta}</span></div>{(item.esperado !== null || item.calculado !== null) && <div className="mt-1 text-[11px] tabular-nums text-slate-500">Documento: {item.esperado ?? '—'} · Calculado: {item.calculado ?? '—'}{item.diferencia !== null && ` · Diferencia: ${item.diferencia}`}</div>}{item.mensaje && item.estado !== 'ok' && <div className="mt-1 text-[11px] text-slate-500">{item.mensaje}</div>}</li>)}</ul></div><div className="space-y-3 text-xs">{validacion.filas_discontinuas.length > 0 && <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"><div className="font-bold">Continuidad rota</div><ul className="mt-1.5 space-y-1">{validacion.filas_discontinuas.map((fila) => <li key={fila.id} className="tabular-nums">Fila {numero(fila.id)}: esperado {fila.saldo_esperado}, reportado {fila.saldo_reportado} (diferencia {fila.diferencia})</li>)}</ul></div>}{validacion.importes_invalidos.length > 0 && <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-amber-900"><div className="font-bold">Importes que impiden sumar</div><ul className="mt-1.5 space-y-1">{validacion.importes_invalidos.map((importe) => <li key={`${importe.id}-${importe.campo}`}>Fila {numero(importe.id)}: {etiquetaCampoInvalido[importe.campo]}</li>)}</ul></div>}{validacion.filas_excluidas.length > 0 && <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-600">{validacion.filas_excluidas.length} fila{validacion.filas_excluidas.length === 1 ? '' : 's'} de saldo (inicial, anterior o final) excluida{validacion.filas_excluidas.length === 1 ? '' : 's'} de las sumas: fila{validacion.filas_excluidas.length === 1 ? '' : 's'} {validacion.filas_excluidas.map(numero).join(', ')}.</div>}{validacion.filas_discontinuas.length === 0 && validacion.importes_invalidos.length === 0 && validacion.filas_excluidas.length === 0 && <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-slate-500">Sin observaciones por fila.</div>}</div></div></section>
 }
 
-function GeminiStatementSummary({ datos }: { datos: { filename: string; modelo: string | null; resumen: Resumen; movimientos: number; warnings: string[] } }) {
-  const resumen = datos.resumen
-  const fields: { label: string; value: string; campo?: CampoMontoResumen }[] = [
-    { label: 'Banco', value: resumen.banco },
-    { label: 'Titular', value: resumen.titular },
-    { label: 'Cuenta', value: resumen.cuenta },
-    { label: 'Periodo', value: resumen.periodo },
-    { label: 'Moneda', value: resumen.moneda },
-    { label: 'Saldo inicial', value: resumen.saldo_inicial, campo: 'saldo_inicial' },
-    { label: 'Total abonos', value: resumen.total_abonos, campo: 'total_abonos' },
-    { label: 'Total cargos', value: resumen.total_cargos, campo: 'total_cargos' },
-    { label: 'Saldo final', value: resumen.saldo_final, campo: 'saldo_final' },
-  ]
-  return <section className="panel overflow-hidden"><div className="border-b border-slate-200 bg-violet-50/50 p-5 sm:p-6"><div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start"><div><div className="eyebrow mb-2 text-violet-700">Resumen del estado de cuenta</div><h2 className="font-display text-xl font-extrabold tracking-tight text-ink">Datos documentales extraídos</h2><p className="mt-1.5 text-sm text-slate-500">Gemini · {datos.modelo ?? 'modelo no registrado'} · {datos.movimientos} movimientos</p></div><span className="rounded-full bg-white px-3 py-2 text-xs font-semibold text-violet-700">{datos.filename}</span></div></div><div className="grid gap-5 p-5 sm:p-6 lg:grid-cols-[minmax(0,1fr)_minmax(280px,.7fr)]"><dl className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{fields.map(({ label, value, campo }) => { const dudoso = campo !== undefined && resumen.dudosos.includes(campo); return <div key={label} className={`rounded-lg border p-3 ${dudoso ? 'border-amber-200 bg-amber-50' : 'border-slate-100 bg-slate-50/60'}`}><dt className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">{label}{dudoso && <span className="text-amber-700">Dudoso</span>}</dt><dd className={`mt-1 break-words text-sm font-semibold ${dudoso ? 'text-amber-900' : 'text-ink'} ${campo ? 'tabular-nums' : ''}`}>{value || 'No identificado'}</dd></div> })}</dl><div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-slate-600"><div className="text-[10px] font-bold uppercase tracking-wider">Advertencias de la extracción</div>{datos.warnings.length > 0 ? <ul className="mt-2 space-y-1 text-xs">{datos.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul> : <div className="mt-2 text-xs">Sin advertencias.</div>}</div></div></section>
+const CAMPOS_MONTO_DEL_RESUMEN: string[] = ['saldo_inicial', 'total_cargos', 'total_abonos', 'saldo_final']
+
+/** Resumen del estado de cuenta, editable en ambos modos. Sin origen por campo: el tipo Resumen no lo tiene. */
+function ResumenEditable({ filename, modelo, resumen, movimientos, warnings, habilitado, destino, onCambiar, onEnfocar }: { filename: string; modelo: string | null; resumen: Resumen | null; movimientos: number; warnings: string[]; habilitado: boolean; destino: CampoResumenEditable | null; onCambiar: (campo: CampoResumenEditable, valor: string) => void; onEnfocar: (campo: CampoResumenEditable) => void }) {
+  const valores = resumen ?? resumenVacio()
+  return <section className="panel overflow-hidden" aria-labelledby="titulo-resumen"><div className="border-b border-slate-200 bg-violet-50/50 p-5 sm:p-6"><div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start"><div><div className="eyebrow mb-2 text-violet-700">Resumen del estado de cuenta</div><h2 id="titulo-resumen" className="font-display text-xl font-extrabold tracking-tight text-ink">Datos documentales</h2><p className="mt-1.5 text-sm text-slate-500">{modelo ? `Gemini · ${modelo}` : 'Captura manual'} · {movimientos} movimientos</p></div><span className="rounded-full bg-white px-3 py-2 text-xs font-semibold text-violet-700">{filename}</span></div></div><div className="grid gap-5 p-5 sm:p-6 lg:grid-cols-[minmax(0,1fr)_minmax(280px,.7fr)]"><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{camposResumen.map((campo) => { const monto = CAMPOS_MONTO_DEL_RESUMEN.includes(campo); const dudoso = monto && valores.dudosos.includes(campo as CampoMontoResumen); return <label key={campo} className={`rounded-lg border p-3 ${destino === campo ? 'border-blue-300 ring-2 ring-blue-400' : dudoso ? 'border-amber-200 bg-amber-50' : 'border-slate-100 bg-slate-50/60'}`}><span className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">{etiquetaResumen[campo]}{dudoso && <span className="text-amber-700">Dudoso</span>}</span><input aria-label={`${etiquetaResumen[campo]} del resumen`} value={valores[campo]} disabled={!habilitado} placeholder="No identificado" inputMode={monto ? 'decimal' : undefined} onFocus={() => onEnfocar(campo)} onChange={(event) => onCambiar(campo, event.target.value)} className={`mt-1 w-full rounded-md border border-transparent bg-transparent px-1 py-0.5 text-sm font-semibold outline-none placeholder:font-normal placeholder:text-slate-300 hover:border-slate-200 focus:border-coral focus:bg-white ${dudoso ? 'text-amber-900' : 'text-ink'} ${monto ? 'tabular-nums' : ''}`} /></label> })}</div><div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-slate-600"><div className="text-[10px] font-bold uppercase tracking-wider">Advertencias de la extracción</div>{warnings.length > 0 ? <ul className="mt-2 space-y-1 text-xs">{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul> : <div className="mt-2 text-xs">Sin advertencias.</div>}</div></div></section>
 }
 
 const etiquetaResultadoEnvio: Record<IntentoEnvio['resultado'], { texto: string; clase: string }> = {
@@ -1017,13 +1117,21 @@ const tonoOrigen: Record<Transaccion['origen'], string> = { ia: 'bg-violet-50 te
 
 const etiquetaRevision: Record<NonNullable<Transaccion['revision']>, string> = { no_aparece_en_extraccion: 'No aparece en extracción', fila_de_saldo_con_importe: 'Fila de saldo: no se suma' }
 
-function TablaTransacciones({ transacciones, alertas, onCambiar, onEliminar }: { transacciones: Transaccion[]; alertas: Record<string, string[]>; onCambiar: (id: string, campo: CampoEditable, valor: string) => void; onEliminar: (id: string) => void }) {
+function TablaTransacciones({ transacciones, alertas, onCambiar, onEliminar, sinRespaldo, resaltado, destino, onEnfocar }: { transacciones: Transaccion[]; alertas: Record<string, string[]>; onCambiar: (id: string, campo: CampoEditable, valor: string) => void; onEliminar: (id: string) => void; sinRespaldo: Set<string>; resaltado: Resaltado | null; destino: { id: string; campo: CampoEditable } | null; onEnfocar: (id: string, campo: CampoEditable) => void }) {
+  const tabla = useRef<HTMLTableElement>(null)
+  const filaResaltada = resaltado?.transaccionId ?? null
+  // Desde el documento: lleva la tabla a la fila del recuadro pulsado.
+  useEffect(() => {
+    if (!filaResaltada || resaltado?.origen !== "documento") return
+    const fila = [...(tabla.current?.querySelectorAll<HTMLElement>("[data-movimiento]") ?? [])].find((elemento) => elemento.dataset.movimiento === filaResaltada)
+    fila?.scrollIntoView?.({ block: "nearest" })
+  }, [filaResaltada, resaltado?.origen])
   if (transacciones.length === 0) return <div className="px-5 py-14 text-center text-xs text-slate-400">Sin movimientos. Usa <strong>Agregar</strong> para capturar uno.</div>
-  return <table className="w-full min-w-[660px] table-fixed border-collapse text-xs"><thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase tracking-wider text-slate-400"><tr>{columnasTabla.map((columna) => <th key={columna.campo} scope="col" className={`${columna.ancho} border-b border-slate-200 px-2 py-2 font-bold ${columna.monto ? 'text-right' : 'text-left'}`}>{columna.etiqueta}</th>)}<th scope="col" className="w-9 border-b border-slate-200"><span className="sr-only">Acciones</span></th></tr></thead><tbody>{transacciones.map((transaccion, index) => <tr key={transaccion.id} className={`border-b border-slate-100 align-top ${alertas[transaccion.id] ? 'bg-red-50/40' : transaccion.revision ? 'bg-amber-50/40' : 'hover:bg-slate-50/50'}`}>{columnasTabla.map((columna) => { const dudoso = columna.monto && transaccion.dudosos.includes(columna.campo as CampoMonto); const clases = `w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${columna.monto ? 'text-right tabular-nums' : ''} ${dudoso ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-transparent bg-transparent hover:border-slate-200'}`; const comunes = { 'aria-label': `${columna.etiqueta} del movimiento ${index + 1}`, value: transaccion[columna.campo], title: dudoso ? 'Importe dudoso: no se pudo interpretar sin adivinar. Revísalo contra el documento.' : transaccion[columna.campo] || undefined }; return <td key={columna.campo} className="px-1 py-1">{columna.campo === 'concepto' ? <><textarea {...comunes} rows={1} style={{ fieldSizing: 'content' } as React.CSSProperties} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={`${clases} block min-h-[30px] resize-none overflow-hidden leading-snug`} /><div className="mt-0.5 flex flex-wrap gap-1 px-1.5"><span className={`inline-flex whitespace-nowrap rounded-full px-1.5 py-0.5 text-[9px] font-bold ${tonoOrigen[transaccion.origen]}`}>{etiquetaOrigen(transaccion.origen)}</span>{transaccion.revision && <span className="inline-flex rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-800">{etiquetaRevision[transaccion.revision]}</span>}{alertas[transaccion.id] && <span title={alertas[transaccion.id].join(' ')} className="inline-flex cursor-help rounded-full bg-red-100 px-1.5 py-0.5 text-[9px] font-bold text-red-700">{alertas[transaccion.id].length} alerta{alertas[transaccion.id].length === 1 ? '' : 's'}</span>}</div></> : <input {...comunes} inputMode={columna.monto ? 'decimal' : undefined} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={clases} />}</td> })}<td className="px-1 py-1"><button type="button" onClick={() => onEliminar(transaccion.id)} className="rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600" aria-label={`Eliminar movimiento ${index + 1}`}><Trash2 size={13} /></button></td></tr>)}</tbody></table>
+  return <table ref={tabla} className="w-full min-w-[660px] table-fixed border-collapse text-xs"><thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase tracking-wider text-slate-400"><tr>{columnasTabla.map((columna) => <th key={columna.campo} scope="col" className={`${columna.ancho} border-b border-slate-200 px-2 py-2 font-bold ${columna.monto ? 'text-right' : 'text-left'}`}>{columna.etiqueta}</th>)}<th scope="col" className="w-9 border-b border-slate-200"><span className="sr-only">Acciones</span></th></tr></thead><tbody>{transacciones.map((transaccion, index) => <tr key={transaccion.id} data-movimiento={transaccion.id} aria-selected={filaResaltada === transaccion.id || undefined} className={`border-b border-slate-100 align-top ${filaResaltada === transaccion.id ? 'bg-blue-50/70 outline outline-1 -outline-offset-1 outline-blue-300' : alertas[transaccion.id] ? 'bg-red-50/40' : transaccion.revision ? 'bg-amber-50/40' : 'hover:bg-slate-50/50'}`}>{columnasTabla.map((columna) => { const dudoso = columna.monto && transaccion.dudosos.includes(columna.campo as CampoMonto); const esDestino = destino?.id === transaccion.id && destino.campo === columna.campo; const clases = `w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${esDestino ? 'ring-2 ring-blue-400' : ''} ${columna.monto ? 'text-right tabular-nums' : ''} ${dudoso ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-transparent bg-transparent hover:border-slate-200'}`; const comunes = { 'aria-label': `${columna.etiqueta} del movimiento ${index + 1}`, value: transaccion[columna.campo], onFocus: () => onEnfocar(transaccion.id, columna.campo), title: dudoso ? 'Importe dudoso: no se pudo interpretar sin adivinar. Revísalo contra el documento.' : transaccion[columna.campo] || undefined }; return <td key={columna.campo} className="px-1 py-1">{columna.campo === 'concepto' ? <><textarea {...comunes} rows={1} style={{ fieldSizing: 'content' } as React.CSSProperties} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={`${clases} block min-h-[30px] resize-none overflow-hidden leading-snug`} /><div className="mt-0.5 flex flex-wrap gap-1 px-1.5"><span className={`inline-flex whitespace-nowrap rounded-full px-1.5 py-0.5 text-[9px] font-bold ${tonoOrigen[transaccion.origen]}`}>{etiquetaOrigen(transaccion.origen)}</span>{transaccion.revision && <span className="inline-flex rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-800">{etiquetaRevision[transaccion.revision]}</span>}{sinRespaldo.has(transaccion.id) && <span title="La verificación visual no encontró este movimiento en el texto del documento." className="inline-flex rounded-full bg-rose-100 px-1.5 py-0.5 text-[9px] font-bold text-rose-700">No aparece en el documento</span>}{alertas[transaccion.id] && <span title={alertas[transaccion.id].join(' ')} className="inline-flex cursor-help rounded-full bg-red-100 px-1.5 py-0.5 text-[9px] font-bold text-red-700">{alertas[transaccion.id].length} alerta{alertas[transaccion.id].length === 1 ? '' : 's'}</span>}</div></> : <input {...comunes} inputMode={columna.monto ? 'decimal' : undefined} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={clases} />}</td> })}<td className="px-1 py-1"><button type="button" onClick={() => onEliminar(transaccion.id)} className="rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600" aria-label={`Eliminar movimiento ${index + 1}`}><Trash2 size={13} /></button></td></tr>)}</tbody></table>
 }
 
-function DocumentViewer({ messageId, attachmentId, filename, page, setPage }: { messageId: string | null; attachmentId: string | null; filename: string; page: number; setPage: (page: number) => void }) {
-  if (messageId && attachmentId) return <GmailDocumentPreview messageId={messageId} attachmentId={attachmentId} filename={filename} page={page} setPage={setPage} />
+function DocumentViewer({ messageId, attachmentId, filename, page, setPage, verificacion = null }: { messageId: string | null; attachmentId: string | null; filename: string; page: number; setPage: (page: number) => void; verificacion?: VerificacionVisor | null }) {
+  if (messageId && attachmentId) return <GmailDocumentPreview messageId={messageId} attachmentId={attachmentId} filename={filename} page={page} setPage={setPage} verificacion={verificacion} />
   return <EmptyDocumentViewer />
 }
 
@@ -1031,18 +1139,20 @@ function EmptyDocumentViewer() {
   return <div className="panel flex h-full min-h-[520px] items-center justify-center overflow-hidden"><div className="max-w-xs px-6 text-center"><div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-100 text-slate-400"><FileSearch size={24} /></div><div className="mt-4 text-sm font-bold text-ink">No hay documento seleccionado</div><div className="mt-1.5 text-xs leading-5 text-slate-400">Abre un PDF o imagen desde Correos y pulsa Extraer para visualizarlo aquí.</div></div></div>
 }
 
-function GmailDocumentPreview({ messageId, attachmentId, filename, page, setPage }: { messageId: string; attachmentId: string; filename: string; page: number; setPage: (page: number) => void }) {
+function GmailDocumentPreview({ messageId, attachmentId, filename, page, setPage, verificacion }: { messageId: string; attachmentId: string; filename: string; page: number; setPage: (page: number) => void; verificacion: VerificacionVisor | null }) {
   const url = gmailApi.attachmentUrl(messageId, attachmentId)
   const isPdf = filename.toLowerCase().endsWith('.pdf')
   const isImage = /\.(png|jpe?g|webp|gif)$/i.test(filename)
   const previewMime = isPdf ? 'application/pdf' : isImage ? attachmentMime({ id: attachmentId, filename, mimeType: '', size: 0, partId: '' }) : 'application/octet-stream'
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [datosPdf, setDatosPdf] = useState<Uint8Array | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   useEffect(() => {
     let objectUrl: string | null = null
     const controller = new AbortController()
     setPreviewUrl(null)
+    setDatosPdf(null)
     setLoading(true)
     setError(null)
     void fetch(url, { signal: controller.signal }).then(async (response) => {
@@ -1051,13 +1161,18 @@ function GmailDocumentPreview({ messageId, attachmentId, filename, page, setPage
       if (controller.signal.aborted) return
       objectUrl = URL.createObjectURL(new Blob([buffer], { type: previewMime }))
       setPreviewUrl(objectUrl)
+      if (isPdf) setDatosPdf(new Uint8Array(buffer))
     }).catch((requestError: unknown) => {
       if (controller.signal.aborted) return
       setError(requestError instanceof Error ? requestError.message : 'No se pudo visualizar el documento.')
     }).finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => { controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl) }
-  }, [url, previewMime])
-  return <div className="panel flex h-full flex-col overflow-hidden"><div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3"><div className="flex min-w-0 items-center gap-2 text-xs font-semibold text-ink"><FileText size={16} className="shrink-0 text-coral" /><span className="truncate">{filename}</span></div><a href={previewUrl ?? undefined} target="_blank" rel="noreferrer" className={`shrink-0 rounded-full bg-blue-50 px-2.5 py-1 text-[10px] font-bold text-blue-700 hover:bg-blue-100 ${previewUrl ? '' : 'pointer-events-none opacity-50'}`}>Abrir en otra pestaña</a></div><div className={`flex min-h-0 flex-1 items-center justify-center overflow-auto bg-slate-100/80 ${previewUrl && isPdf ? '' : 'p-5 sm:p-8'}`}>{loading && <div className="flex items-center gap-2 text-sm text-slate-400"><RefreshCw size={16} className="animate-spin" />Cargando documento...</div>}{error && <div className="text-sm text-red-600">{error}</div>}{previewUrl && isPdf && <iframe src={`${previewUrl}#navpanes=0&view=FitH`} title={filename} className="h-full w-full bg-white" />}{previewUrl && isImage && <img src={previewUrl} alt={filename} className="max-h-full max-w-full rounded-lg object-contain shadow-lg" />}{!loading && !error && !isPdf && !isImage && <div className="text-center text-sm text-slate-500">Este formato no tiene visor integrado.</div>}</div></div>
+  }, [url, previewMime, isPdf])
+  // PDF con capa de texto: visor propio con la verificación. Escaneados, o si pdf.js no pudo abrirlo: visor del navegador.
+  if (isPdf && datosPdf && verificacion && verificacion.estado !== 'sin_texto' && verificacion.estado !== 'error') {
+    return <VisorPdf datos={datosPdf} filename={filename} urlExterna={previewUrl} pagina={page} onPagina={setPage} onTexto={verificacion.onTexto} marcas={verificacion.marcas} verificacionDisponible={verificacion.disponible} verificacionVisible={verificacion.visible} onAlternarVerificacion={verificacion.onAlternar} resaltado={verificacion.resaltado} onClicMarca={verificacion.onClicMarca} panel={verificacion.panel} />
+  }
+  return <div className="panel flex h-full flex-col overflow-hidden"><div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3"><div className="flex min-w-0 items-center gap-2 text-xs font-semibold text-ink"><FileText size={16} className="shrink-0 text-coral" /><span className="truncate">{filename}</span></div><a href={previewUrl ?? undefined} target="_blank" rel="noreferrer" className={`shrink-0 rounded-full bg-blue-50 px-2.5 py-1 text-[10px] font-bold text-blue-700 hover:bg-blue-100 ${previewUrl ? '' : 'pointer-events-none opacity-50'}`}>Abrir en otra pestaña</a></div>{previewUrl && verificacion?.panel}{previewUrl && verificacion?.estado === 'error' && <div role="note" className="shrink-0 border-b border-amber-200 bg-amber-50 px-4 py-2 text-[11px] text-amber-800">No se pudo preparar la verificación visual de este PDF; se muestra con el visor del navegador.</div>}<div className={`flex min-h-0 flex-1 items-center justify-center overflow-auto bg-slate-100/80 ${previewUrl && isPdf ? '' : 'p-5 sm:p-8'}`}>{loading && <div className="flex items-center gap-2 text-sm text-slate-400"><RefreshCw size={16} className="animate-spin" />Cargando documento...</div>}{error && <div className="text-sm text-red-600">{error}</div>}{previewUrl && isPdf && <iframe src={`${previewUrl}#navpanes=0&view=FitH`} title={filename} className="h-full w-full bg-white" />}{previewUrl && isImage && <img src={previewUrl} alt={filename} className="max-h-full max-w-full rounded-lg object-contain shadow-lg" />}{!loading && !error && !isPdf && !isImage && <div className="text-center text-sm text-slate-500">Este formato no tiene visor integrado.</div>}</div></div>
 }
 
 function SettingsPageV3() {

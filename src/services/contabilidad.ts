@@ -185,7 +185,8 @@ export type MovimientoValidable = { id: string; concepto: string; cargo: string;
 
 const ETIQUETAS: Record<(typeof CAMPOS_MONTO_RESUMEN)[number], string> = { saldo_inicial: 'saldo inicial', total_cargos: 'total de cargos', total_abonos: 'total de abonos', saldo_final: 'saldo final' }
 
-function montoParaValidacion(campo: string, texto: unknown, formato: FormatoNumerico | null): [Decimal | null, boolean] {
+/** Importe de un campo tal como lo interpreta la validación contable: [valor, inválido]. */
+export function montoParaValidacion(campo: string, texto: unknown, formato: FormatoNumerico | null): [Decimal | null, boolean] {
   if (typeof texto !== 'string' || !texto.trim()) return [null, false]
   const t = texto.trim()
   if (CANONICO.test(t) && !CANONICO_AMBIGUO.test(t)) {
