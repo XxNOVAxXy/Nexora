@@ -2,6 +2,7 @@ import { gmailApi, type FiltroCorreo, type GmailMessage, type GmailStatus } from
 import { FINGERPRINT_LEGADO, type ClassificationCache, type EmailClassification } from './emailClassification'
 import { extraccionesApi, type EntradaListado } from './extraccionesApi'
 import { preferenciasApi, type ConfigRemitentes } from './preferenciasApi'
+import { seleccionAdjuntos } from './seleccionAdjuntos'
 
 export type MailFolder = 'inbox' | 'sent' | 'archive' | 'trash'
 export type ClassificationOverride = { classification: EmailClassification; fingerprint: string }
@@ -73,6 +74,8 @@ const limpiarCuenta = () => {
   estados = null
   remitentes = null
   clasificaciones = null
+  // Los adjuntos marcados para extraer son de la cuenta anterior.
+  seleccionAdjuntos.limpiar()
 }
 
 export const claveEstado = (messageId: string, partId: string) => `${messageId}__${partId}`

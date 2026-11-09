@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type SetStateAction } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type SetStateAction } from 'react'
 import { Link, NavLink, Route, Routes, useBlocker, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import type { CampoMonto, CampoMontoResumen, Resumen, Transaccion } from './types'
 import { combinarExtraccion, contarCorrecciones, editarCampo, etiquetaOrigen, nuevaTransaccion, type CampoEditable } from './services/transacciones'
@@ -9,6 +9,9 @@ import { geminiApi, type GeminiExtractionResponse, type GeminiStatus } from './s
 import { ejecutarEnvio, savedataApi, type ConfigSaveData, type VistaPreviaEnvio } from './services/savedataApi'
 import { claveEstado, inboxStore, type EstadosExtraccion, type Listado, type MailFolder } from './services/inboxStore'
 import { extraccionesApi, type EstadoExtraccion, type ExtraccionGuardada, type IntentoEnvio, type ProblemasRevision } from './services/extraccionesApi'
+import { crearColaExtraccion, type ColaExtraccion } from './services/colaExtraccion'
+import { estadoPestana, leerArchivos, urlExtraccionLote, type ArchivoExtraccion, type EstadoCola, type EstadoPestana } from './services/pestanasExtraccion'
+import { esSeleccionable, LIMITE_LOTE, seleccionAdjuntos } from './services/seleccionAdjuntos'
 import { borradoresLocales, claveBorrador, contarProblemas, documentoDesdeGuardado, documentoVacio, ejecutarGuardado, firmaContenido, hayCambios, type BorradorLocal, type DocumentoEditable } from './services/guardado'
 import {
   ArrowDownToLine,
@@ -116,11 +119,6 @@ function PageHeading({ eyebrow, title, description, children }: { eyebrow: strin
   return <div className="mb-7 flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><div className="eyebrow mb-2">{eyebrow}</div><h2 className="font-display text-[28px] font-extrabold tracking-[-0.04em] text-ink sm:text-[32px]">{title}</h2><p className="mt-1.5 max-w-2xl text-sm text-slate-500">{description}</p></div>{children && <div className="flex shrink-0 gap-2">{children}</div>}</div>
 }
 
-function StatCard({ icon: StatIcon, label, value, change, tone = 'blue' }: { icon: Icon; label: string; value: string; change: string; tone?: string }) {
-  const toneClasses: Record<string, string> = { blue: 'bg-blue-50 text-blue-600', coral: 'bg-orange-50 text-coral', green: 'bg-emerald-50 text-emerald-600', purple: 'bg-violet-50 text-violet-600' }
-  return <div className="panel p-4 sm:p-5"><div className="flex items-start justify-between"><div className={`flex h-9 w-9 items-center justify-center rounded-lg ${toneClasses[tone]}`}><StatIcon size={17} /></div><span className="rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-bold text-emerald-600">{change}</span></div><div className="mt-4 text-2xl font-bold tracking-tight text-ink">{value}</div><div className="mt-1 text-xs text-slate-500">{label}</div></div>
-}
-
 /** Carpetas que se muestran: los estados de cuenta llegan a la bandeja de entrada; "Enviados" sirve para reenvíos propios. */
 const carpetasCorreo: { value: MailFolder; label: string; icon: Icon }[] = [{ value: 'inbox', label: 'Bandeja de entrada', icon: Inbox }, { value: 'sent', label: 'Enviados', icon: Send }]
 
@@ -136,8 +134,15 @@ function FilteredGmailInboxPage() {
   const [loading, setLoading] = useState(() => listado === null)
   const [cargandoMas, setCargandoMas] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [avisoLimite, setAvisoLimite] = useState(false)
   const latestRequest = useRef(0)
   const messages = listado?.messages ?? []
+  // Adjuntos marcados para extraer: la selección vive fuera del componente y abarca varios correos.
+  useSyncExternalStore(seleccionAdjuntos.suscribir, seleccionAdjuntos.version)
+  const totalMarcados = seleccionAdjuntos.total()
+  const alternarMarcado = (message: GmailMessage, attachment: GmailAttachment) => setAvisoLimite(seleccionAdjuntos.alternar(message.id, attachment) === 'limite')
+  const limpiarSeleccion = () => { seleccionAdjuntos.limpiar(); setAvisoLimite(false) }
+  const extraerMarcados = () => { if (totalMarcados > 0) navigate(urlExtraccionLote(seleccionAdjuntos.lista())) }
 
   const setFolder = (nextFolder: MailFolder) => {
     inboxStore.setLastFolder(nextFolder)
@@ -197,36 +202,35 @@ function FilteredGmailInboxPage() {
   const estadoAdjunto = (message: GmailMessage, attachment: GmailAttachment): EstadoDocumento => (attachment.partId && estadosExtraccion[claveEstado(message.id, attachment.partId)]?.estado) || 'sin_extraer'
   const estadoCorreo = (message: GmailMessage) => resumirEstados(message.attachments.filter(esAdjuntoDocumental).map((attachment) => estadoAdjunto(message, attachment)))
   const visibleSelected = selected && messages.some((message) => message.id === selected.id) ? selected : messages[0] ?? null
-  const unreadCount = messages.filter((message) => message.unread).length
-  const porExtraerCount = messages.filter((message) => estadoCorreo(message)?.estado === 'sin_extraer').length
-  const enviadosCount = messages.filter((message) => estadoCorreo(message)?.estado === 'enviado').length
   const conectado = Boolean(status?.connected)
-  const extraer = (message: GmailMessage, attachment: GmailAttachment) => navigate(`/extraction?message=${encodeURIComponent(message.id)}&attachment=${encodeURIComponent(attachment.id)}&part=${encodeURIComponent(attachment.partId)}&filename=${encodeURIComponent(attachment.filename)}`)
 
   return (
     <>
-      <PageHeading eyebrow="Centro de comunicaciones" title="Correos" description="Solo los estados de cuenta que llegan a tu Gmail, de cualquier banco. Nexora no modifica tus correos.">
-        <button className="btn-primary" onClick={() => void loadEmails(true)} disabled={loading || !conectado}><RefreshCw size={15} className={loading ? 'animate-spin' : ''} />Sincronizar</button>
-      </PageHeading>
+      <PageHeading eyebrow="Centro de comunicaciones" title="Correos" description="Solo los estados de cuenta que llegan a tu Gmail, de cualquier banco. Nexora no modifica tus correos." />
       {error && <ErrorNotice text={error} onClose={() => setError(null)} />}
       {status && !conectado && !error && <div className="mb-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"><div className="flex items-center gap-2"><CircleHelp size={17} /><span>Gmail no está conectado. La conexión se administra únicamente desde Configuración.</span></div></div>}
-      <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <StatCard icon={FileCheck2} label="Estados de cuenta" value={`${messages.length}`} change={conectado ? 'Cargados' : 'Sin conectar'} tone="green" />
-        <StatCard icon={Inbox} label="Sin leer" value={`${unreadCount}`} change="En Gmail" tone="blue" />
-        <StatCard icon={FileSearch} label="Por extraer" value={`${porExtraerCount}`} change="Pendientes" tone="coral" />
-        <StatCard icon={Send} label="Enviados a SaveData" value={`${enviadosCount}`} change="Completados" tone="purple" />
+      <div className="mb-6 flex flex-col gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="text-xs text-slate-500" role="status">
+          {totalMarcados > 0 ? <><strong className="text-ink">{totalMarcados}</strong> archivo{totalMarcados === 1 ? '' : 's'} marcado{totalMarcados === 1 ? '' : 's'} para extraer.</> : 'Marca los PDF o imágenes que quieras extraer, de uno o varios correos.'}
+          {avisoLimite && <span className="ml-1 font-semibold text-red-700">Máximo {LIMITE_LOTE} archivos por lote.</span>}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {totalMarcados > 0 && <button type="button" onClick={limpiarSeleccion} className="btn-soft px-3 py-2"><X size={14} />Limpiar selección</button>}
+          <button type="button" className="btn-soft px-3 py-2" onClick={() => void loadEmails(true)} disabled={loading || !conectado}><RefreshCw size={15} className={loading ? 'animate-spin' : ''} />Sincronizar</button>
+          <button type="button" className="btn-primary px-3 py-2" onClick={extraerMarcados} disabled={totalMarcados === 0}><Sparkles size={15} />{totalMarcados > 0 ? `Extraer (${totalMarcados})` : 'Extraer'}</button>
+        </div>
       </div>
       <div className="panel grid min-h-[580px] grid-cols-1 overflow-hidden lg:grid-cols-[255px_minmax(350px,1fr)_minmax(390px,1.1fr)]">
         <GmailFoldersReadOnly folder={folder} setFolder={setFolder} status={status} />
-        <EmailMessageList messages={messages} selected={visibleSelected} loading={loading} folder={folder} estadoCorreo={estadoCorreo} onSelect={setSelected} puedeCargarMas={Boolean(listado?.nextPageToken)} cargandoMas={cargandoMas} onCargarMas={() => void cargarMas()} />
-        {visibleSelected ? <GmailMessageDetail mail={visibleSelected} resumen={estadoCorreo(visibleSelected)} estadoAdjunto={(attachment) => estadoAdjunto(visibleSelected, attachment)} onExtract={(attachment) => extraer(visibleSelected, attachment)} /> : <EmptyMailDetail />}
+        <EmailMessageList messages={messages} selected={visibleSelected} loading={loading} folder={folder} estadoCorreo={estadoCorreo} marcadosEn={(message) => seleccionAdjuntos.contarEnCorreo(message.id)} onSelect={setSelected} puedeCargarMas={Boolean(listado?.nextPageToken)} cargandoMas={cargandoMas} onCargarMas={() => void cargarMas()} />
+        {visibleSelected ? <GmailMessageDetail mail={visibleSelected} resumen={estadoCorreo(visibleSelected)} estadoAdjunto={(attachment) => estadoAdjunto(visibleSelected, attachment)} estaMarcado={(attachment) => seleccionAdjuntos.estaMarcado(visibleSelected.id, attachment.partId)} onAlternar={(attachment) => alternarMarcado(visibleSelected, attachment)} /> : <EmptyMailDetail />}
       </div>
     </>
   )
 }
 
-function EmailMessageList({ messages, selected, loading, folder, estadoCorreo, onSelect, puedeCargarMas, cargandoMas, onCargarMas }: { messages: GmailMessage[]; selected: GmailMessage | null; loading: boolean; folder: MailFolder; estadoCorreo: (message: GmailMessage) => ResumenEstados | null; onSelect: (message: GmailMessage) => void; puedeCargarMas: boolean; cargandoMas: boolean; onCargarMas: () => void }) {
-  return <div className="border-t border-slate-200 lg:border-l lg:border-t-0"><div className="border-b border-slate-200 px-4 py-4"><div className="font-semibold text-ink">{folderLabel(folder)}</div><div className="mt-0.5 text-[11px] text-slate-400">{loading ? 'Consultando Gmail...' : `${messages.length} estado${messages.length === 1 ? '' : 's'} de cuenta${puedeCargarMas ? ' · hay más' : ''}`}</div></div><div className="p-2">{loading && <div className="flex items-center justify-center gap-2 py-14 text-xs text-slate-400"><RefreshCw size={16} className="animate-spin" />Consultando Gmail</div>}{!loading && messages.length === 0 && <div className="px-5 py-14 text-center text-xs leading-5 text-slate-400">No hay estados de cuenta en esta carpeta.<br />Se muestran los correos con PDF o imagen cuyo asunto dice “estado de cuenta” o similar.</div>}{!loading && messages.map((mail) => <button key={mail.id} onClick={() => onSelect(mail)} className={`w-full rounded-xl border-b border-slate-100 p-3 text-left transition last:border-b-0 hover:bg-slate-50 ${selected?.id === mail.id ? 'bg-slate-50 ring-1 ring-slate-200' : ''}`}><div className="flex gap-3"><div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><span className={`truncate text-xs ${mail.unread ? 'font-bold text-ink' : 'font-semibold text-slate-600'}`}>{mail.sender}</span><span className="shrink-0 text-[10px] text-slate-400">{timeLabel(mail.receivedAt)}</span></div><div className={`mt-1 truncate text-xs ${mail.unread ? 'font-semibold text-slate-700' : 'text-slate-500'}`}>{mail.subject || '(Sin asunto)'}</div><div className="mt-1 flex items-center gap-2 truncate text-[11px] text-slate-400"><span className="truncate">{mail.snippet || 'Sin vista previa'}</span>{mail.attachments.length > 0 && <Paperclip size={12} className="shrink-0" />}</div><div className="mt-2 flex flex-wrap items-center gap-1.5"><EstadoCorreoBadge resumen={estadoCorreo(mail)} /></div></div>{mail.unread && <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-coral" />}</div></button>)}{!loading && puedeCargarMas && <button type="button" onClick={onCargarMas} disabled={cargandoMas} className="btn-soft mt-2 w-full justify-center text-xs"><RefreshCw size={13} className={cargandoMas ? 'animate-spin' : ''} />{cargandoMas ? 'Cargando…' : 'Cargar más'}</button>}</div></div>
+function EmailMessageList({ messages, selected, loading, folder, estadoCorreo, marcadosEn, onSelect, puedeCargarMas, cargandoMas, onCargarMas }: { messages: GmailMessage[]; selected: GmailMessage | null; loading: boolean; folder: MailFolder; estadoCorreo: (message: GmailMessage) => ResumenEstados | null; marcadosEn: (message: GmailMessage) => number; onSelect: (message: GmailMessage) => void; puedeCargarMas: boolean; cargandoMas: boolean; onCargarMas: () => void }) {
+  return <div className="border-t border-slate-200 lg:border-l lg:border-t-0"><div className="border-b border-slate-200 px-4 py-4"><div className="font-semibold text-ink">{folderLabel(folder)}</div><div className="mt-0.5 text-[11px] text-slate-400">{loading ? 'Consultando Gmail...' : `${messages.length} estado${messages.length === 1 ? '' : 's'} de cuenta${puedeCargarMas ? ' · hay más' : ''}`}</div></div><div className="p-2">{loading && <div className="flex items-center justify-center gap-2 py-14 text-xs text-slate-400"><RefreshCw size={16} className="animate-spin" />Consultando Gmail</div>}{!loading && messages.length === 0 && <div className="px-5 py-14 text-center text-xs leading-5 text-slate-400">No hay estados de cuenta en esta carpeta.<br />Se muestran los correos con PDF o imagen cuyo asunto dice “estado de cuenta” o similar.</div>}{!loading && messages.map((mail) => <button key={mail.id} onClick={() => onSelect(mail)} className={`w-full rounded-xl border-b border-slate-100 p-3 text-left transition last:border-b-0 hover:bg-slate-50 ${selected?.id === mail.id ? 'bg-slate-50 ring-1 ring-slate-200' : ''}`}><div className="flex gap-3"><div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><span className={`truncate text-xs ${mail.unread ? 'font-bold text-ink' : 'font-semibold text-slate-600'}`}>{mail.sender}</span><span className="shrink-0 text-[10px] text-slate-400">{timeLabel(mail.receivedAt)}</span></div><div className={`mt-1 truncate text-xs ${mail.unread ? 'font-semibold text-slate-700' : 'text-slate-500'}`}>{mail.subject || '(Sin asunto)'}</div><div className="mt-1 flex items-center gap-2 truncate text-[11px] text-slate-400"><span className="truncate">{mail.snippet || 'Sin vista previa'}</span>{mail.attachments.length > 0 && <Paperclip size={12} className="shrink-0" />}</div><div className="mt-2 flex flex-wrap items-center gap-1.5"><EstadoCorreoBadge resumen={estadoCorreo(mail)} /><MarcadosBadge cantidad={marcadosEn(mail)} /></div></div>{mail.unread && <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-coral" />}</div></button>)}{!loading && puedeCargarMas && <button type="button" onClick={onCargarMas} disabled={cargandoMas} className="btn-soft mt-2 w-full justify-center text-xs"><RefreshCw size={13} className={cargandoMas ? 'animate-spin' : ''} />{cargandoMas ? 'Cargando…' : 'Cargar más'}</button>}</div></div>
 }
 
 type EstadoDocumento = EstadoExtraccion | 'sin_extraer'
@@ -257,18 +261,24 @@ function EstadoCorreoBadge({ resumen }: { resumen: ResumenEstados | null }) {
   return <span title="Estado de la extracción de los documentos de este correo" className={`inline-flex rounded-full px-2 py-1 text-[9px] font-bold ${estiloEstadoDocumento[resumen.estado].clase}`}>{estiloEstadoDocumento[resumen.estado].etiqueta}{parcial && ` · ${resumen.revisados}/${resumen.total} revisados`}</span>
 }
 
-function GmailMessageDetail({ mail, resumen, estadoAdjunto, onExtract }: { mail: GmailMessage; resumen: ResumenEstados | null; estadoAdjunto: (attachment: GmailAttachment) => EstadoDocumento; onExtract: (attachment: GmailAttachment) => void }) {
+function MarcadosBadge({ cantidad }: { cantidad: number }) {
+  if (cantidad === 0) return null
+  return <span title="Adjuntos de este correo marcados para extraer" className="inline-flex items-center gap-1 rounded-full bg-orange-50 px-2 py-1 text-[9px] font-bold text-coral"><Check size={10} />{cantidad} marcado{cantidad === 1 ? '' : 's'}</span>
+}
+
+function GmailMessageDetail({ mail, resumen, estadoAdjunto, estaMarcado, onAlternar }: { mail: GmailMessage; resumen: ResumenEstados | null; estadoAdjunto: (attachment: GmailAttachment) => EstadoDocumento; estaMarcado: (attachment: GmailAttachment) => boolean; onAlternar: (attachment: GmailAttachment) => void }) {
   const [preview, setPreview] = useState<GmailAttachment | null>(null)
-  return <div className="border-t border-slate-200 bg-slate-50/30 lg:border-l lg:border-t-0"><div className="flex items-center justify-between border-b border-slate-200 px-5 py-4"><span className="text-xs text-slate-500">Estado de cuenta</span><EstadoCorreoBadge resumen={resumen} /></div><div className="p-5 sm:p-7"><div className="mb-6 flex items-start gap-3"><div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xs font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0"><h3 className="font-display text-base font-bold text-ink">{mail.subject || '(Sin asunto)'}</h3><div className="mt-1 text-xs text-slate-500"><span className="font-semibold text-slate-700">{mail.sender}</span> &lt;{mail.senderEmail}&gt;</div><div className="mt-1 text-[11px] text-slate-400">Para: {mail.to || 'Tu cuenta de Gmail'} · {timeLabel(mail.receivedAt)}</div></div></div><div className="whitespace-pre-line text-sm leading-6 text-slate-600">{mail.body || mail.snippet || 'Este mensaje no contiene texto visible.'}</div>{mail.attachments.length > 0 && <div className="mt-8"><div className="mb-3 text-[10px] font-bold uppercase tracking-wider text-slate-400">{mail.attachments.length} archivo{mail.attachments.length === 1 ? '' : 's'} adjunto{mail.attachments.length === 1 ? '' : 's'}</div><div className="space-y-2">{mail.attachments.map((attachment) => <GmailAttachmentCard key={attachment.id} attachment={attachment} estado={esAdjuntoDocumental(attachment) ? estadoAdjunto(attachment) : null} onPreview={() => setPreview(attachment)} onExtract={() => onExtract(attachment)} />)}</div></div>}</div>{preview && <AttachmentPreview messageId={mail.id} attachment={preview} onClose={() => setPreview(null)} />}</div>
+  return <div className="border-t border-slate-200 bg-slate-50/30 lg:border-l lg:border-t-0"><div className="flex items-center justify-between border-b border-slate-200 px-5 py-4"><span className="text-xs text-slate-500">Estado de cuenta</span><EstadoCorreoBadge resumen={resumen} /></div><div className="p-5 sm:p-7"><div className="mb-6 flex items-start gap-3"><div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xs font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0"><h3 className="font-display text-base font-bold text-ink">{mail.subject || '(Sin asunto)'}</h3><div className="mt-1 text-xs text-slate-500"><span className="font-semibold text-slate-700">{mail.sender}</span> &lt;{mail.senderEmail}&gt;</div><div className="mt-1 text-[11px] text-slate-400">Para: {mail.to || 'Tu cuenta de Gmail'} · {timeLabel(mail.receivedAt)}</div></div></div><div className="whitespace-pre-line text-sm leading-6 text-slate-600">{mail.body || mail.snippet || 'Este mensaje no contiene texto visible.'}</div>{mail.attachments.length > 0 && <div className="mt-8"><div className="mb-3 text-[10px] font-bold uppercase tracking-wider text-slate-400">{mail.attachments.length} archivo{mail.attachments.length === 1 ? '' : 's'} adjunto{mail.attachments.length === 1 ? '' : 's'}</div><div className="space-y-2">{mail.attachments.map((attachment) => <GmailAttachmentCard key={attachment.id} attachment={attachment} estado={esAdjuntoDocumental(attachment) ? estadoAdjunto(attachment) : null} onPreview={() => setPreview(attachment)} marcado={estaMarcado(attachment)} onAlternar={esSeleccionable(attachment) ? () => onAlternar(attachment) : null} />)}</div></div>}</div>{preview && <AttachmentPreview messageId={mail.id} attachment={preview} onClose={() => setPreview(null)} />}</div>
 }
 
 function GmailFoldersReadOnly({ folder, setFolder, status }: { folder: MailFolder; setFolder: (value: MailFolder) => void; status: GmailStatus | null }) {
   return <div className="p-4"><div className="mb-4 px-2"><span className="eyebrow">Cuenta conectada</span><div className="mt-3 flex items-center gap-2.5 rounded-lg bg-slate-100 px-3 py-2.5 text-xs font-semibold text-ink"><span className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-100 text-blue-600"><Globe2 size={13} /></span><span className="min-w-0 truncate">{status?.email ?? 'Gmail no conectado'}</span><span className={`ml-auto h-1.5 w-1.5 rounded-full ${status?.connected ? 'bg-emerald-500' : 'bg-amber-400'}`} /></div></div><div className="mb-2 px-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">Carpetas Gmail</div><div className="space-y-1">{carpetasCorreo.map(({ value, label, icon: FolderIcon }) => <button key={value} onClick={() => setFolder(value)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-xs font-medium transition ${folder === value ? 'bg-slate-100 font-semibold text-ink' : 'text-slate-500 hover:bg-slate-50'}`}><FolderIcon size={16} />{label}</button>)}</div></div>
 }
 
-function GmailAttachmentCard({ attachment, estado, onPreview, onExtract }: { attachment: GmailAttachment; estado: EstadoDocumento | null; onPreview: () => void; onExtract: () => void }) {
+function GmailAttachmentCard({ attachment, estado, onPreview, marcado, onAlternar }: { attachment: GmailAttachment; estado: EstadoDocumento | null; onPreview: () => void; marcado: boolean; onAlternar: (() => void) | null }) {
   const previewable = attachmentMime(attachment) === 'application/pdf' || attachmentMime(attachment).startsWith('image/')
-  return <div className="flex max-w-md flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-white p-3"><div className="flex h-10 w-10 items-center justify-center rounded-lg bg-red-50 text-red-500">{attachmentMime(attachment).startsWith('image/') ? <FileImage size={20} /> : <FileText size={20} />}</div><div className="min-w-0 flex-1"><div className="truncate text-xs font-semibold text-ink">{attachment.filename}</div><div className="mt-0.5 text-[11px] text-slate-400">{attachmentMime(attachment)} · {formatBytes(attachment.size)}</div>{estado && <div className="mt-1.5"><EstadoDocumentoBadge estado={estado} /></div>}</div>{previewable && <button type="button" onClick={(event) => { event.preventDefault(); event.stopPropagation(); onPreview() }} className="btn-soft px-2.5 py-2 text-[11px]"><FileSearch size={13} />Visualizar</button>}<button type="button" onClick={(event) => { event.preventDefault(); event.stopPropagation(); onExtract() }} className="btn-primary px-2.5 py-2 text-[11px]"><Sparkles size={13} />Extraer</button></div>
+  // Solo PDF e imágenes se pueden marcar para extraer; los ya extraídos también (al abrirlos se carga lo guardado).
+  return <div className={`flex max-w-md flex-wrap items-center gap-3 rounded-xl border bg-white p-3 ${marcado ? 'border-coral ring-1 ring-coral/30' : 'border-slate-200'}`}>{onAlternar ? <input type="checkbox" checked={marcado} onChange={onAlternar} aria-label={`Marcar ${attachment.filename} para extraer`} className="h-4 w-4 shrink-0 cursor-pointer rounded border-slate-300 text-coral focus:ring-coral" /> : <span className="h-4 w-4 shrink-0" aria-hidden="true" />}<div className="flex h-10 w-10 items-center justify-center rounded-lg bg-red-50 text-red-500">{attachmentMime(attachment).startsWith('image/') ? <FileImage size={20} /> : <FileText size={20} />}</div><div className="min-w-0 flex-1"><div className="truncate text-xs font-semibold text-ink">{attachment.filename}</div><div className="mt-0.5 text-[11px] text-slate-400">{attachmentMime(attachment)} · {formatBytes(attachment.size)}</div>{estado && <div className="mt-1.5"><EstadoDocumentoBadge estado={estado} /></div>}</div>{previewable && <button type="button" onClick={(event) => { event.preventDefault(); event.stopPropagation(); onPreview() }} className="btn-soft px-2.5 py-2 text-[11px]"><FileSearch size={13} />Visualizar</button>}</div>
 }
 
 function AttachmentPreview({ messageId, attachment, onClose }: { messageId: string; attachment: GmailAttachment; onClose: () => void }) {
@@ -316,7 +326,142 @@ function Notice({ text, onClose }: { text: string; onClose: () => void }) { retu
 function ExtractionWorkspace() {
   const [params] = useSearchParams()
   const [mode, setMode] = useState<ExtractionMode>(() => params.get('mode') === 'gemini' ? 'gemini' : 'manual')
-  return <div className="space-y-5"><ExtractionReviewWorkspace mode={mode} onModeChange={setMode} /></div>
+  const { archivos, lote } = useMemo(() => leerArchivos(params), [params])
+  // Otra lista de archivos es otro lote: se reinicia todo (el aviso de salida protege los cambios sin guardar).
+  const firmaLote = `${lote ? 'lote' : 'enlace'}|${archivos.map((archivo) => archivo.clave).join('|')}`
+  return <div className="space-y-5"><ExtractionTabsWorkspace key={firmaLote} archivos={archivos} lote={lote} mode={mode} onModeChange={setMode} /></div>
+}
+
+/** Lo que cada pestaña informa a su contenedor: estado guardado (tras cargar) y si tiene cambios sin guardar. */
+type ReportePestana = { guardado: EstadoExtraccion | null; sinGuardar: boolean }
+type ColaPestana = { estado: EstadoCola; guardado: EstadoExtraccion | null; error: string | null }
+/** Resultado de Gemini obtenido por la cola para un archivo; `id` evita aplicarlo dos veces. */
+type ResultadoCola = { id: number; datos: GeminiExtractionResponse }
+let idResultadoCola = 0
+
+const estiloPestana: Record<EstadoPestana, { etiqueta: string; clase: string }> = {
+  en_cola: { etiqueta: 'En cola', clase: 'bg-slate-100 text-slate-600' },
+  extrayendo: { etiqueta: 'Extrayendo', clase: 'bg-violet-50 text-violet-700' },
+  extraido: { etiqueta: 'Extraído', clase: 'bg-sky-50 text-sky-700' },
+  error: { etiqueta: 'Error', clase: 'bg-red-50 text-red-700' },
+  borrador: { etiqueta: 'Borrador', clase: 'bg-blue-50 text-blue-700' },
+  revisado: { etiqueta: 'Revisado', clase: 'bg-emerald-50 text-emerald-700' },
+  enviado: { etiqueta: 'Enviado', clase: 'bg-violet-50 text-violet-700' },
+  borrador_local: { etiqueta: 'Borrador local', clase: 'bg-amber-50 text-amber-800' },
+  sin_extraer: { etiqueta: 'Sin extraer', clase: 'bg-slate-100 text-slate-500' },
+}
+
+/**
+ * Extracción con pestañas: una por archivo. Cada pestaña es un ExtractionReviewWorkspace independiente que se monta
+ * la primera vez que se abre y después se conserva oculto, así sus ediciones no se pierden ni se mezclan.
+ * Aquí viven la cola (extracción en secuencia) y el único aviso de salida, que considera todas las pestañas.
+ */
+export function ExtractionTabsWorkspace({ archivos, lote, mode, onModeChange }: { archivos: ArchivoExtraccion[]; lote: boolean; mode: ExtractionMode; onModeChange: (mode: ExtractionMode) => void }) {
+  const [activa, setActiva] = useState<string | null>(archivos[0]?.clave ?? null)
+  const [visitadas, setVisitadas] = useState<string[]>(() => (archivos[0] ? [archivos[0].clave] : []))
+  const [cola, setCola] = useState<Record<string, ColaPestana>>({})
+  const [resultados, setResultados] = useState<Record<string, ResultadoCola>>({})
+  const [reportes, setReportes] = useState<Record<string, ReportePestana>>({})
+  const salidas = useRef(new Map<string, () => void>())
+  const colaRef = useRef<ColaExtraccion<ArchivoExtraccion, GeminiExtractionResponse> | null>(null)
+  const archivosIniciales = useRef(archivos)
+
+  useEffect(() => {
+    if (!lote) return
+    const nueva = crearColaExtraccion<ArchivoExtraccion, GeminiExtractionResponse>({
+      consultarGuardado: async (archivo) => (archivo.partId ? (await extraccionesApi.obtener(archivo.messageId, archivo.partId))?.estado ?? null : null),
+      tieneBorradorLocal: async (archivo) => {
+        if (!archivo.partId) return false
+        const status = await inboxStore.loadStatus().catch(() => inboxStore.cachedStatus())
+        return Boolean(status?.cuentaId && borradores.leer(claveBorrador(status.cuentaId, archivo.messageId, archivo.partId)))
+      },
+      extraer: async (archivo, signal) => {
+        const status = await geminiApi.status()
+        if (!status.enabled) throw new Error('Gemini no está conectado o habilitado en FastAPI.')
+        return geminiApi.extract(archivo.messageId, archivo.attachmentId, { signal })
+      },
+      alCambiar: (clave, evento) => {
+        if (evento.estado !== 'terminado') {
+          setCola((prev) => ({ ...prev, [clave]: { estado: evento.estado, guardado: null, error: null } }))
+          return
+        }
+        const resultado = evento.resultado
+        if (resultado.tipo === 'extraido') {
+          idResultadoCola += 1
+          const id = idResultadoCola
+          setResultados((prev) => ({ ...prev, [clave]: { id, datos: resultado.resultado } }))
+        }
+        const siguiente: ColaPestana = resultado.tipo === 'guardado' ? { estado: 'guardado', guardado: resultado.estado, error: null }
+          : resultado.tipo === 'error' ? { estado: 'error', guardado: null, error: resultado.mensaje }
+            : { estado: resultado.tipo, guardado: null, error: null }
+        setCola((prev) => ({ ...prev, [clave]: siguiente }))
+      },
+    })
+    colaRef.current = nueva
+    void nueva.agregar(archivosIniciales.current)
+    return () => { nueva.cancelar(); colaRef.current = null }
+  }, [lote])
+
+  const activar = (clave: string) => {
+    setActiva(clave)
+    setVisitadas((prev) => (prev.includes(clave) ? prev : [...prev, clave]))
+  }
+  const reintentar = (clave: string) => {
+    const archivo = archivos.find((item) => item.clave === clave)
+    if (archivo) void colaRef.current?.agregar([archivo])
+  }
+  const reportar = useCallback((clave: string, reporte: ReportePestana) => setReportes((prev) => (prev[clave]?.guardado === reporte.guardado && prev[clave]?.sinGuardar === reporte.sinGuardar ? prev : { ...prev, [clave]: reporte })), [])
+  const registrarSalida = useCallback((clave: string, alSalir: (() => void) | null) => {
+    if (alSalir) salidas.current.set(clave, alSalir)
+    else salidas.current.delete(clave)
+  }, [])
+
+  const conCambios = archivos.filter((archivo) => reportes[archivo.clave]?.sinGuardar)
+  const haySinGuardar = conCambios.length > 0
+  const estadoDe = (clave: string) => estadoPestana(cola[clave]?.estado, reportes[clave] ? reportes[clave].guardado : undefined, cola[clave]?.guardado ?? null)
+
+  // Aviso del navegador al recargar o cerrar con cambios pendientes en cualquier pestaña.
+  useEffect(() => {
+    if (!haySinGuardar) return
+    const alSalir = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = '' }
+    window.addEventListener('beforeunload', alSalir)
+    return () => window.removeEventListener('beforeunload', alSalir)
+  }, [haySinGuardar])
+
+  // Aviso al navegar dentro de la app (otra sección u otro lote). Cambiar de pestaña no cambia la URL.
+  const blocker = useBlocker(({ currentLocation, nextLocation }) => haySinGuardar && (currentLocation.pathname !== nextLocation.pathname || currentLocation.search !== nextLocation.search))
+  const salirSinGuardar = () => {
+    // Cada pestaña escribe ya su borrador local (sin esperar el debounce) para no perder los últimos cambios.
+    salidas.current.forEach((alSalir) => alSalir())
+    blocker.proceed?.()
+  }
+
+  if (archivos.length === 0) return <ExtractionReviewWorkspace archivo={null} mode={mode} onModeChange={onModeChange} />
+
+  const barra = <BarraPestanas archivos={archivos} activa={activa} onActivar={activar} estadoDe={estadoDe} sinGuardar={(clave) => Boolean(reportes[clave]?.sinGuardar)} />
+  return <>
+    {archivos.map((archivo, indice) => visitadas.includes(archivo.clave) && <div key={archivo.clave} role="tabpanel" id={`panel-extraccion-${indice}`} aria-labelledby={`pestana-extraccion-${indice}`} hidden={archivo.clave !== activa}>
+      <ExtractionReviewWorkspace archivo={archivo} mode={mode} onModeChange={onModeChange} barraPestanas={archivo.clave === activa ? barra : null} cola={cola[archivo.clave]} resultadoCola={resultados[archivo.clave] ?? null} onReintentar={() => reintentar(archivo.clave)} onReporte={reportar} registrarSalida={registrarSalida} />
+    </div>)}
+    {blocker.state === 'blocked' && <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/60 p-4"><div role="alertdialog" aria-modal="true" aria-labelledby="titulo-salir" className="w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl"><div id="titulo-salir" className="font-display text-lg font-bold text-ink">Hay cambios sin guardar</div><p className="mt-2 text-sm leading-6 text-slate-600">{conCambios.length === 1 ? <>Los cambios de <strong>{conCambios[0].filename}</strong> no están guardados en el backend.</> : <>{conCambios.length} archivos tienen cambios que no están guardados en el backend: {conCambios.map((archivo) => archivo.filename).join(', ')}.</>} Se conservarán como borrador local en este navegador y podrás restaurarlos al volver.</p><div className="mt-4 flex flex-wrap justify-end gap-2"><button type="button" onClick={() => blocker.reset?.()} className="btn-primary px-3 py-2 text-sm">Seguir editando</button><button type="button" onClick={salirSinGuardar} className="btn-soft px-3 py-2 text-sm">Salir sin guardar</button></div></div></div>}
+  </>
+}
+
+function BarraPestanas({ archivos, activa, onActivar, estadoDe, sinGuardar }: { archivos: ArchivoExtraccion[]; activa: string | null; onActivar: (clave: string) => void; estadoDe: (clave: string) => EstadoPestana; sinGuardar: (clave: string) => boolean }) {
+  return <nav aria-label="Archivos de este lote" className="panel overflow-hidden">
+    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-4 py-2.5"><div className="text-sm font-bold text-ink">Archivos</div><div className="text-[11px] text-slate-400">{archivos.length} archivo{archivos.length === 1 ? '' : 's'} · cada pestaña tiene su documento, sus movimientos y su validación</div></div>
+    <div role="tablist" className="flex gap-1.5 overflow-x-auto p-2 scrollbar-thin">{archivos.map((archivo, indice) => {
+      const estado = estiloPestana[estadoDe(archivo.clave)]
+      const seleccionada = archivo.clave === activa
+      const pendiente = sinGuardar(archivo.clave)
+      return <button key={archivo.clave} type="button" role="tab" id={`pestana-extraccion-${indice}`} aria-selected={seleccionada} aria-controls={`panel-extraccion-${indice}`} onClick={() => onActivar(archivo.clave)} className={`flex min-w-0 max-w-[280px] shrink-0 items-center gap-2 rounded-lg border px-3 py-2 text-left text-xs transition ${seleccionada ? 'border-coral bg-orange-50/60 text-ink' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}>
+        {/\.(png|jpe?g|webp|gif)$/i.test(archivo.filename) ? <FileImage size={14} className="shrink-0 text-coral" /> : <FileText size={14} className="shrink-0 text-coral" />}
+        <span className="min-w-0 truncate font-semibold" title={archivo.filename}>{archivo.filename}</span>
+        <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-bold ${estado.clase}`}>{estado.etiqueta}</span>
+        {pendiente && <span title="Cambios sin guardar" aria-label="Cambios sin guardar" className="h-2 w-2 shrink-0 rounded-full bg-amber-500" />}
+      </button>
+    })}</div>
+  </nav>
 }
 
 type AvisoCombinacion = { conservadas: number; noAparecen: number }
@@ -330,7 +475,21 @@ const borradores = borradoresLocales()
 const listaVacia = (documentKey: string | null): ListaDocumento => ({ documentKey, documento: documentoVacio(), aviso: null, warnings: [] })
 const etiquetaEstado: Record<EstadoExtraccion, string> = { borrador: 'Borrador', revisado: 'Revisado', enviado: 'Enviado' }
 
-function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMode; onModeChange: (mode: ExtractionMode) => void }) {
+type PropsRevision = {
+  archivo: ArchivoExtraccion | null
+  mode: ExtractionMode
+  onModeChange: (mode: ExtractionMode) => void
+  /** Barra de pestañas: se muestra entre el área documento/movimientos y la validación. */
+  barraPestanas?: React.ReactNode
+  /** Estado de este archivo en la cola de extracción en lote (undefined fuera de un lote). */
+  cola?: ColaPestana
+  resultadoCola?: ResultadoCola | null
+  onReintentar?: () => void
+  onReporte?: (clave: string, reporte: ReportePestana) => void
+  registrarSalida?: (clave: string, alSalir: (() => void) | null) => void
+}
+
+function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas = null, cola, resultadoCola = null, onReintentar, onReporte, registrarSalida }: PropsRevision) {
   const navigate = useNavigate()
   const [page, setPage] = useState(1)
   const [extracting, setExtracting] = useState(false)
@@ -349,11 +508,10 @@ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMod
   const [confirmandoReextraccion, setConfirmandoReextraccion] = useState(false)
   // Asocia cada extracción a su documento y descarta respuestas tardías de documentos anteriores.
   const [controlador] = useState(crearControladorExtraccion)
-  const [params] = useSearchParams()
-  const messageId = params.get('message')
-  const attachmentId = params.get('attachment')
-  const partId = params.get('part')
-  const filename = params.get('filename') ?? 'Documento recibido'
+  const messageId = archivo?.messageId ?? null
+  const attachmentId = archivo?.attachmentId ?? null
+  const partId = archivo?.partId ?? null
+  const filename = archivo?.filename ?? 'Documento recibido'
   const fileType = filename.split('.').pop()?.toUpperCase() ?? 'PDF'
   const documentKey = messageId && attachmentId ? `${messageId}:${partId ?? attachmentId}` : null
   const documentKeyActual = useRef(documentKey)
@@ -382,6 +540,8 @@ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMod
   const alertas = useMemo(() => alertasPorFila(validacion), [validacion])
   const problemas = useMemo(() => contarProblemas(validacion, documento.resumen, transactions), [validacion, documento.resumen, transactions])
 
+  const aplicadoCola = useRef<number | null>(null)
+
   useEffect(() => {
     let active = true
     // Cambiar de documento cancela la extracción en curso: su respuesta tardía se descartará.
@@ -395,6 +555,7 @@ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMod
     setConfirmandoReextraccion(false)
     setExtracting(false)
     setProgress(0)
+    aplicadoCola.current = null
     if (!documentKey) {
       setGeminiStatus(null)
       setCarga({ documentKey, estado: 'listo', error: null })
@@ -446,21 +607,22 @@ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMod
     return () => window.clearTimeout(temporizador)
   }, [claveLocal, sinGuardar, oferta, documento, versionGuardada])
 
-  // Aviso del navegador al recargar o cerrar con cambios pendientes.
-  useEffect(() => {
-    if (!sinGuardar) return
-    const alSalir = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = '' }
-    window.addEventListener('beforeunload', alSalir)
-    return () => window.removeEventListener('beforeunload', alSalir)
-  }, [sinGuardar])
-
-  // Aviso al navegar dentro de la app (otra sección u otro documento) con cambios pendientes.
-  const blocker = useBlocker(({ currentLocation, nextLocation }) => sinGuardar && (currentLocation.pathname !== nextLocation.pathname || currentLocation.search !== nextLocation.search))
-  const salirSinGuardar = () => {
+  // El aviso al salir vive en el contenedor de pestañas (React Router admite un solo bloqueador): esta pestaña le
+  // informa si tiene cambios sin guardar y le deja cómo escribir su borrador local al salir.
+  const alSalirRef = useRef<() => void>(() => undefined)
+  alSalirRef.current = () => {
     // El borrador local se escribe ya (sin esperar el debounce) para no perder los últimos cambios.
-    if (claveLocal && !oferta) borradores.guardar(claveLocal, { version_base: versionGuardada?.version ?? null, guardadoEn: new Date().toISOString(), documento })
-    blocker.proceed?.()
+    if (claveLocal && !oferta && sinGuardar) borradores.guardar(claveLocal, { version_base: versionGuardada?.version ?? null, guardadoEn: new Date().toISOString(), documento })
   }
+  useEffect(() => {
+    if (!documentKey || !registrarSalida) return
+    registrarSalida(documentKey, () => alSalirRef.current())
+    return () => registrarSalida(documentKey, null)
+  }, [documentKey, registrarSalida])
+  const estadoGuardado = versionGuardada?.estado ?? null
+  useEffect(() => {
+    if (documentKey && cargaLista && onReporte) onReporte(documentKey, { guardado: estadoGuardado, sinGuardar })
+  }, [documentKey, cargaLista, estadoGuardado, sinGuardar, onReporte])
 
   const cambiarCampo = (id: string, campo: CampoEditable, valor: string) => setTransactions((items) => items.map((item) => item.id === id ? editarCampo(item, campo, valor) : item))
   const eliminarTransaccion = (id: string) => setTransactions((items) => items.filter((item) => item.id !== id))
@@ -532,8 +694,38 @@ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMod
     setRecargas((valor) => valor + 1)
   }
 
+  /** Combina un resultado de Gemini con lo vigente de ESTE documento (lo guardado y las ediciones hechas mientras procesaba). */
+  const aplicarResultadoGemini = (result: GeminiExtractionResponse, forzar: boolean) => {
+    if (!documentKey) return
+    const clave = documentKey
+    loteExtraccion += 1
+    const lote = `${Date.now().toString(36)}${loteExtraccion}`
+    // Updater puro. El resultado queda como borrador con cambios sin guardar hasta que el usuario pulse Guardar.
+    setLista((prev) => {
+      const base = prev.documentKey === clave ? prev : listaVacia(clave)
+      const combinacion = combinarExtraccion(base.documento.transacciones, result.transacciones, lote)
+      const mostrarAviso = forzar || combinacion.conservadas > 0
+      return {
+        documentKey: clave,
+        documento: { estado: 'borrador', resumen: result.resumen, transacciones: combinacion.transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version },
+        aviso: mostrarAviso ? { conservadas: combinacion.conservadas, noAparecen: combinacion.noAparecen } : null,
+        warnings: result.warnings,
+      }
+    })
+  }
+
+  // Resultado de la extracción en lote: solo llega el de este archivo (la cola lo entrega con su clave) y se aplica
+  // una vez, cuando lo guardado ya cargó y no existe (la cola no extrae lo que ya está guardado).
+  useEffect(() => {
+    if (!resultadoCola || !documentKey || !cargaLista || versionGuardada || aplicadoCola.current === resultadoCola.id) return
+    aplicadoCola.current = resultadoCola.id
+    onModeChange('gemini')
+    aplicarResultadoGemini(resultadoCola.datos, false)
+  })
+
+  const colaActiva = cola?.estado === 'en_cola' || cola?.estado === 'extrayendo'
   const solicitarExtraccion = () => {
-    if (extracting || !documentKey) return
+    if (extracting || colaActiva || !documentKey) return
     if (huboExtraccion && correcciones > 0) {
       setConfirmandoReextraccion(true)
       return
@@ -555,21 +747,7 @@ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMod
       return geminiApi.extract(messageId, attachmentId, { forzar, signal })
     }, {
       exito: (result) => {
-        loteExtraccion += 1
-        const lote = `${Date.now().toString(36)}${loteExtraccion}`
-        // Updater puro: combina con lo vigente (lo guardado y las ediciones hechas mientras Gemini procesaba).
-        // El resultado queda como borrador con cambios sin guardar hasta que el usuario pulse Guardar.
-        setLista((prev) => {
-          const base = prev.documentKey === documentKey ? prev : listaVacia(documentKey)
-          const combinacion = combinarExtraccion(base.documento.transacciones, result.transacciones, lote)
-          const mostrarAviso = forzar || combinacion.conservadas > 0
-          return {
-            documentKey,
-            documento: { estado: 'borrador', resumen: result.resumen, transacciones: combinacion.transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version },
-            aviso: mostrarAviso ? { conservadas: combinacion.conservadas, noAparecen: combinacion.noAparecen } : null,
-            warnings: result.warnings,
-          }
-        })
+        aplicarResultadoGemini(result, forzar)
         setProgress(100)
       },
       error: (error) => {
@@ -585,7 +763,7 @@ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMod
   const cargando = carga.documentKey === documentKey && carga.estado === 'cargando'
   const errorCarga = carga.documentKey === documentKey && carga.estado === 'error' ? carga.error : null
   const puedeGuardar = Boolean(partId) && cargaLista && !guardando
-  const puedeExtraer = cargaLista && !extracting && !confirmandoReextraccion && geminiStatus?.enabled === true
+  const puedeExtraer = cargaLista && !extracting && !colaActiva && !confirmandoReextraccion && geminiStatus?.enabled === true
   const estadoVisible = versionGuardada ? etiquetaEstado[versionGuardada.estado] : 'Sin guardar'
   const ultimoEnvioExitoso = versionGuardada?.envios.filter((intento) => intento.resultado === 'exito').slice(-1)[0]
   const modificadoTrasEnvio = Boolean(ultimoEnvioExitoso) && (sinGuardar || (versionGuardada?.version ?? 0) > (ultimoEnvioExitoso?.version_extraccion ?? 0))
@@ -601,7 +779,7 @@ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMod
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex rounded-lg bg-slate-100 p-1"><button type="button" onClick={() => selectMode('manual')} className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold ${mode === 'manual' ? 'bg-white text-ink shadow-sm' : 'text-slate-500'}`}><UserRound size={13} />Manual</button><button type="button" onClick={() => selectMode('gemini')} className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-bold ${mode === 'gemini' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><Sparkles size={13} />Gemini</button></div>
-          {mode === 'gemini' && <button type="button" onClick={solicitarExtraccion} disabled={!puedeExtraer} className="btn-primary px-3 py-2"><Sparkles size={14} className={extracting ? 'animate-pulse' : ''} />{extracting ? `Extrayendo ${progress}%` : geminiStatus?.enabled !== true ? 'Extracción IA no disponible' : huboExtraccion ? 'Re-extraer con Gemini' : 'Extraer con Gemini'}</button>}
+          {mode === 'gemini' && <button type="button" onClick={solicitarExtraccion} disabled={!puedeExtraer} className="btn-primary px-3 py-2"><Sparkles size={14} className={extracting ? 'animate-pulse' : ''} />{extracting ? `Extrayendo ${progress}%` : cola?.estado === 'extrayendo' ? 'Extrayendo…' : cola?.estado === 'en_cola' ? 'En cola…' : geminiStatus?.enabled !== true ? 'Extracción IA no disponible' : huboExtraccion ? 'Re-extraer con Gemini' : 'Extraer con Gemini'}</button>}
           <button type="button" onClick={() => navigate('/emails')} className="btn-soft px-3 py-2"><ArrowLeft size={14} />Volver</button>
           <button type="button" onClick={() => void guardar(documento.estado === 'revisado' ? 'revisado' : 'borrador', documento.estado === 'revisado')} disabled={!puedeGuardar || !sinGuardar} className="btn-soft px-3 py-2"><Check size={14} />{guardando ? 'Guardando…' : 'Guardar'}</button>
           <button type="button" onClick={marcarRevisado} disabled={!puedeGuardar || transactions.length === 0 || (versionGuardada !== null && versionGuardada.estado !== 'borrador' && !sinGuardar)} className="btn-primary px-3 py-2"><FileCheck2 size={14} />Marcar como revisado</button>
@@ -611,6 +789,8 @@ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMod
       {mode === 'gemini' && !geminiStatus?.enabled && <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">{geminiError ?? 'Consultando disponibilidad de Gemini en FastAPI. La extracción no generará datos hasta que esté habilitado.'}</div>}
       {geminiError && geminiStatus?.enabled === true && <div className="mt-3"><ErrorNotice text={geminiError} onClose={() => setGeminiError(null)} /></div>}
       {extracting && <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-violet-500 transition-all" style={{ width: `${progress}%` }} /></div>}
+      {!extracting && cola?.estado === 'extrayendo' && <div role="status" className="mt-3"><div className="mb-1 text-[11px] text-violet-700">Extrayendo con Gemini (un archivo a la vez)…</div><div className="h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full w-1/2 animate-pulse rounded-full bg-violet-500" /></div></div>}
+      {cola?.estado === 'error' && <div role="alert" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700"><span>No se pudo extraer este archivo: {cola.error}</span>{onReintentar && <button type="button" onClick={onReintentar} className="btn-soft px-3 py-1.5 text-xs"><RefreshCw size={13} />Reintentar este archivo</button>}</div>}
       {errorCarga && <div role="alert" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700"><span>No se pudo cargar la extracción guardada: {errorCarga}</span><button type="button" onClick={() => setRecargas((valor) => valor + 1)} className="btn-soft px-3 py-1.5 text-xs"><RefreshCw size={13} />Reintentar</button></div>}
       {oferta && <div role="alertdialog" aria-labelledby="titulo-borrador-local" className="mt-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-3 text-xs text-blue-900"><div id="titulo-borrador-local" className="font-bold">Borrador local sin guardar · {new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(oferta.borrador.guardadoEn))}</div><div className="mt-1 leading-5">Este navegador conserva cambios que nunca llegaron al backend ({oferta.borrador.documento.transacciones.length} movimientos).{oferta.borrador.version_base !== oferta.versionGuardada && ` Se basan en ${oferta.borrador.version_base ? `la versión ${oferta.borrador.version_base}` : 'un documento sin guardar'} y lo guardado ahora es ${oferta.versionGuardada ? `la versión ${oferta.versionGuardada}` : 'nada'}.`}</div><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={restaurarBorrador} className="btn-primary px-3 py-1.5 text-xs">Restaurar borrador local</button><button type="button" onClick={descartarBorrador} className="btn-soft px-3 py-1.5 text-xs">Descartar</button></div></div>}
       {confirmandoReextraccion && <div role="alertdialog" aria-labelledby="confirmar-reextraccion" className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-amber-900"><div id="confirmar-reextraccion" className="font-bold">Este documento tiene {correcciones} corrección{correcciones === 1 ? '' : 'es'} manual{correcciones === 1 ? '' : 'es'}.</div><div className="mt-1 leading-5">Volver a extraer reemplaza solo las filas de la IA sin editar. Las filas manuales y las editadas se conservan; si una fila editada ya no aparece en la nueva extracción, se conserva marcada para revisión. El resultado queda como borrador hasta que lo guardes.</div><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={() => void extraerConGemini()} className="btn-primary px-3 py-1.5 text-xs"><Sparkles size={13} />Re-extraer conservando correcciones</button><button type="button" onClick={() => setConfirmandoReextraccion(false)} className="btn-soft px-3 py-1.5 text-xs">Cancelar</button></div></div>}
@@ -619,17 +799,17 @@ function ExtractionReviewWorkspace({ mode, onModeChange }: { mode: ExtractionMod
       {avisoGuardado?.tipo === 'exito' && <div className="mt-3"><Notice text={avisoGuardado.mensaje} onClose={() => setResultadoGuardado(null)} /></div>}
       {avisoGuardado && avisoGuardado.tipo !== 'exito' && <div role="alert" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"><span>{avisoGuardado.mensaje}{avisoGuardado.tipo === 'conflicto' && ' Tus cambios se conservan como borrador local en este navegador.'}</span><span className="flex gap-2">{avisoGuardado.tipo === 'conflicto' && <button type="button" onClick={recargarGuardado} className="btn-soft px-3 py-1.5 text-xs"><RefreshCw size={13} />Cargar la versión guardada</button>}<button type="button" onClick={() => setResultadoGuardado(null)} aria-label="Cerrar error"><X size={16} /></button></span></div>}
     </section>
-    {blocker.state === 'blocked' && <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/60 p-4"><div role="alertdialog" aria-modal="true" aria-labelledby="titulo-salir" className="w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl"><div id="titulo-salir" className="font-display text-lg font-bold text-ink">Hay cambios sin guardar</div><p className="mt-2 text-sm leading-6 text-slate-600">Los cambios de este documento no están guardados en el backend.{claveLocal ? ' Se conservarán como borrador local en este navegador y podrás restaurarlos al volver.' : ''}</p><div className="mt-4 flex flex-wrap justify-end gap-2"><button type="button" onClick={() => blocker.reset?.()} className="btn-primary px-3 py-2 text-sm">Seguir editando</button><button type="button" onClick={salirSinGuardar} className="btn-soft px-3 py-2 text-sm">Salir sin guardar</button></div></div></div>}
     <div className="grid min-h-0 gap-4 2xl:h-[calc(100vh-226px)] 2xl:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)]">
-      <section className="h-[75vh] min-h-[520px] min-w-0 overflow-hidden rounded-2xl 2xl:h-full"><DocumentViewer page={page} setPage={setPage} /></section>
+      <section className="h-[75vh] min-h-[520px] min-w-0 overflow-hidden rounded-2xl 2xl:h-full"><DocumentViewer messageId={messageId} attachmentId={attachmentId} filename={filename} page={page} setPage={setPage} /></section>
       <section className="panel flex min-h-[520px] min-w-0 flex-col overflow-hidden 2xl:min-h-0">
         <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-5"><div><div className="text-sm font-bold text-ink">Movimientos</div><div className="mt-0.5 text-[11px] text-slate-400">{versionGuardada ? `Guardado ${new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(versionGuardada.actualizado))}` : mode === 'gemini' ? 'Resultado del backend Gemini' : 'Captura manual'}</div></div><button type="button" onClick={agregarTransaccion} disabled={!cargaLista} className="btn-soft px-2.5 py-1.5 text-xs"><Plus size={14} />Agregar</button></div>
         {cargando && <div className="flex items-center justify-center gap-2 px-4 py-10 text-xs text-slate-400"><RefreshCw size={15} className="animate-spin" />Cargando la extracción guardada…</div>}
-        {cargaLista && !versionGuardada && transactions.length === 0 && !extracting && <div className="border-b border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">Este documento no tiene una extracción guardada. {mode === 'gemini' ? <>Pulsa <strong>Extraer con Gemini</strong> para obtenerla.</> : <>Captura los movimientos con <strong>Agregar</strong> o cambia al modo Gemini para extraerlos.</>}</div>}
+        {cargaLista && !versionGuardada && transactions.length === 0 && !extracting && !colaActiva && cola?.estado !== 'error' && <div className="border-b border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">Este documento no tiene una extracción guardada. {mode === 'gemini' ? <>Pulsa <strong>Extraer con Gemini</strong> para obtenerla.</> : <>Captura los movimientos con <strong>Agregar</strong> o cambia al modo Gemini para extraerlos.</>}</div>}
         {!cargando && <div className="min-h-0 flex-1 overflow-auto scrollbar-thin"><TablaTransacciones transacciones={transactions} alertas={alertas} onCambiar={cambiarCampo} onEliminar={eliminarTransaccion} /></div>}
         <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-4 py-2.5 text-[11px] text-slate-400"><div className="flex flex-wrap items-center gap-1.5"><CircleHelp size={13} />{`${transactions.length} movimiento${transactions.length === 1 ? '' : 's'}.`}{dudososCount > 0 && <span className="font-semibold text-amber-700">{dudososCount} importe{dudososCount === 1 ? '' : 's'} dudoso{dudososCount === 1 ? '' : 's'}: revísalo{dudososCount === 1 ? '' : 's'} contra el documento.</span>}</div></div>
       </section>
     </div>
+    {barraPestanas}
     <PanelValidacion validacion={validacion} transacciones={transactions} conResumen={documento.resumen !== null} />
     <PanelEnvioSaveData key={documentKey ?? 'sin-documento'} messageId={messageId} partId={partId} guardado={versionGuardada} sinGuardar={sinGuardar} modificadoTrasEnvio={modificadoTrasEnvio} onActualizado={alActualizarEnvio} />
     {mode === 'gemini' && documento.resumen && <GeminiStatementSummary datos={{ filename, modelo: documento.modelo, resumen: documento.resumen, movimientos: transactions.length, warnings: deEsteDocumento ? lista.warnings : [] }} />}
@@ -806,11 +986,7 @@ function TablaTransacciones({ transacciones, alertas, onCambiar, onEliminar }: {
   return <table className="w-full min-w-[660px] table-fixed border-collapse text-xs"><thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase tracking-wider text-slate-400"><tr>{columnasTabla.map((columna) => <th key={columna.campo} scope="col" className={`${columna.ancho} border-b border-slate-200 px-2 py-2 font-bold ${columna.monto ? 'text-right' : 'text-left'}`}>{columna.etiqueta}</th>)}<th scope="col" className="w-9 border-b border-slate-200"><span className="sr-only">Acciones</span></th></tr></thead><tbody>{transacciones.map((transaccion, index) => <tr key={transaccion.id} className={`border-b border-slate-100 align-top ${alertas[transaccion.id] ? 'bg-red-50/40' : transaccion.revision ? 'bg-amber-50/40' : 'hover:bg-slate-50/50'}`}>{columnasTabla.map((columna) => { const dudoso = columna.monto && transaccion.dudosos.includes(columna.campo as CampoMonto); const clases = `w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${columna.monto ? 'text-right tabular-nums' : ''} ${dudoso ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-transparent bg-transparent hover:border-slate-200'}`; const comunes = { 'aria-label': `${columna.etiqueta} del movimiento ${index + 1}`, value: transaccion[columna.campo], title: dudoso ? 'Importe dudoso: no se pudo interpretar sin adivinar. Revísalo contra el documento.' : transaccion[columna.campo] || undefined }; return <td key={columna.campo} className="px-1 py-1">{columna.campo === 'concepto' ? <><textarea {...comunes} rows={1} style={{ fieldSizing: 'content' } as React.CSSProperties} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={`${clases} block min-h-[30px] resize-none overflow-hidden leading-snug`} /><div className="mt-0.5 flex flex-wrap gap-1 px-1.5"><span className={`inline-flex whitespace-nowrap rounded-full px-1.5 py-0.5 text-[9px] font-bold ${tonoOrigen[transaccion.origen]}`}>{etiquetaOrigen(transaccion.origen)}</span>{transaccion.revision && <span className="inline-flex rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-800">{etiquetaRevision[transaccion.revision]}</span>}{alertas[transaccion.id] && <span title={alertas[transaccion.id].join(' ')} className="inline-flex cursor-help rounded-full bg-red-100 px-1.5 py-0.5 text-[9px] font-bold text-red-700">{alertas[transaccion.id].length} alerta{alertas[transaccion.id].length === 1 ? '' : 's'}</span>}</div></> : <input {...comunes} inputMode={columna.monto ? 'decimal' : undefined} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={clases} />}</td> })}<td className="px-1 py-1"><button type="button" onClick={() => onEliminar(transaccion.id)} className="rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600" aria-label={`Eliminar movimiento ${index + 1}`}><Trash2 size={13} /></button></td></tr>)}</tbody></table>
 }
 
-function DocumentViewer({ page, setPage }: { page: number; setPage: (page: number) => void }) {
-  const [params] = useSearchParams()
-  const messageId = params.get('message')
-  const attachmentId = params.get('attachment')
-  const filename = params.get('filename') ?? 'Documento recibido'
+function DocumentViewer({ messageId, attachmentId, filename, page, setPage }: { messageId: string | null; attachmentId: string | null; filename: string; page: number; setPage: (page: number) => void }) {
   if (messageId && attachmentId) return <GmailDocumentPreview messageId={messageId} attachmentId={attachmentId} filename={filename} page={page} setPage={setPage} />
   return <EmptyDocumentViewer />
 }
