@@ -1,4 +1,4 @@
-import type { Resumen, Transaccion } from '../types'
+import type { Resumen, SugerenciaCampo, Transaccion } from '../types'
 import type { FormatoNumerico, ValidacionContable } from './contabilidad'
 
 const API_URL = import.meta.env.DEV ? '/api' : (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
@@ -19,6 +19,8 @@ export type GeminiExtractionResponse = {
   resumen: Resumen
   transacciones: Transaccion[]
   validacion: ValidacionContable
+  /** Campos que la IA encontró en el documento y no están entre los estándar (como máximo 8). */
+  sugerencias_campos?: SugerenciaCampo[]
   warnings: string[]
 }
 

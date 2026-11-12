@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .contabilidad import validar_contabilidad
 
@@ -30,10 +30,63 @@ logger = logging.getLogger("nexora.extracciones")
 
 SCHEMA_VERSION = 1
 MAX_TRANSACCIONES = 5000
+# Columnas adicionales de la tabla de Movimientos (botón "+ Campo"): no entran en la validación contable ni en SaveData.
+MAX_CAMPOS_EXTRA = 30
+MAX_NOMBRE_CAMPO = 60
+MAX_VALOR_CAMPO = 500
+MAX_SUGERENCIAS_CAMPOS = 20
 ID_DOCUMENTO_SEGURO = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 CampoMonto = Literal["cargo", "abono", "saldo"]
 CampoMontoResumen = Literal["saldo_inicial", "total_cargos", "total_abonos", "saldo_final"]
+
+
+def _nombre_campo(valor: str) -> str:
+    nombre = re.sub(r"\s+", " ", valor).strip()
+    if not nombre:
+        raise ValueError("El nombre del campo no puede estar vacio.")
+    if len(nombre) > MAX_NOMBRE_CAMPO:
+        raise ValueError(f"El nombre del campo admite hasta {MAX_NOMBRE_CAMPO} caracteres.")
+    return nombre
+
+
+class CampoExtraGuardado(BaseModel):
+    """Columna adicional de la tabla. ``clave`` enlaza la columna con la sugerencia de la IA que la creó."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(min_length=1, max_length=64)
+    nombre: str = Field(max_length=200)
+    origen: Literal["ia", "manual"]
+    clave: str | None = Field(default=None, max_length=64)
+
+    @field_validator("nombre")
+    @classmethod
+    def _nombre_valido(cls, valor: str) -> str:
+        return _nombre_campo(valor)
+
+
+class ValorSugerido(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    huella: str = Field(max_length=64)
+    valor: str = Field(max_length=MAX_VALOR_CAMPO)
+
+
+class SugerenciaGuardada(BaseModel):
+    """Campo adicional que propuso la IA; se guarda para que el menú "+ Campo" siga disponible al recargar."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    clave: str = Field(min_length=1, max_length=64)
+    nombre: str = Field(max_length=200)
+    valores: list[ValorSugerido] = Field(default_factory=list, max_length=MAX_TRANSACCIONES)
+    valor_documento: str | None = Field(default=None, max_length=MAX_VALOR_CAMPO)
+
+    @field_validator("nombre")
+    @classmethod
+    def _nombre_valido(cls, valor: str) -> str:
+        return _nombre_campo(valor)
 
 
 class TransaccionGuardada(BaseModel):
@@ -53,11 +106,25 @@ class TransaccionGuardada(BaseModel):
     dudosos: list[CampoMonto] = Field(default_factory=list)
     huella: str | None = Field(default=None, max_length=64)
     revision: Literal["no_aparece_en_extraccion", "fila_de_saldo_con_importe"] | None = None
+    # Valores de las columnas adicionales: {id de la columna: valor}.
+    extras: dict[str, str] | None = None
 
     @field_validator("dudosos")
     @classmethod
     def _sin_repetidos(cls, valor: list[str]) -> list[str]:
         return list(dict.fromkeys(valor))
+
+    @field_validator("extras")
+    @classmethod
+    def _extras_validos(cls, valor: dict[str, str] | None) -> dict[str, str] | None:
+        if not valor:
+            return None
+        if len(valor) > MAX_CAMPOS_EXTRA:
+            raise ValueError(f"Un movimiento admite hasta {MAX_CAMPOS_EXTRA} campos adicionales.")
+        for clave, texto in valor.items():
+            if len(clave) > 64 or len(texto) > MAX_VALOR_CAMPO:
+                raise ValueError(f"Los valores de los campos adicionales admiten hasta {MAX_VALOR_CAMPO} caracteres.")
+        return valor
 
 
 class ResumenGuardado(BaseModel):
@@ -95,6 +162,8 @@ class GuardarExtraccionRequest(BaseModel):
     prompt_version: str | None = Field(default=None, max_length=100)
     filename: str = Field(default="", max_length=500)
     attachmentId: str | None = Field(default=None, max_length=4000)
+    campos_extra: list[CampoExtraGuardado] = Field(default_factory=list, max_length=MAX_CAMPOS_EXTRA)
+    sugerencias_campos: list[SugerenciaGuardada] = Field(default_factory=list, max_length=MAX_SUGERENCIAS_CAMPOS)
 
     @field_validator("transacciones")
     @classmethod
@@ -103,6 +172,24 @@ class GuardarExtraccionRequest(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("Los ids de las transacciones deben ser unicos.")
         return valor
+
+    @field_validator("campos_extra")
+    @classmethod
+    def _campos_unicos(cls, valor: list[CampoExtraGuardado]) -> list[CampoExtraGuardado]:
+        ids = [campo.id for campo in valor]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Los ids de los campos adicionales deben ser unicos.")
+        return valor
+
+    @model_validator(mode="after")
+    def _extras_de_campos_existentes(self) -> "GuardarExtraccionRequest":
+        """Descarta valores de columnas que no existen (y los vacíos): nunca se guardan datos huérfanos."""
+        ids = {campo.id for campo in self.campos_extra}
+        for transaccion in self.transacciones:
+            if transaccion.extras:
+                limpios = {clave: texto for clave, texto in transaccion.extras.items() if clave in ids and texto.strip()}
+                transaccion.extras = limpios or None
+        return self
 
 
 class ConflictoVersion(Exception):
@@ -278,6 +365,8 @@ class AlmacenExtracciones:
                 "formato_numerico": solicitud.formato_numerico,
                 "resumen": resumen,
                 "transacciones": transacciones,
+                "campos_extra": [campo.model_dump(exclude_none=True) for campo in solicitud.campos_extra],
+                "sugerencias_campos": [sugerencia.model_dump(exclude_none=True) for sugerencia in solicitud.sugerencias_campos],
                 "validacion": validacion,
                 "problemas": problemas,
             }

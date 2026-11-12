@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -40,12 +41,23 @@ class GeminiRequestError(RuntimeError):
 
 
 # Cambia esta versión cada vez que cambie el prompt o el esquema: invalida los resultados en caché.
-PROMPT_VERSION = "2026-11-05.2"
+PROMPT_VERSION = "2026-11-12.1"
 CACHE_MAX_ITEMS = 16
 # Máximo de los modelos Flash actuales. Los tokens de razonamiento también cuentan contra este límite.
 MAX_OUTPUT_TOKENS_PREDETERMINADO = 65536
 # Códigos de error que indican que la respuesta no está completa: nunca se reintentan ni se guardan en caché.
 CODIGOS_RESPUESTA_INCOMPLETA = {"invalid_response", "respuesta_truncada", "respuesta_incompleta"}
+# Campos adicionales sugeridos por la IA (botón "+ Campo"): como máximo estos, priorizando los que tienen valor en más filas.
+MAX_SUGERENCIAS_CAMPOS = 8
+MAX_NOMBRE_CAMPO = 60
+MAX_VALOR_CAMPO = 500
+# Nombres que ya son columnas estándar del movimiento o datos del resumen: nunca se sugieren como campo adicional.
+NOMBRES_ESTANDAR = {
+    "fecha", "fecha de operacion", "fecha operacion", "fecha de movimiento", "concepto", "descripcion", "concepto descripcion",
+    "referencia", "ref", "cargo", "cargos", "retiro", "retiros", "abono", "abonos", "deposito", "depositos", "saldo",
+    "saldo final", "saldo inicial", "saldo anterior", "banco", "titular", "cuenta", "numero de cuenta", "periodo", "moneda",
+    "total cargos", "total abonos", "total de cargos", "total de abonos",
+}
 
 
 def max_output_tokens() -> int:
@@ -80,6 +92,24 @@ class ResumenExtraido(BaseModel):
     saldo_final: str = ""
 
 
+class ValorAdicional(BaseModel):
+    """Valor de una columna adicional (no estándar) impresa en un movimiento."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    campo: str = ""
+    valor: str = ""
+
+
+class CampoAdicional(BaseModel):
+    """Dato impreso una sola vez en el documento que no está en el resumen (p. ej. "Número de crédito")."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    nombre: str = ""
+    valor_documento: str = ""
+
+
 class TransaccionExtraida(BaseModel):
     """Movimiento tal como lo devuelve Gemini: los montos llegan como texto impreso en el documento."""
 
@@ -91,6 +121,7 @@ class TransaccionExtraida(BaseModel):
     cargo: str = ""
     abono: str = ""
     saldo: str = ""
+    adicionales: list[ValorAdicional] = Field(default_factory=list)
 
 
 class StatementExtraction(BaseModel):
@@ -98,6 +129,7 @@ class StatementExtraction(BaseModel):
 
     resumen: ResumenExtraido = Field(default_factory=ResumenExtraido)
     transacciones: list[TransaccionExtraida] = Field(default_factory=list)
+    campos_adicionales: list[CampoAdicional] = Field(default_factory=list)
     notas: list[str] = Field(default_factory=list)
 
 
@@ -350,6 +382,8 @@ Resumen: `banco`, `titular`, `cuenta`, `periodo`, `moneda`, `saldo_inicial`, `to
 
 Movimientos: para cada uno conserva `fecha`, `concepto`, `referencia`, `cargo`, `abono` y `saldo`. Copia los importes EXACTAMENTE como estan impresos, con sus separadores de miles y decimales, signos, parentesis y sufijos (CR, DR, etc.); no los reformatees ni los calcules. Un movimiento lleva importe en `cargo` o en `abono`, segun la columna donde aparece; deja vacia la otra. `saldo` es el saldo despues del movimiento, si el documento lo muestra. No conviertas la fila `SALDO INICIAL` en un movimiento: usa ese valor solo como `saldo_inicial`.
 
+Campos adicionales: si los movimientos muestran columnas distintas de las seis anteriores (por ejemplo `VSM`, `Sucursal`, `Folio`), agrega en `adicionales` de cada movimiento un elemento por columna con `campo` (el encabezado tal como esta impreso) y `valor` (el texto impreso en esa fila). Si el documento muestra una sola vez un dato que no esta en el resumen (por ejemplo `Numero de credito`), agregalo en `campos_adicionales` con `nombre` y `valor_documento` tal como estan impresos. Solo incluye campos y valores que aparecen literalmente en el documento: nunca inventes nombres ni valores, no repitas los campos del resumen ni de los movimientos, y deja las listas vacias si no hay campos adicionales.
+
 El documento puede tener varias paginas. Cuenta cada movimiento una sola vez. Si una fila no es legible, conserva la fila y deja vacios solo los campos ilegibles. Incluye en `notas` cualquier advertencia de lectura, pagina o discrepancia evidente."""
 
 
@@ -392,6 +426,7 @@ def _build_result(filename: str, extraction: StatementExtraction, model: str) ->
     resumen["dudosos"] = resumen_dudosos
 
     transacciones: list[dict[str, Any]] = []
+    adicionales_por_fila: list[tuple[str, list[ValorAdicional]]] = []
     dudosos_total = len(resumen_dudosos)
     filas_de_saldo_con_importe = 0
     for item in extraction.transacciones:
@@ -422,6 +457,7 @@ def _build_result(filename: str, extraction: StatementExtraction, model: str) ->
             filas_de_saldo_con_importe += 1
         dudosos_total += len(dudosos)
         transacciones.append(transaccion)
+        adicionales_por_fila.append((transaccion["huella"], item.adicionales))
 
     if dudosos_total:
         warnings.append(f"{dudosos_total} importe(s) quedaron marcados como dudosos y requieren revision.")
@@ -440,8 +476,52 @@ def _build_result(filename: str, extraction: StatementExtraction, model: str) ->
         "resumen": resumen,
         "transacciones": transacciones,
         "validacion": validacion,
+        "sugerencias_campos": _sugerencias_campos(adicionales_por_fila, extraction.campos_adicionales),
         "warnings": _unique_text(warnings),
     }
+
+
+def _limpiar_texto(valor: str, maximo: int) -> str:
+    return re.sub(r"\s+", " ", valor or "").strip()[:maximo].strip()
+
+
+def clave_campo(nombre: str) -> str:
+    """Clave estable de un campo adicional: sin acentos, minúsculas y guiones ("Número de crédito" → "numero-de-credito")."""
+    sin_acentos = unicodedata.normalize("NFKD", nombre).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "-", sin_acentos.casefold()).strip("-")[:64]
+
+
+def _sugerencias_campos(filas: list[tuple[str, list[ValorAdicional]]], documento: list[CampoAdicional]) -> list[dict[str, Any]]:
+    """Campos adicionales que la IA encontró en el documento, sin inventar ninguno.
+
+    Se descartan los que no tienen ningún valor, los que repiten un campo estándar y los duplicados. Los valores por
+    fila se asocian a la huella del movimiento (la lista conserva el orden, así dos filas con la misma huella no se
+    pisan). Quedan como máximo MAX_SUGERENCIAS_CAMPOS: primero los que tienen valor en más filas; los de valor único
+    del documento van después.
+    """
+    por_clave: dict[str, dict[str, Any]] = {}
+    for huella, adicionales in filas:
+        vistos: set[str] = set()
+        for adicional in adicionales:
+            nombre = _limpiar_texto(adicional.campo, MAX_NOMBRE_CAMPO)
+            valor = _limpiar_texto(adicional.valor, MAX_VALOR_CAMPO)
+            clave = clave_campo(nombre)
+            if not clave or not valor or clave in vistos or clave.replace("-", " ") in NOMBRES_ESTANDAR:
+                continue
+            vistos.add(clave)
+            sugerencia = por_clave.setdefault(clave, {"clave": clave, "nombre": nombre, "valores": []})
+            sugerencia["valores"].append({"huella": huella, "valor": valor})
+    por_fila = sorted(por_clave.values(), key=lambda sugerencia: -len(sugerencia["valores"]))
+    unicos: list[dict[str, Any]] = []
+    for campo in documento:
+        nombre = _limpiar_texto(campo.nombre, MAX_NOMBRE_CAMPO)
+        valor = _limpiar_texto(campo.valor_documento, MAX_VALOR_CAMPO)
+        clave = clave_campo(nombre)
+        if not clave or not valor or clave in por_clave or clave.replace("-", " ") in NOMBRES_ESTANDAR:
+            continue
+        por_clave[clave] = {"clave": clave, "nombre": nombre, "valores": [], "valor_documento": valor}
+        unicos.append(por_clave[clave])
+    return (por_fila + unicos)[:MAX_SUGERENCIAS_CAMPOS]
 
 
 def _model_candidates(model: str) -> list[str]:

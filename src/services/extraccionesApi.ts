@@ -1,4 +1,4 @@
-import type { Resumen, Transaccion } from '../types'
+import type { CampoExtra, Resumen, SugerenciaCampo, Transaccion } from '../types'
 import type { FormatoNumerico, ValidacionContable } from './contabilidad'
 
 const API_URL = import.meta.env.DEV ? '/api' : (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
@@ -36,6 +36,9 @@ export type ExtraccionGuardada = {
   formato_numerico: FormatoNumerico | null
   resumen: Resumen
   transacciones: Transaccion[]
+  /** Ausentes en documentos guardados antes de las columnas adicionales. */
+  campos_extra?: CampoExtra[]
+  sugerencias_campos?: SugerenciaCampo[]
   validacion: ValidacionContable
   problemas: ProblemasRevision
 }
@@ -85,6 +88,8 @@ export type SolicitudGuardado = {
   prompt_version: string | null
   filename: string
   attachmentId: string | null
+  campos_extra?: CampoExtra[]
+  sugerencias_campos?: SugerenciaCampo[]
 }
 
 export class ErrorApi extends Error {

@@ -1,4 +1,5 @@
-import type { Resumen, Transaccion } from '../types'
+import type { CampoExtra, Resumen, SugerenciaCampo, Transaccion } from '../types'
+import { rellenarColumnasIa } from './camposExtra'
 import type { FormatoNumerico, ValidacionContable } from './contabilidad'
 import { ErrorApi, type EstadoExtraccion, type ExtraccionGuardada, type ProblemasRevision } from './extraccionesApi'
 import type { GeminiExtractionResponse } from './geminiApi'
@@ -12,20 +13,34 @@ export type DocumentoEditable = {
   formato_numerico: FormatoNumerico | null
   modelo: string | null
   prompt_version: string | null
+  /** Columnas adicionales de la tabla (botón "+ Campo"). */
+  campos_extra: CampoExtra[]
+  /** Campos que propuso la IA en la última extracción; se guardan para que el menú siga disponible al recargar. */
+  sugerencias_campos: SugerenciaCampo[]
 }
 
-export const documentoVacio = (): DocumentoEditable => ({ estado: 'borrador', resumen: null, transacciones: [], formato_numerico: null, modelo: null, prompt_version: null })
+export const documentoVacio = (): DocumentoEditable => ({ estado: 'borrador', resumen: null, transacciones: [], formato_numerico: null, modelo: null, prompt_version: null, campos_extra: [], sugerencias_campos: [] })
+
+/** Documentos y borradores anteriores a las columnas adicionales no traen esos datos: se leen como vacíos. */
+export const conColumnasExtra = (documento: Omit<DocumentoEditable, 'campos_extra' | 'sugerencias_campos'> & Partial<Pick<DocumentoEditable, 'campos_extra' | 'sugerencias_campos'>>): DocumentoEditable => ({
+  ...documento,
+  campos_extra: Array.isArray(documento.campos_extra) ? documento.campos_extra : [],
+  sugerencias_campos: Array.isArray(documento.sugerencias_campos) ? documento.sugerencias_campos : [],
+})
 
 /**
  * Resultado de Gemini → documento editable, combinado con las filas vigentes (se conservan las manuales y las
  * editadas). Queda como borrador. Lo usan la pestaña al aplicar una extracción y el contenedor al escribir el
- * borrador local de una pestaña que nunca se abrió.
+ * borrador local de una pestaña que nunca se abrió. Las columnas adicionales vigentes se conservan; las celdas
+ * vacías de las columnas de la IA se rellenan y las sugerencias se reemplazan por las de esta extracción.
  */
-export function documentoDesdeExtraccion(result: GeminiExtractionResponse, actuales: Transaccion[], lote: string): { documento: DocumentoEditable; combinacion: ResultadoCombinacion } {
+export function documentoDesdeExtraccion(result: GeminiExtractionResponse, actuales: Transaccion[], lote: string, campos: CampoExtra[] = []): { documento: DocumentoEditable; combinacion: ResultadoCombinacion } {
   const combinacion = combinarExtraccion(actuales, result.transacciones, lote)
+  const sugerencias = Array.isArray(result.sugerencias_campos) ? result.sugerencias_campos : []
+  const transacciones = rellenarColumnasIa(combinacion.transacciones, campos, sugerencias)
   return {
-    documento: { estado: 'borrador', resumen: result.resumen, transacciones: combinacion.transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version },
-    combinacion,
+    documento: { estado: 'borrador', resumen: result.resumen, transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version, campos_extra: campos, sugerencias_campos: sugerencias },
+    combinacion: { ...combinacion, transacciones },
   }
 }
 
@@ -36,6 +51,8 @@ export const documentoDesdeGuardado = (guardado: ExtraccionGuardada): DocumentoE
   formato_numerico: guardado.formato_numerico,
   modelo: guardado.modelo,
   prompt_version: guardado.prompt_version,
+  campos_extra: Array.isArray(guardado.campos_extra) ? guardado.campos_extra : [],
+  sugerencias_campos: Array.isArray(guardado.sugerencias_campos) ? guardado.sugerencias_campos : [],
 })
 
 /** JSON con claves ordenadas y sin `undefined`: la misma información da siempre la misma firma. */
@@ -51,7 +68,7 @@ export const firmaContenido = (documento: DocumentoEditable) => JSON.stringify(c
 
 /** ¿Hay cambios sin guardar? Sin versión guardada, cualquier contenido cuenta como cambio. */
 export function hayCambios(documento: DocumentoEditable, firmaGuardada: string | null): boolean {
-  if (firmaGuardada === null) return documento.resumen !== null || documento.transacciones.length > 0
+  if (firmaGuardada === null) return documento.resumen !== null || documento.transacciones.length > 0 || documento.campos_extra.length > 0
   return firmaContenido(documento) !== firmaGuardada
 }
 
@@ -116,7 +133,8 @@ export function borradoresLocales(almacen: AlmacenLocal | null = almacenNavegado
         const crudo = almacen?.getItem(clave)
         if (!crudo) return null
         const valor = JSON.parse(crudo) as BorradorLocal
-        return valor && Array.isArray(valor.documento?.transacciones) ? valor : null
+        // Un borrador escrito antes de las columnas adicionales abre igual, sin columnas.
+        return valor && Array.isArray(valor.documento?.transacciones) ? { ...valor, documento: conColumnasExtra(valor.documento) } : null
       } catch {
         return null
       }

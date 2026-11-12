@@ -27,6 +27,28 @@ export type Transaccion = {
   huella?: string
   /** Motivo por el que la fila requiere revisión además de sus montos dudosos. */
   revision?: RevisionTransaccion
+  /** Valores de las columnas adicionales ({id del campo: valor}); no entran en la validación contable ni en SaveData. */
+  extras?: Record<string, string>
+}
+
+/** Columna adicional de la tabla de Movimientos (botón "+ Campo"). */
+export type CampoExtra = {
+  id: string
+  nombre: string
+  /** 'ia' si se creó desde una sugerencia de la IA; 'manual' si el usuario escribió el nombre. */
+  origen: 'ia' | 'manual'
+  /** Clave de la sugerencia que la creó: enlaza la columna con la misma sugerencia al re-extraer. */
+  clave?: string
+}
+
+/** Campo que la IA encontró en el documento y no está capturado. Nunca inventa campos ni valores. */
+export type SugerenciaCampo = {
+  clave: string
+  nombre: string
+  /** Valores por fila, asociados a la huella del movimiento (en orden, por si dos filas comparten huella). */
+  valores: { huella: string; valor: string }[]
+  /** Valor único del documento: al elegirlo se repite en cada fila. */
+  valor_documento?: string
 }
 
 export type RevisionTransaccion = 'no_aparece_en_extraccion' | 'fila_de_saldo_con_importe'

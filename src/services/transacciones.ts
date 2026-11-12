@@ -26,8 +26,9 @@ export function etiquetaOrigen(origen: Transaccion['origen']): string {
 
 const CAMPOS_CAPTURA: CampoEditable[] = ['fecha', 'concepto', 'referencia', 'cargo', 'abono', 'saldo']
 
-/** Una fila manual sin ningún dato capturado no es una corrección. */
-export const esFilaVacia = (transaccion: Transaccion) => CAMPOS_CAPTURA.every((campo) => !transaccion[campo].trim())
+/** Una fila manual sin ningún dato capturado (tampoco en las columnas adicionales) no es una corrección. */
+export const esFilaVacia = (transaccion: Transaccion) =>
+  CAMPOS_CAPTURA.every((campo) => !transaccion[campo].trim()) && Object.values(transaccion.extras ?? {}).every((valor) => !valor.trim())
 
 /** Correcciones que una re-extracción debe conservar: filas manuales con datos y filas de la IA editadas. */
 export const contarCorrecciones = (transacciones: Transaccion[]) =>
@@ -43,7 +44,8 @@ export type ResultadoCombinacion = {
 
 /**
  * Combina una nueva extracción con la lista actual del documento sin perder correcciones:
- * - las filas `ia` sin editar se reemplazan por la nueva extracción;
+ * - las filas `ia` sin editar se reemplazan por la nueva extracción (sus valores de columnas adicionales pasan a
+ *   la fila nueva con la misma huella);
  * - una fila `ia_editada` cuya huella sigue presente ocupa el lugar de esa fila nueva;
  * - una fila `ia_editada` que ya no aparece se conserva con `revision: 'no_aparece_en_extraccion'`;
  * - las filas `manual` se conservan después de la fila que tenían delante (al inicio si no había ninguna).
@@ -89,6 +91,7 @@ export function combinarExtraccion(actual: Transaccion[], nuevas: Transaccion[],
         noAparecen += 1
       }
     } else if (indice !== undefined) {
+      if (transaccion.extras) base[indice] = { ...base[indice], extras: transaccion.extras }
       ancla = indice
     }
   }
