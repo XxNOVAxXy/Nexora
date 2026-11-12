@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type SetStateAction } from 'react'
 import { Link, NavLink, Route, Routes, useBlocker, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import type { CampoExtra, CampoMonto, CampoMontoResumen, Resumen, SugerenciaCampo, Transaccion } from './types'
-import { agregarCampoManual, aplicarSugerencia, editarExtra, eliminarCampo, errorNombreCampo, filasConValor, MAX_CAMPOS_EXTRA, renombrarCampo, sugerenciasDisponibles, type ColumnasDocumento } from './services/camposExtra'
+import { agregarCampoManual, aplicarSugerencia, camposParaSolicitar, editarExtra, eliminarCampo, errorNombreCampo, esCeldaDeIa, filasConValor, fuenteDeLlenado, llenarColumnaManual, MAX_CAMPOS_EXTRA, mensajeLlenado, renombrarCampo, sugerenciasDisponibles, type ColumnasDocumento, type ResultadoLlenado } from './services/camposExtra'
 import { contarCorrecciones, editarCampo, etiquetaOrigen, nuevaTransaccion, type CampoEditable } from './services/transacciones'
 import { validarContabilidad, type ValidacionContable } from './services/contabilidad'
 import { crearControladorExtraccion, ejecutarExtraccion } from './services/extraccion'
@@ -502,7 +502,7 @@ function BarraPestanas({ archivos, activa, onActivar, estadoDe, sinGuardar }: { 
   </nav>
 }
 
-type AvisoCombinacion = { conservadas: number; noAparecen: number }
+type AvisoCombinacion = { conservadas: number; noAparecen: number; campos: string[] }
 /** Una sola lista por documento: los modos manual y Gemini muestran y editan el mismo documento. */
 type CampoResumenEditable = 'banco' | 'titular' | 'cuenta' | 'periodo' | 'moneda' | CampoMontoResumen
 /** Celda a la que se copia el dato del documento al hacer clic en su recuadro. */
@@ -512,7 +512,10 @@ const etiquetaResumen: Record<CampoResumenEditable, string> = { banco: 'Banco', 
 const camposResumen: CampoResumenEditable[] = ['banco', 'titular', 'cuenta', 'periodo', 'moneda', 'saldo_inicial', 'total_abonos', 'total_cargos', 'saldo_final']
 type VerificacionVisor = { estado: EstadoTextoDocumento; onTexto: (paginas: PaginaTexto[] | null) => void; marcas: MarcaVerificacion[]; disponible: boolean; visible: boolean; onAlternar: () => void; resaltado: Resaltado | null; onClicMarca: (marca: MarcaVerificacion) => void; panel: React.ReactNode }
 
-type ListaDocumento = { documentKey: string | null; documento: DocumentoEditable; aviso: AvisoCombinacion | null; warnings: string[] }
+type ListaDocumento = { documentKey: string | null; documento: DocumentoEditable; aviso: AvisoCombinacion | null; warnings: string[]; avisosCampos: Record<string, AvisoCampo> }
+/** Mensaje junto a una columna manual tras buscarla con la IA. */
+type AvisoCampo = { tipo: 'exito' | 'info' | 'error'; texto: string }
+const avisoDeLlenado = (resultado: ResultadoLlenado): AvisoCampo => ({ tipo: resultado.estado === 'llenado' ? 'exito' : 'info', texto: mensajeLlenado(resultado) })
 /** Última versión confirmada por el backend para este documento. */
 type VersionGuardada = { documentKey: string; version: number; estado: EstadoExtraccion; actualizado: string; firma: string; envios: IntentoEnvio[]; enviado_en: string | null }
 type OfertaBorrador = { documentKey: string; borrador: BorradorLocal; versionGuardada: number | null }
@@ -523,7 +526,7 @@ function nuevoLoteExtraccion() {
   return `${Date.now().toString(36)}${loteExtraccion}`
 }
 const borradores = borradoresLocales()
-const listaVacia = (documentKey: string | null): ListaDocumento => ({ documentKey, documento: documentoVacio(), aviso: null, warnings: [] })
+const listaVacia = (documentKey: string | null): ListaDocumento => ({ documentKey, documento: documentoVacio(), aviso: null, warnings: [], avisosCampos: {} })
 const etiquetaEstado: Record<EstadoExtraccion, string> = { borrador: 'Borrador', revisado: 'Revisado', enviado: 'Enviado' }
 
 type PropsRevision = {
@@ -564,6 +567,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const [resaltado, setResaltado] = useState<Resaltado | null>(null)
   const [mensajeCaptura, setMensajeCaptura] = useState<{ tipo: 'info' | 'error'; texto: string } | null>(null)
   const [filaPorAgregar, setFilaPorAgregar] = useState<number | null>(null)
+  const [llenandoCampos, setLlenandoCampos] = useState<{ documentKey: string | null; campos: string[] }>({ documentKey: null, campos: [] })
   // Asocia cada extracción a su documento y descarta respuestas tardías de documentos anteriores.
   const [controlador] = useState(crearControladorExtraccion)
   const messageId = archivo?.messageId ?? null
@@ -654,7 +658,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
         if (guardadoBackend) {
           const documentoGuardado = documentoDesdeGuardado(guardadoBackend)
           firmaServidor = firmaContenido(documentoGuardado)
-          setLista({ documentKey, documento: documentoGuardado, aviso: null, warnings: [] })
+          setLista({ documentKey, documento: documentoGuardado, aviso: null, warnings: [], avisosCampos: {} })
           setGuardado({ documentKey, version: guardadoBackend.version, estado: guardadoBackend.estado, actualizado: guardadoBackend.actualizado, firma: firmaServidor, envios: guardadoBackend.envios ?? [], enviado_en: guardadoBackend.enviado_en })
         }
         const clave = cuenta ? claveBorrador(cuenta, messageId, partId) : null
@@ -710,6 +714,36 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const agregarCampo = (nombre: string) => setColumnas((columnas) => ({ ...columnas, campos_extra: agregarCampoManual(columnas.campos_extra, nombre) }))
   const renombrarColumna = (id: string, nombre: string) => setColumnas((columnas) => ({ ...columnas, campos_extra: renombrarCampo(columnas.campos_extra, id, nombre) }))
   const eliminarColumna = (id: string) => setColumnas((columnas) => eliminarCampo(columnas, id))
+  const cerrarAvisoCampo = (id: string) => setLista((prev) => (prev.documentKey === documentKey ? { ...prev, avisosCampos: Object.fromEntries(Object.entries(prev.avisosCampos).filter(([clave]) => clave !== id)) } : prev))
+  /** "Llenar con IA": busca solo esta columna manual con las filas actuales y llena únicamente las celdas vacías. */
+  const llenarConIa = async (campoId: string) => {
+    const campo = documento.campos_extra.find((item) => item.id === campoId)
+    if (!campo || !messageId || !attachmentId || !documentKey || llenandoCampos.campos.includes(campoId)) return
+    const clave = documentKey
+    const filas = transactions
+    const ids = filas.map((fila) => fila.id)
+    setLlenandoCampos((prev) => ({ documentKey: clave, campos: [...(prev.documentKey === clave ? prev.campos : []), campoId] }))
+    let aviso: AvisoCampo | null = null
+    let respuesta: Awaited<ReturnType<typeof geminiApi.llenarCampo>> | null = null
+    try {
+      respuesta = await geminiApi.llenarCampo(messageId, attachmentId, campo.nombre, filas.map(({ fecha, concepto, referencia, cargo, abono }) => ({ fecha, concepto, referencia, cargo, abono })))
+    } catch (error) {
+      aviso = { tipo: 'error', texto: `No se pudo buscar «${campo.nombre}»: ${error instanceof Error ? error.message : 'error desconocido'}` }
+    }
+    // Una respuesta tardía de otro documento se descarta.
+    if (documentKeyActual.current !== clave) return
+    setLlenandoCampos((prev) => (prev.documentKey === clave ? { ...prev, campos: prev.campos.filter((id) => id !== campoId) } : prev))
+    setLista((prev) => {
+      if (prev.documentKey !== clave) return prev
+      const actual = prev.documento.campos_extra.find((item) => item.id === campoId)
+      if (!actual) return prev
+      if (!respuesta) return { ...prev, avisosCampos: { ...prev.avisosCampos, [campoId]: aviso! } }
+      // Las filas borradas mientras se buscaba se ignoran; solo se llenan las celdas que siguen vacías.
+      const { transacciones, resultado } = llenarColumnaManual(prev.documento.transacciones, actual, respuesta.encontrado, fuenteDeLlenado(respuesta, ids))
+      const documentoNuevo = resultado.llenadas > 0 ? { ...prev.documento, estado: 'borrador' as const, transacciones } : prev.documento
+      return { ...prev, documento: documentoNuevo, avisosCampos: { ...prev.avisosCampos, [campoId]: avisoDeLlenado(resultado) } }
+    })
+  }
   /** Edición del resumen: como cualquier cambio de contenido, vuelve el documento a borrador; el campo deja de ser dudoso. */
   const cambiarResumen = (campo: CampoResumenEditable, valor: string) => setLista((prev) => {
     const base = prev.documentKey === documentKey ? prev : listaVacia(documentKey)
@@ -779,7 +813,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
 
   const restaurarBorrador = () => {
     if (!oferta) return
-    setLista({ documentKey, documento: oferta.borrador.documento, aviso: null, warnings: [] })
+    setLista({ documentKey, documento: oferta.borrador.documento, aviso: null, warnings: [], avisosCampos: {} })
     setOfertaBorrador(null)
   }
   const descartarBorrador = () => {
@@ -853,13 +887,14 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
     // Updater puro. El resultado queda como borrador con cambios sin guardar hasta que el usuario pulse Guardar.
     setLista((prev) => {
       const base = prev.documentKey === clave ? prev : listaVacia(clave)
-      const { documento: combinado, combinacion } = documentoDesdeExtraccion(result, base.documento.transacciones, lote, base.documento.campos_extra)
-      const mostrarAviso = forzar || combinacion.conservadas > 0
+      const { documento: combinado, combinacion, llenado } = documentoDesdeExtraccion(result, base.documento.transacciones, lote, base.documento.campos_extra)
+      const mostrarAviso = forzar || combinacion.conservadas > 0 || llenado.length > 0
       return {
         documentKey: clave,
         documento: combinado,
-        aviso: mostrarAviso ? { conservadas: combinacion.conservadas, noAparecen: combinacion.noAparecen } : null,
+        aviso: mostrarAviso ? { conservadas: combinacion.conservadas, noAparecen: combinacion.noAparecen, campos: llenado.map(mensajeLlenado) } : null,
         warnings: result.warnings,
+        avisosCampos: Object.fromEntries(llenado.map((resultado) => [resultado.campoId, avisoDeLlenado(resultado)])),
       }
     })
   }
@@ -894,7 +929,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
     await ejecutarExtraccion(controlador, documentKey, async (signal) => {
       const status = geminiStatus ?? await geminiApi.status()
       if (!status.enabled) throw new Error('Gemini no está conectado o habilitado en FastAPI.')
-      return geminiApi.extract(messageId, attachmentId, { forzar, signal })
+      return geminiApi.extract(messageId, attachmentId, { forzar, signal, campos: camposParaSolicitar(documento.campos_extra) })
     }, {
       exito: (result) => {
         aplicarResultadoGemini(result, forzar)
@@ -970,6 +1005,11 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
           onCambiar: cambiarExtra,
           onRenombrar: renombrarColumna,
           onEliminar: eliminarColumna,
+          onLlenar: (id) => void llenarConIa(id),
+          llenando: llenandoCampos.documentKey === documentKey ? llenandoCampos.campos : [],
+          motivoNoLlenar: geminiStatus?.enabled !== true ? 'Gemini no está conectado o habilitado.' : null,
+          avisos: deEsteDocumento ? lista.avisosCampos : {},
+          onCerrarAviso: cerrarAvisoCampo,
           menu: <MenuCampo campos={documento.campos_extra} sugerencias={documento.sugerencias_campos} huboExtraccionIa={huboExtraccion} onAplicar={elegirSugerencia} onAgregar={agregarCampo} />,
         }} alertas={alertas} onCambiar={cambiarCampo} onEliminar={eliminarTransaccion} sinRespaldo={sinRespaldo} resaltado={resaltado} destino={verificando && destino?.tipo === 'movimiento' ? destino : null} onEnfocar={enfocarCeldaMovimiento} /></div>}
         <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-4 py-2.5 text-[11px] text-slate-400"><div className="flex flex-wrap items-center gap-1.5"><CircleHelp size={13} />{`${transactions.length} movimiento${transactions.length === 1 ? '' : 's'}.`}{dudososCount > 0 && <span className="font-semibold text-amber-700">{dudososCount} importe{dudososCount === 1 ? '' : 's'} dudoso{dudososCount === 1 ? '' : 's'}: revísalo{dudososCount === 1 ? '' : 's'} contra el documento.</span>}</div></div>
@@ -984,7 +1024,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
 
 function AvisoReextraccion({ aviso, onClose }: { aviso: AvisoCombinacion; onClose: () => void }) {
   const tono = aviso.noAparecen > 0 ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-emerald-200 bg-emerald-50 text-emerald-700'
-  return <div role="status" className={`flex items-start justify-between gap-3 rounded-xl border px-4 py-3 text-sm ${tono}`}><div className="flex items-start gap-2"><CheckCircle2 size={17} className="mt-0.5 shrink-0" /><div><div className="font-semibold">Extracción combinada con tus correcciones.</div><div className="mt-0.5 text-xs">Se conservaron {aviso.conservadas} corrección{aviso.conservadas === 1 ? '' : 'es'}. {aviso.noAparecen} fila{aviso.noAparecen === 1 ? '' : 's'} quedaron marcadas como «no aparece en extracción».</div></div></div><button type="button" onClick={onClose} aria-label="Cerrar aviso"><X size={16} /></button></div>
+  return <div role="status" className={`flex items-start justify-between gap-3 rounded-xl border px-4 py-3 text-sm ${tono}`}><div className="flex items-start gap-2"><CheckCircle2 size={17} className="mt-0.5 shrink-0" /><div><div className="font-semibold">Extracción combinada con tus correcciones.</div><div className="mt-0.5 text-xs">Se conservaron {aviso.conservadas} corrección{aviso.conservadas === 1 ? '' : 'es'}. {aviso.noAparecen} fila{aviso.noAparecen === 1 ? '' : 's'} quedaron marcadas como «no aparece en extracción».</div>{aviso.campos.length > 0 && <ul className="mt-1 list-disc space-y-0.5 pl-4 text-xs">{aviso.campos.map((texto) => <li key={texto}>{texto}</li>)}</ul>}</div></div><button type="button" onClick={onClose} aria-label="Cerrar aviso"><X size={16} /></button></div>
 }
 
 const etiquetaCampoInvalido = { cargo: 'Cargo dudoso o inválido.', abono: 'Abono dudoso o inválido.', saldo: 'Saldo dudoso o inválido.', cargo_y_abono: 'Tiene cargo y abono a la vez.' } as const
@@ -1139,7 +1179,20 @@ const tonoOrigen: Record<Transaccion['origen'], string> = { ia: 'bg-violet-50 te
 
 const etiquetaRevision: Record<NonNullable<Transaccion['revision']>, string> = { no_aparece_en_extraccion: 'No aparece en extracción', fila_de_saldo_con_importe: 'Fila de saldo: no se suma' }
 
-type ColumnasTabla = { campos: CampoExtra[]; onCambiar: (id: string, campoId: string, valor: string) => void; onRenombrar: (id: string, nombre: string) => void; onEliminar: (id: string) => void; menu: React.ReactNode }
+type ColumnasTabla = {
+  campos: CampoExtra[]
+  onCambiar: (id: string, campoId: string, valor: string) => void
+  onRenombrar: (id: string, nombre: string) => void
+  onEliminar: (id: string) => void
+  /** "Llenar con IA" de una columna manual. */
+  onLlenar: (id: string) => void
+  llenando: string[]
+  /** Por qué no se puede llenar con IA ahora (null si se puede). */
+  motivoNoLlenar: string | null
+  avisos: Record<string, AvisoCampo>
+  onCerrarAviso: (id: string) => void
+  menu: React.ReactNode
+}
 
 function TablaTransacciones({ transacciones, columnas, alertas, onCambiar, onEliminar, sinRespaldo, resaltado, destino, onEnfocar }: { transacciones: Transaccion[]; columnas: ColumnasTabla; alertas: Record<string, string[]>; onCambiar: (id: string, campo: CampoEditable, valor: string) => void; onEliminar: (id: string) => void; sinRespaldo: Set<string>; resaltado: Resaltado | null; destino: { id: string; campo: CampoEditable } | null; onEnfocar: (id: string, campo: CampoEditable) => void }) {
   const tabla = useRef<HTMLTableElement>(null)
@@ -1151,11 +1204,11 @@ function TablaTransacciones({ transacciones, columnas, alertas, onCambiar, onEli
     fila?.scrollIntoView?.({ block: "nearest" })
   }, [filaResaltada, resaltado?.origen])
   if (transacciones.length === 0) return <div className="px-5 py-14 text-center text-xs text-slate-400">Sin movimientos. Usa <strong>Agregar</strong> para capturar uno.</div>
-  return <table ref={tabla} style={{ minWidth: 744 + columnas.campos.length * 140 }} className="w-full table-fixed border-collapse text-xs"><thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase tracking-wider text-slate-400"><tr>{columnasTabla.map((columna) => <th key={columna.campo} scope="col" className={`${columna.ancho} border-b border-slate-200 px-2 py-2 font-bold ${columna.monto ? 'text-right' : 'text-left'}`}>{columna.etiqueta}</th>)}{columnas.campos.map((campo) => <th key={campo.id} scope="col" className="w-[140px] border-b border-slate-200 px-2 py-2 text-left font-bold"><EncabezadoCampo campo={campo} campos={columnas.campos} onRenombrar={columnas.onRenombrar} onEliminar={columnas.onEliminar} /></th>)}<th scope="col" className="w-[84px] border-b border-slate-200 px-1 py-1.5 text-right normal-case tracking-normal">{columnas.menu}</th><th scope="col" className="w-9 border-b border-slate-200"><span className="sr-only">Acciones</span></th></tr></thead><tbody>{transacciones.map((transaccion, index) => <tr key={transaccion.id} data-movimiento={transaccion.id} aria-selected={filaResaltada === transaccion.id || undefined} className={`border-b border-slate-100 align-top ${filaResaltada === transaccion.id ? 'bg-blue-50/70 outline outline-1 -outline-offset-1 outline-blue-300' : alertas[transaccion.id] ? 'bg-red-50/40' : transaccion.revision ? 'bg-amber-50/40' : 'hover:bg-slate-50/50'}`}>{columnasTabla.map((columna) => { const dudoso = columna.monto && transaccion.dudosos.includes(columna.campo as CampoMonto); const esDestino = destino?.id === transaccion.id && destino.campo === columna.campo; const clases = `w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${esDestino ? 'ring-2 ring-blue-400' : ''} ${columna.monto ? 'text-right tabular-nums' : ''} ${dudoso ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-transparent bg-transparent hover:border-slate-200'}`; const comunes = { 'aria-label': `${columna.etiqueta} del movimiento ${index + 1}`, value: transaccion[columna.campo], onFocus: () => onEnfocar(transaccion.id, columna.campo), title: dudoso ? 'Importe dudoso: no se pudo interpretar sin adivinar. Revísalo contra el documento.' : transaccion[columna.campo] || undefined }; return <td key={columna.campo} className="px-1 py-1">{columna.campo === 'concepto' ? <><textarea {...comunes} rows={1} style={{ fieldSizing: 'content' } as React.CSSProperties} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={`${clases} block min-h-[30px] resize-none overflow-hidden leading-snug`} /><div className="mt-0.5 flex flex-wrap gap-1 px-1.5"><span className={`inline-flex whitespace-nowrap rounded-full px-1.5 py-0.5 text-[9px] font-bold ${tonoOrigen[transaccion.origen]}`}>{etiquetaOrigen(transaccion.origen)}</span>{transaccion.revision && <span className="inline-flex rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-800">{etiquetaRevision[transaccion.revision]}</span>}{sinRespaldo.has(transaccion.id) && <span title="La verificación visual no encontró este movimiento en el texto del documento." className="inline-flex rounded-full bg-rose-100 px-1.5 py-0.5 text-[9px] font-bold text-rose-700">No aparece en el documento</span>}{alertas[transaccion.id] && <span title={alertas[transaccion.id].join(' ')} className="inline-flex cursor-help rounded-full bg-red-100 px-1.5 py-0.5 text-[9px] font-bold text-red-700">{alertas[transaccion.id].length} alerta{alertas[transaccion.id].length === 1 ? '' : 's'}</span>}</div></> : <input {...comunes} inputMode={columna.monto ? 'decimal' : undefined} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={clases} />}</td> })}{columnas.campos.map((campo) => { const valor = transaccion.extras?.[campo.id] ?? ''; return <td key={campo.id} className="px-1 py-1"><input aria-label={`${campo.nombre} del movimiento ${index + 1}`} value={valor} title={valor || undefined} maxLength={500} onChange={(event) => columnas.onCambiar(transaccion.id, campo.id, event.target.value)} className="w-full rounded-md border border-transparent bg-transparent px-1.5 py-1.5 text-xs text-ink outline-none transition hover:border-slate-200 focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10" /></td> })}<td /><td className="px-1 py-1"><button type="button" onClick={() => onEliminar(transaccion.id)} className="rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600" aria-label={`Eliminar movimiento ${index + 1}`}><Trash2 size={13} /></button></td></tr>)}</tbody></table>
+  return <table ref={tabla} style={{ minWidth: 744 + columnas.campos.length * 140 }} className="w-full table-fixed border-collapse text-xs"><thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase tracking-wider text-slate-400"><tr>{columnasTabla.map((columna) => <th key={columna.campo} scope="col" className={`${columna.ancho} border-b border-slate-200 px-2 py-2 font-bold ${columna.monto ? 'text-right' : 'text-left'}`}>{columna.etiqueta}</th>)}{columnas.campos.map((campo) => <th key={campo.id} scope="col" className="w-[140px] border-b border-slate-200 px-2 py-2 text-left font-bold"><EncabezadoCampo campo={campo} campos={columnas.campos} onRenombrar={columnas.onRenombrar} onEliminar={columnas.onEliminar} onLlenar={() => columnas.onLlenar(campo.id)} llenando={columnas.llenando.includes(campo.id)} motivoNoLlenar={columnas.motivoNoLlenar} aviso={columnas.avisos[campo.id] ?? null} onCerrarAviso={() => columnas.onCerrarAviso(campo.id)} /></th>)}<th scope="col" className="w-[84px] border-b border-slate-200 px-1 py-1.5 text-right normal-case tracking-normal">{columnas.menu}</th><th scope="col" className="w-9 border-b border-slate-200"><span className="sr-only">Acciones</span></th></tr></thead><tbody>{transacciones.map((transaccion, index) => <tr key={transaccion.id} data-movimiento={transaccion.id} aria-selected={filaResaltada === transaccion.id || undefined} className={`border-b border-slate-100 align-top ${filaResaltada === transaccion.id ? 'bg-blue-50/70 outline outline-1 -outline-offset-1 outline-blue-300' : alertas[transaccion.id] ? 'bg-red-50/40' : transaccion.revision ? 'bg-amber-50/40' : 'hover:bg-slate-50/50'}`}>{columnasTabla.map((columna) => { const dudoso = columna.monto && transaccion.dudosos.includes(columna.campo as CampoMonto); const esDestino = destino?.id === transaccion.id && destino.campo === columna.campo; const clases = `w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${esDestino ? 'ring-2 ring-blue-400' : ''} ${columna.monto ? 'text-right tabular-nums' : ''} ${dudoso ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-transparent bg-transparent hover:border-slate-200'}`; const comunes = { 'aria-label': `${columna.etiqueta} del movimiento ${index + 1}`, value: transaccion[columna.campo], onFocus: () => onEnfocar(transaccion.id, columna.campo), title: dudoso ? 'Importe dudoso: no se pudo interpretar sin adivinar. Revísalo contra el documento.' : transaccion[columna.campo] || undefined }; return <td key={columna.campo} className="px-1 py-1">{columna.campo === 'concepto' ? <><textarea {...comunes} rows={1} style={{ fieldSizing: 'content' } as React.CSSProperties} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={`${clases} block min-h-[30px] resize-none overflow-hidden leading-snug`} /><div className="mt-0.5 flex flex-wrap gap-1 px-1.5"><span className={`inline-flex whitespace-nowrap rounded-full px-1.5 py-0.5 text-[9px] font-bold ${tonoOrigen[transaccion.origen]}`}>{etiquetaOrigen(transaccion.origen)}</span>{transaccion.revision && <span className="inline-flex rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-800">{etiquetaRevision[transaccion.revision]}</span>}{sinRespaldo.has(transaccion.id) && <span title="La verificación visual no encontró este movimiento en el texto del documento." className="inline-flex rounded-full bg-rose-100 px-1.5 py-0.5 text-[9px] font-bold text-rose-700">No aparece en el documento</span>}{alertas[transaccion.id] && <span title={alertas[transaccion.id].join(' ')} className="inline-flex cursor-help rounded-full bg-red-100 px-1.5 py-0.5 text-[9px] font-bold text-red-700">{alertas[transaccion.id].length} alerta{alertas[transaccion.id].length === 1 ? '' : 's'}</span>}</div></> : <input {...comunes} inputMode={columna.monto ? 'decimal' : undefined} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={clases} />}</td> })}{columnas.campos.map((campo) => { const valor = transaccion.extras?.[campo.id] ?? ''; const deIa = esCeldaDeIa(transaccion, campo.id); return <td key={campo.id} className="relative px-1 py-1"><input aria-label={`${campo.nombre} del movimiento ${index + 1}`} data-ia={deIa || undefined} value={valor} title={deIa ? `Llenado por la IA: ${valor}` : valor || undefined} maxLength={500} onChange={(event) => columnas.onCambiar(transaccion.id, campo.id, event.target.value)} className={`w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${deIa ? 'border-violet-100 bg-violet-50 pr-5 text-violet-900' : 'border-transparent bg-transparent hover:border-slate-200'}`} />{deIa && <Sparkles size={10} aria-hidden className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-violet-400" />}</td> })}<td /><td className="px-1 py-1"><button type="button" onClick={() => onEliminar(transaccion.id)} className="rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600" aria-label={`Eliminar movimiento ${index + 1}`}><Trash2 size={13} /></button></td></tr>)}</tbody></table>
 }
 
 /** Encabezado de una columna adicional: nombre, renombrar y eliminar (con confirmación, porque borra sus valores). */
-function EncabezadoCampo({ campo, campos, onRenombrar, onEliminar }: { campo: CampoExtra; campos: CampoExtra[]; onRenombrar: (id: string, nombre: string) => void; onEliminar: (id: string) => void }) {
+function EncabezadoCampo({ campo, campos, onRenombrar, onEliminar, onLlenar, llenando, motivoNoLlenar, aviso, onCerrarAviso }: { campo: CampoExtra; campos: CampoExtra[]; onRenombrar: (id: string, nombre: string) => void; onEliminar: (id: string) => void; onLlenar: () => void; llenando: boolean; motivoNoLlenar: string | null; aviso: AvisoCampo | null; onCerrarAviso: () => void }) {
   const [modo, setModo] = useState<'normal' | 'renombrar' | 'confirmar'>('normal')
   const [nombre, setNombre] = useState(campo.nombre)
   const error = modo === 'renombrar' ? errorNombreCampo(nombre, campos, campo.id) : null
@@ -1173,10 +1226,15 @@ function EncabezadoCampo({ campo, campos, onRenombrar, onEliminar }: { campo: Ca
     <div className="text-[10px] font-semibold leading-tight text-red-700">¿Eliminar «{campo.nombre}» y sus valores?</div>
     <div className="mt-1 flex gap-1"><button type="button" onClick={() => onEliminar(campo.id)} className="rounded bg-red-600 px-1.5 py-0.5 text-[10px] font-bold text-white">Eliminar</button><button type="button" onClick={() => setModo('normal')} className="rounded px-1.5 py-0.5 text-[10px] font-semibold text-slate-500 hover:bg-slate-100">Cancelar</button></div>
   </div>
-  return <div className="flex items-center gap-1">
+  const tonoAviso = aviso?.tipo === 'error' ? 'bg-red-50 text-red-700' : aviso?.tipo === 'exito' ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-800'
+  return <div>
+  <div className="flex items-center gap-1">
     <span className="min-w-0 flex-1 truncate" title={campo.origen === 'ia' ? `${campo.nombre} · sugerido por la IA` : campo.nombre}>{campo.origen === 'ia' && <Sparkles size={10} className="mr-1 inline text-violet-500" aria-hidden />}{campo.nombre}</span>
+    {campo.origen === 'manual' && <button type="button" onClick={onLlenar} disabled={llenando || motivoNoLlenar !== null} aria-label={`Llenar con IA el campo ${campo.nombre}`} title={motivoNoLlenar ?? (llenando ? 'Buscando en el documento…' : 'Llenar con IA: busca este dato en el documento y llena solo las celdas vacías')} className="rounded p-0.5 text-violet-500 hover:bg-violet-100 hover:text-violet-700 disabled:cursor-not-allowed disabled:opacity-40">{llenando ? <RefreshCw size={11} className="animate-spin" /> : <Sparkles size={11} />}</button>}
     <button type="button" onClick={() => { setNombre(campo.nombre); setModo('renombrar') }} aria-label={`Renombrar el campo ${campo.nombre}`} className="rounded p-0.5 text-slate-400 hover:bg-slate-200 hover:text-ink"><Pencil size={11} /></button>
     <button type="button" onClick={() => setModo('confirmar')} aria-label={`Eliminar el campo ${campo.nombre}`} className="rounded p-0.5 text-slate-400 hover:bg-red-50 hover:text-red-600"><X size={11} /></button>
+  </div>
+  {aviso && <div role="status" className={`mt-1 flex items-start gap-1 rounded-md px-1.5 py-1 text-[10px] font-normal normal-case leading-tight tracking-normal ${tonoAviso}`}><span className="min-w-0 flex-1">{aviso.texto}</span><button type="button" onClick={onCerrarAviso} aria-label={`Cerrar el mensaje de ${campo.nombre}`} className="shrink-0 opacity-70 hover:opacity-100"><X size={10} /></button></div>}
   </div>
 }
 

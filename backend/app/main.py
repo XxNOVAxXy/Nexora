@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import logging
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .adjuntos import content_disposition
 from .config import settings
@@ -60,6 +60,27 @@ class GeminiExtractionRequest(BaseModel):
     attachmentId: str = Field(min_length=1)
     # True al re-extraer: ignora la cache de Gemini y reemplaza su entrada.
     forzar: bool = False
+    # Nombres de las columnas manuales que Gemini debe buscar en el documento.
+    campos_solicitados: list[Annotated[str, Field(max_length=200)]] = Field(default_factory=list, max_length=30)
+
+
+class FilaParaCampo(BaseModel):
+    """Movimiento ya capturado que se envía a "Llenar con IA" para que Gemini lo ubique por su índice."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    fecha: str = Field(default="", max_length=200)
+    concepto: str = Field(default="", max_length=2000)
+    referencia: str = Field(default="", max_length=500)
+    cargo: str = Field(default="", max_length=200)
+    abono: str = Field(default="", max_length=200)
+
+
+class GeminiCampoRequest(BaseModel):
+    messageId: str = Field(min_length=1)
+    attachmentId: str = Field(min_length=1)
+    nombre: str = Field(min_length=1, max_length=200)
+    filas: list[FilaParaCampo] = Field(default_factory=list, max_length=5000)
 
 
 @app.get("/api/health")
@@ -159,7 +180,7 @@ def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
             media_type,
             data.startswith(b"%PDF-"),
         )
-        result = gemini.extract_document(data, media_type, filename, forzar=payload.forzar)
+        result = gemini.extract_document(data, media_type, filename, forzar=payload.forzar, campos_solicitados=payload.campos_solicitados)
         logger.info(
             "Gemini extraction result attachment_id=%s result=success transacciones=%d cuadra=%s",
             payload.attachmentId,
@@ -190,6 +211,28 @@ def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
     except Exception as error:
         logger.exception("Document extraction failed for message=%s attachment=%s", payload.messageId, payload.attachmentId)
         raise HTTPException(status_code=502, detail=f"No se pudo extraer el documento: {error}") from error
+
+
+@app.post("/api/gemini/campos")
+def fill_gemini_field(payload: GeminiCampoRequest) -> dict[str, Any]:
+    """"Llenar con IA": busca una sola columna en el documento para las filas actuales, sin re-extraer."""
+    try:
+        data, media_type, filename = gmail.attachment(payload.messageId, payload.attachmentId)
+        return gemini.fill_field(data, media_type, filename, payload.nombre, [fila.model_dump() for fila in payload.filas])
+    except GmailNotConnectedError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    except GmailRateLimitError as error:
+        raise _rate_limited(error) from error
+    except GmailAttachmentError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except GeminiUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except GeminiRequestError as error:
+        logger.exception("Gemini field fill failed for attachment=%s", payload.attachmentId)
+        raise HTTPException(status_code=error.status_code, detail={"code": error.code, "message": str(error), "retryable": error.retryable}) from error
+    except Exception as error:
+        logger.exception("Field fill failed for message=%s attachment=%s", payload.messageId, payload.attachmentId)
+        raise HTTPException(status_code=502, detail=f"No se pudo buscar el campo en el documento: {error}") from error
 
 
 @app.get("/api/gmail/messages")

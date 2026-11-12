@@ -66,7 +66,7 @@ class DocumentTransportTests(unittest.TestCase):
                 return expected_bytes, "application/pdf", "Estado_de_Cuenta_Prueba_Nexora.pdf"
 
         class FakeGemini:
-            def extract_document(self, data: bytes, mime_type: str, filename: str, forzar: bool = False) -> dict[str, object]:
+            def extract_document(self, data: bytes, mime_type: str, filename: str, forzar: bool = False, campos_solicitados=()) -> dict[str, object]:
                 self.received = (data, mime_type, filename)
                 return {"filename": filename, "transacciones": [], "validacion": {"cuadra": None}}
 

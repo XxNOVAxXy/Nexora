@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { CampoExtra, SugerenciaCampo, Transaccion } from '../types'
-import { agregarCampoManual, aplicarSugerencia, editarExtra, eliminarCampo, errorNombreCampo, filasConValor, renombrarCampo, sugerenciasDisponibles } from './camposExtra'
+import type { CampoExtra, ResultadoCampo, SugerenciaCampo, Transaccion } from '../types'
+import { agregarCampoManual, aplicarSugerencia, camposParaSolicitar, editarExtra, eliminarCampo, errorNombreCampo, esCeldaDeIa, filasConValor, fuenteDeLlenado, llenarColumnaManual, mensajeLlenado, rellenarColumnas, renombrarCampo, sugerenciasDisponibles } from './camposExtra'
 import { borradoresLocales, documentoDesdeExtraccion, documentoDesdeGuardado, documentoVacio, firmaContenido, hayCambios } from './guardado'
 import type { ExtraccionGuardada } from './extraccionesApi'
 import type { GeminiExtractionResponse } from './geminiApi'
@@ -117,5 +117,67 @@ describe('documentos y borradores anteriores', () => {
 
   it('una columna nueva sin filas cuenta como cambio sin guardar', () => {
     expect(hayCambios({ ...documentoVacio(), campos_extra: [{ id: 'c', nombre: 'X', origen: 'manual' }] }, null)).toBe(true)
+  })
+})
+
+describe('la IA llena columnas manuales', () => {
+  const nombre: CampoExtra = { id: 'c-nom', nombre: 'Nombre', origen: 'manual' }
+  const filas = () => [fila('a', 'h1'), fila('b', 'h2'), fila('c', undefined, { origen: 'manual' })]
+  const resultado = (cambios: Partial<ResultadoCampo>): ResultadoCampo => ({ nombre: 'Nombre', clave: 'nombre', encontrado: true, valores: [], ...cambios })
+
+  it('llena una columna manual vacía, marca las celdas como de la IA y no cambia el origen', () => {
+    const { transacciones, llenado } = rellenarColumnas(filas(), [nombre], [], [resultado({ valores: [{ huella: 'h1', valor: 'Ana' }, { huella: 'h2', valor: 'Luis' }] })])
+    expect(transacciones.map((t) => t.extras?.['c-nom'])).toEqual(['Ana', 'Luis', undefined])
+    expect(transacciones.map((t) => esCeldaDeIa(t, 'c-nom'))).toEqual([true, true, false])
+    expect(transacciones.map((t) => t.origen)).toEqual(['ia', 'ia', 'manual'])
+    expect(llenado.map(mensajeLlenado)).toEqual(['Se llenaron 2 celdas de «Nombre».'])
+  })
+
+  it('en una columna parcialmente llena solo llena las vacías y conserva "Juan"', () => {
+    const actuales = [fila('a', 'h1', { extras: { 'c-nom': 'Juan' } }), fila('b', 'h2')]
+    const { transacciones, llenado } = rellenarColumnas(actuales, [nombre], [], [resultado({ valores: [{ huella: 'h1', valor: 'Ana' }, { huella: 'h2', valor: 'Luis' }] })])
+    expect(transacciones.map((t) => t.extras?.['c-nom'])).toEqual(['Juan', 'Luis'])
+    expect(esCeldaDeIa(transacciones[0], 'c-nom')).toBe(false)
+    expect(llenado[0]).toMatchObject({ estado: 'llenado', llenadas: 1 })
+  })
+
+  it('un dato inexistente da el mensaje y no cambia nada', () => {
+    const actuales = filas()
+    const { transacciones, llenado } = rellenarColumnas(actuales, [nombre], [], [resultado({ encontrado: false })])
+    expect(transacciones).toBe(actuales)
+    expect(llenado.map(mensajeLlenado)).toEqual(['No se encontró «Nombre» en el documento.'])
+  })
+
+  it('un dato único del documento se repite en cada fila vacía, también en las manuales', () => {
+    const actuales = [fila('a', 'h1', { extras: { 'c-nom': 'Juan' } }), ...filas().slice(1)]
+    const { transacciones } = rellenarColumnas(actuales, [nombre], [], [resultado({ valor_documento: 'Persona Prueba' })])
+    expect(transacciones.map((t) => t.extras?.['c-nom'])).toEqual(['Juan', 'Persona Prueba', 'Persona Prueba'])
+  })
+
+  it('una columna completa no cambia y lo dice', () => {
+    const actuales = [fila('a', 'h1', { extras: { 'c-nom': 'Juan' } })]
+    const { transacciones, resultado: r } = llenarColumnaManual(actuales, nombre, true, { unico: 'Otro' })
+    expect(transacciones).toBe(actuales)
+    expect(mensajeLlenado(r)).toBe('La columna ya estaba completa; no se cambió nada.')
+  })
+
+  it('"Llenar con IA" asocia por índice a las filas enviadas e ignora las borradas', () => {
+    const fuente = fuenteDeLlenado({ valores: [{ indice: 0, valor: 'Ana' }, { indice: 2, valor: 'Eva' }, { indice: 9, valor: 'x' }] }, ['a', 'b', 'c'])
+    const sinB = [fila('a', 'h1'), fila('c', undefined, { origen: 'manual' })]
+    const { transacciones, resultado: r } = llenarColumnaManual(sinB, nombre, true, fuente)
+    expect(transacciones.map((t) => t.extras?.['c-nom'])).toEqual(['Ana', 'Eva'])
+    expect(r.llenadas).toBe(2)
+  })
+
+  it('editar una celda llenada por la IA le quita la marca y pasa la fila a "IA editada"', () => {
+    const [llena] = rellenarColumnas([fila('a', 'h1')], [nombre], [], [resultado({ valor_documento: 'Ana' })]).transacciones
+    const editada = editarExtra(llena, 'c-nom', 'Ana María')
+    expect(esCeldaDeIa(editada, 'c-nom')).toBe(false)
+    expect(editada.origen).toBe('ia_editada')
+    expect('extras_ia' in editada).toBe(false)
+  })
+
+  it('solo se piden a Gemini las columnas manuales', () => {
+    expect(camposParaSolicitar([nombre, { id: 'x', nombre: 'VSM', origen: 'ia', clave: 'vsm' }])).toEqual(['Nombre'])
   })
 })

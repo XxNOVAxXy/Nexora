@@ -41,7 +41,7 @@ class GeminiRequestError(RuntimeError):
 
 
 # Cambia esta versión cada vez que cambie el prompt o el esquema: invalida los resultados en caché.
-PROMPT_VERSION = "2026-11-12.1"
+PROMPT_VERSION = "2026-11-12.2"
 CACHE_MAX_ITEMS = 16
 # Máximo de los modelos Flash actuales. Los tokens de razonamiento también cuentan contra este límite.
 MAX_OUTPUT_TOKENS_PREDETERMINADO = 65536
@@ -51,6 +51,8 @@ CODIGOS_RESPUESTA_INCOMPLETA = {"invalid_response", "respuesta_truncada", "respu
 MAX_SUGERENCIAS_CAMPOS = 8
 MAX_NOMBRE_CAMPO = 60
 MAX_VALOR_CAMPO = 500
+# Columnas manuales que el usuario pide buscar en el documento (al extraer o con "Llenar con IA").
+MAX_CAMPOS_SOLICITADOS = 30
 # Nombres que ya son columnas estándar del movimiento o datos del resumen: nunca se sugieren como campo adicional.
 NOMBRES_ESTANDAR = {
     "fecha", "fecha de operacion", "fecha operacion", "fecha de movimiento", "concepto", "descripcion", "concepto descripcion",
@@ -110,6 +112,33 @@ class CampoAdicional(BaseModel):
     valor_documento: str = ""
 
 
+class CampoSolicitadoExtraido(BaseModel):
+    """Respuesta de Gemini para una columna manual que se le pidió buscar en el documento."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    nombre: str = ""
+    encontrado: bool = False
+    valor_documento: str = ""
+
+
+class ValorPorIndice(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    indice: int = -1
+    valor: str = ""
+
+
+class CampoLlenado(BaseModel):
+    """Esquema de "Llenar con IA": el valor de una sola columna para las filas actuales, sin re-extraer."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    encontrado: bool = False
+    valor_documento: str = ""
+    valores: list[ValorPorIndice] = Field(default_factory=list)
+
+
 class TransaccionExtraida(BaseModel):
     """Movimiento tal como lo devuelve Gemini: los montos llegan como texto impreso en el documento."""
 
@@ -130,6 +159,7 @@ class StatementExtraction(BaseModel):
     resumen: ResumenExtraido = Field(default_factory=ResumenExtraido)
     transacciones: list[TransaccionExtraida] = Field(default_factory=list)
     campos_adicionales: list[CampoAdicional] = Field(default_factory=list)
+    campos_solicitados: list[CampoSolicitadoExtraido] = Field(default_factory=list)
     notas: list[str] = Field(default_factory=list)
 
 
@@ -163,12 +193,14 @@ class GeminiSettings:
         self._write(values)
         return self.status()
 
-    def extract_document(self, data: bytes, mime_type: str, filename: str, forzar: bool = False) -> dict[str, Any]:
+    def extract_document(self, data: bytes, mime_type: str, filename: str, forzar: bool = False, campos_solicitados: list[str] | tuple[str, ...] = ()) -> dict[str, Any]:
         """Extrae el documento con Gemini.
 
-        El resultado se guarda en caché por (documento, modelo configurado, PROMPT_VERSION). Con ``forzar``
-        se ignora la caché y el resultado nuevo reemplaza la entrada anterior.
+        El resultado se guarda en caché por (documento, modelo configurado, PROMPT_VERSION, columnas pedidas). Con
+        ``forzar`` se ignora la caché y el resultado nuevo reemplaza la entrada anterior. ``campos_solicitados`` son
+        los nombres de las columnas manuales que Gemini debe buscar en el documento.
         """
+        campos = normalizar_campos_solicitados(campos_solicitados)
         values = self._read()
         api_key = values.get("apiKey", "")
         if not api_key or not values.get("enabled", False):
@@ -185,7 +217,7 @@ class GeminiSettings:
         )
 
         model = values.get("model", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
-        document_hash = _cache_key(data, model)
+        document_hash = _cache_key(data, model, campos)
         with self._lock:
             cached = None if forzar else self._cache.get(document_hash)
             if cached is not None:
@@ -211,8 +243,8 @@ class GeminiSettings:
             raise GeminiRequestError("Gemini no produjo un resultado reutilizable.", code="invalid_response")
 
         try:
-            extracted, used_model = self._generate(data, mime_type, filename, api_key, model)
-            result = _build_result(filename, extracted, used_model)
+            extracted, used_model = self._generate(data, mime_type, filename, api_key, model, campos)
+            result = _build_result(filename, extracted, used_model, campos)
             with self._lock:
                 # pop + asignación: la entrada reemplazada pasa a ser la más reciente.
                 self._cache.pop(document_hash, None)
@@ -230,25 +262,35 @@ class GeminiSettings:
                 if current_event is not None:
                     current_event.set()
 
-    def _generate(self, data: bytes, mime_type: str, filename: str, api_key: str, model: str) -> tuple[StatementExtraction, str]:
-        candidates = _model_candidates(model)
-        last_error: GeminiRequestError | None = None
-        for candidate in candidates:
-            for attempt in range(2):
-                try:
-                    text = _call_gemini_sdk(api_key, candidate, data, mime_type, filename)
-                    return _parse_extraction(text), candidate
-                except GeminiRequestError as error:
-                    last_error = error
-                    if error.code in CODIGOS_RESPUESTA_INCOMPLETA:
-                        raise
-                    if not error.retryable:
-                        if _is_model_error(str(error)) and candidate != candidates[-1]:
-                            break
-                        raise
-                    if attempt == 0:
-                        time.sleep(0.5)
-        raise last_error or GeminiRequestError("Gemini no devolvio una respuesta valida.", code="invalid_response")
+    def _generate(self, data: bytes, mime_type: str, filename: str, api_key: str, model: str, campos: list[str] | tuple[str, ...] = ()) -> tuple[StatementExtraction, str]:
+        prompt = _extraction_prompt(filename, list(campos))
+        return _con_reintentos(model, lambda candidato: _parse_extraction(_call_gemini_sdk(api_key, candidato, data, mime_type, filename, prompt)))
+
+    def fill_field(self, data: bytes, mime_type: str, filename: str, nombre: str, filas: list[dict[str, str]]) -> dict[str, Any]:
+        """"Llenar con IA": busca una sola columna para las filas actuales, sin re-extraer los movimientos.
+
+        No usa caché: el resultado depende de las filas que el usuario tiene ahora.
+        """
+        campos = normalizar_campos_solicitados([nombre])
+        if not campos:
+            raise GeminiRequestError("El nombre del campo no es valido.", code="campo_invalido", status_code=400)
+        values = self._read()
+        api_key = values.get("apiKey", "")
+        if not api_key or not values.get("enabled", False):
+            raise GeminiUnavailableError("Gemini no esta conectado o habilitado en FastAPI.")
+        data, mime_type = _validate_document_input(data, mime_type, filename)
+        model = values.get("model", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
+        prompt = _prompt_llenar_campo(filename, campos[0], filas)
+
+        def llamar(candidato: str) -> CampoLlenado:
+            texto = _call_gemini_sdk(api_key, candidato, data, mime_type, filename, prompt, CampoLlenado)
+            try:
+                return CampoLlenado.model_validate_json(_strip_json_fences(texto))
+            except (ValueError, TypeError) as error:
+                raise GeminiRequestError("Gemini no devolvio una respuesta valida para el campo.", code="invalid_response") from error
+
+        respuesta = _con_reintentos(model, llamar)[0]
+        return resultado_llenado(campos[0], respuesta, len(filas))
 
     def _read(self) -> dict[str, Any]:
         if self.path.exists():
@@ -267,7 +309,28 @@ class GeminiSettings:
         self.path.write_text(json.dumps(values, indent=2), encoding="utf-8")
 
 
-def _call_gemini_sdk(api_key: str, model: str, data: bytes, mime_type: str, filename: str) -> str:
+def _con_reintentos(model: str, llamar: Any) -> tuple[Any, str]:
+    """Llama a Gemini con el modelo configurado y sus alternativas; reintenta una vez los errores transitorios."""
+    candidates = _model_candidates(model)
+    last_error: GeminiRequestError | None = None
+    for candidate in candidates:
+        for attempt in range(2):
+            try:
+                return llamar(candidate), candidate
+            except GeminiRequestError as error:
+                last_error = error
+                if error.code in CODIGOS_RESPUESTA_INCOMPLETA:
+                    raise
+                if not error.retryable:
+                    if _is_model_error(str(error)) and candidate != candidates[-1]:
+                        break
+                    raise
+                if attempt == 0:
+                    time.sleep(0.5)
+    raise last_error or GeminiRequestError("Gemini no devolvio una respuesta valida.", code="invalid_response")
+
+
+def _call_gemini_sdk(api_key: str, model: str, data: bytes, mime_type: str, filename: str, prompt: str | None = None, schema: Any = StatementExtraction) -> str:
     try:
         from google import genai
         from google.genai import types
@@ -284,13 +347,13 @@ def _call_gemini_sdk(api_key: str, model: str, data: bytes, mime_type: str, file
             model=model,
             contents=[
                 types.Part.from_bytes(data=data, mime_type=mime_type),
-                _extraction_prompt(filename),
+                prompt if prompt is not None else _extraction_prompt(filename),
             ],
             config=types.GenerateContentConfig(
                 temperature=0,
                 max_output_tokens=max_output_tokens(),
                 response_mime_type="application/json",
-                response_schema=StatementExtraction,
+                response_schema=schema,
             ),
         )
         _registrar_uso(model, response)
@@ -373,7 +436,7 @@ def _validate_document_input(data: bytes, mime_type: str, filename: str) -> tupl
     return data, mime_type
 
 
-def _extraction_prompt(filename: str) -> str:
+def _extraction_prompt(filename: str, campos: list[str] | None = None) -> str:
     return f"""Analiza el estado de cuenta bancario adjunto llamado {filename!r}.
 
 Devuelve unicamente un objeto JSON que cumpla el esquema recibido. Extrae el resumen del estado de cuenta y TODOS los movimientos visibles. No inventes datos, no completes texto con conocimiento externo y no conviertas un valor ilegible en cero. Usa cadenas vacias para valores no visibles o no aplicables.
@@ -384,7 +447,28 @@ Movimientos: para cada uno conserva `fecha`, `concepto`, `referencia`, `cargo`, 
 
 Campos adicionales: si los movimientos muestran columnas distintas de las seis anteriores (por ejemplo `VSM`, `Sucursal`, `Folio`), agrega en `adicionales` de cada movimiento un elemento por columna con `campo` (el encabezado tal como esta impreso) y `valor` (el texto impreso en esa fila). Si el documento muestra una sola vez un dato que no esta en el resumen (por ejemplo `Numero de credito`), agregalo en `campos_adicionales` con `nombre` y `valor_documento` tal como estan impresos. Solo incluye campos y valores que aparecen literalmente en el documento: nunca inventes nombres ni valores, no repitas los campos del resumen ni de los movimientos, y deja las listas vacias si no hay campos adicionales.
 
-El documento puede tener varias paginas. Cuenta cada movimiento una sola vez. Si una fila no es legible, conserva la fila y deja vacios solo los campos ilegibles. Incluye en `notas` cualquier advertencia de lectura, pagina o discrepancia evidente."""
+El documento puede tener varias paginas. Cuenta cada movimiento una sola vez. Si una fila no es legible, conserva la fila y deja vacios solo los campos ilegibles. Incluye en `notas` cualquier advertencia de lectura, pagina o discrepancia evidente.{_instrucciones_campos_solicitados(campos or [])}"""
+
+
+def _instrucciones_campos_solicitados(campos: list[str]) -> str:
+    if not campos:
+        return ""
+    lista = "\n".join(f"- {json.dumps(nombre, ensure_ascii=False)}" for nombre in campos)
+    return f"""
+
+Columnas pedidas por el usuario: busca en el documento cada uno de estos datos.
+{lista}
+Para cada una agrega un elemento en `campos_solicitados` con `nombre` (exactamente como aparece en la lista) y `encontrado`. Si el dato aparece por movimiento, pon su valor en `adicionales` de cada movimiento con `campo` igual al nombre de la lista. Si es un dato unico del documento (por ejemplo el nombre del titular), ponlo en `valor_documento`. Si el dato no aparece en el documento, usa `encontrado` = false y deja los valores vacios. Copia los valores tal como estan impresos: nunca inventes, deduzcas ni calcules un valor."""
+
+
+def _prompt_llenar_campo(filename: str, nombre: str, filas: list[dict[str, str]]) -> str:
+    movimientos = "\n".join(json.dumps({"indice": indice, **fila}, ensure_ascii=False) for indice, fila in enumerate(filas))
+    return f"""Analiza el estado de cuenta bancario adjunto llamado {filename!r} y busca el dato {json.dumps(nombre, ensure_ascii=False)}.
+
+Devuelve unicamente un objeto JSON que cumpla el esquema recibido. Estos son los movimientos ya capturados, uno por linea, con su `indice`:
+{movimientos or "(sin movimientos)"}
+
+Si el dato aparece por movimiento, agrega en `valores` un elemento por cada movimiento donde aparece, con su `indice` y el `valor` tal como esta impreso. Si es un dato unico del documento (por ejemplo el nombre del titular), ponlo en `valor_documento` y deja `valores` vacio. Usa `encontrado` = true solo si el dato aparece literalmente en el documento; si no aparece, usa `encontrado` = false y deja todo vacio. Nunca inventes, deduzcas ni calcules un valor."""
 
 
 def _parse_extraction(value: str) -> StatementExtraction:
@@ -394,9 +478,11 @@ def _parse_extraction(value: str) -> StatementExtraction:
         raise GeminiRequestError("Gemini no devolvio una extraccion bancaria estructurada valida.", code="invalid_response") from error
 
 
-def _cache_key(data: bytes, model: str) -> str:
+def _cache_key(data: bytes, model: str, campos: list[str] | tuple[str, ...] = ()) -> str:
     digest = hashlib.sha256(data).hexdigest()
-    return f"{digest}:{model.strip()}:{PROMPT_VERSION}"
+    # Las columnas pedidas cambian el prompt: otra combinación de columnas no reutiliza el resultado.
+    pedidas = ",".join(sorted(clave_campo(nombre) for nombre in campos))
+    return f"{digest}:{model.strip()}:{PROMPT_VERSION}:{pedidas}"
 
 
 def _huella(fecha: str, concepto: str, referencia: str, cargo: str, abono: str) -> str:
@@ -405,7 +491,7 @@ def _huella(fecha: str, concepto: str, referencia: str, cargo: str, abono: str) 
     return hashlib.sha256("|".join(partes).encode("utf-8")).hexdigest()[:16]
 
 
-def _build_result(filename: str, extraction: StatementExtraction, model: str) -> dict[str, Any]:
+def _build_result(filename: str, extraction: StatementExtraction, model: str, campos_solicitados: list[str] | tuple[str, ...] = ()) -> dict[str, Any]:
     # El formato numérico se decide con todos los importes del documento para resolver casos como "1,234".
     textos = [getattr(extraction.resumen, campo) for campo in CAMPOS_MONTO_RESUMEN]
     textos += [getattr(item, campo) for item in extraction.transacciones for campo in CAMPOS_MONTO_TRANSACCION]
@@ -476,7 +562,8 @@ def _build_result(filename: str, extraction: StatementExtraction, model: str) ->
         "resumen": resumen,
         "transacciones": transacciones,
         "validacion": validacion,
-        "sugerencias_campos": _sugerencias_campos(adicionales_por_fila, extraction.campos_adicionales),
+        "sugerencias_campos": _sugerencias_campos(adicionales_por_fila, extraction.campos_adicionales, excluir={clave_campo(nombre) for nombre in campos_solicitados}),
+        "resultados_campos": _resultados_campos(list(campos_solicitados), adicionales_por_fila, extraction.campos_solicitados),
         "warnings": _unique_text(warnings),
     }
 
@@ -491,7 +578,63 @@ def clave_campo(nombre: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", sin_acentos.casefold()).strip("-")[:64]
 
 
-def _sugerencias_campos(filas: list[tuple[str, list[ValorAdicional]]], documento: list[CampoAdicional]) -> list[dict[str, Any]]:
+def normalizar_campos_solicitados(nombres: list[str] | tuple[str, ...]) -> list[str]:
+    """Nombres de columnas pedidas, limpios y sin repetir (por clave), como máximo MAX_CAMPOS_SOLICITADOS."""
+    resultado: dict[str, str] = {}
+    for nombre in nombres:
+        limpio = _limpiar_texto(nombre if isinstance(nombre, str) else "", MAX_NOMBRE_CAMPO)
+        clave = clave_campo(limpio)
+        if clave and clave not in resultado:
+            resultado[clave] = limpio
+    return list(resultado.values())[:MAX_CAMPOS_SOLICITADOS]
+
+
+def _resultados_campos(campos: list[str], filas: list[tuple[str, list[ValorAdicional]]], respuestas: list[CampoSolicitadoExtraido]) -> list[dict[str, Any]]:
+    """Resultado de cada columna pedida: valores por fila (por huella), un valor único del documento, o no encontrado.
+
+    Si Gemini responde ``encontrado`` = false se descarta cualquier valor; un "encontrado" sin ningún valor cuenta
+    como no encontrado. Así nunca se llena una celda con algo que la IA no vio en el documento.
+    """
+    por_clave = {clave_campo(respuesta.nombre): respuesta for respuesta in respuestas}
+    resultados: list[dict[str, Any]] = []
+    for nombre in campos:
+        clave = clave_campo(nombre)
+        respuesta = por_clave.get(clave)
+        valores: list[dict[str, str]] = []
+        for huella, adicionales in filas:
+            for adicional in adicionales:
+                valor = _limpiar_texto(adicional.valor, MAX_VALOR_CAMPO)
+                if clave_campo(adicional.campo) == clave and valor:
+                    valores.append({"huella": huella, "valor": valor})
+                    break
+        unico = "" if valores or respuesta is None else _limpiar_texto(respuesta.valor_documento, MAX_VALOR_CAMPO)
+        if respuesta is not None and not respuesta.encontrado:
+            valores, unico = [], ""
+        resultado: dict[str, Any] = {"nombre": nombre, "clave": clave, "encontrado": bool(valores or unico), "valores": valores}
+        if unico:
+            resultado["valor_documento"] = unico
+        resultados.append(resultado)
+    return resultados
+
+
+def resultado_llenado(nombre: str, respuesta: CampoLlenado, total_filas: int) -> dict[str, Any]:
+    """Respuesta de "Llenar con IA" validada: índices dentro de las filas enviadas, sin repetidos ni vacíos."""
+    valores: list[dict[str, Any]] = []
+    vistos: set[int] = set()
+    if respuesta.encontrado:
+        for item in respuesta.valores:
+            valor = _limpiar_texto(item.valor, MAX_VALOR_CAMPO)
+            if 0 <= item.indice < total_filas and item.indice not in vistos and valor:
+                vistos.add(item.indice)
+                valores.append({"indice": item.indice, "valor": valor})
+    unico = "" if valores or not respuesta.encontrado else _limpiar_texto(respuesta.valor_documento, MAX_VALOR_CAMPO)
+    resultado: dict[str, Any] = {"nombre": nombre, "clave": clave_campo(nombre), "encontrado": bool(valores or unico), "valores": valores}
+    if unico:
+        resultado["valor_documento"] = unico
+    return resultado
+
+
+def _sugerencias_campos(filas: list[tuple[str, list[ValorAdicional]]], documento: list[CampoAdicional], excluir: set[str] | None = None) -> list[dict[str, Any]]:
     """Campos adicionales que la IA encontró en el documento, sin inventar ninguno.
 
     Se descartan los que no tienen ningún valor, los que repiten un campo estándar y los duplicados. Los valores por
@@ -506,7 +649,7 @@ def _sugerencias_campos(filas: list[tuple[str, list[ValorAdicional]]], documento
             nombre = _limpiar_texto(adicional.campo, MAX_NOMBRE_CAMPO)
             valor = _limpiar_texto(adicional.valor, MAX_VALOR_CAMPO)
             clave = clave_campo(nombre)
-            if not clave or not valor or clave in vistos or clave.replace("-", " ") in NOMBRES_ESTANDAR:
+            if not clave or not valor or clave in vistos or clave in (excluir or ()) or clave.replace("-", " ") in NOMBRES_ESTANDAR:
                 continue
             vistos.add(clave)
             sugerencia = por_clave.setdefault(clave, {"clave": clave, "nombre": nombre, "valores": []})
@@ -517,7 +660,7 @@ def _sugerencias_campos(filas: list[tuple[str, list[ValorAdicional]]], documento
         nombre = _limpiar_texto(campo.nombre, MAX_NOMBRE_CAMPO)
         valor = _limpiar_texto(campo.valor_documento, MAX_VALOR_CAMPO)
         clave = clave_campo(nombre)
-        if not clave or not valor or clave in por_clave or clave.replace("-", " ") in NOMBRES_ESTANDAR:
+        if not clave or not valor or clave in por_clave or clave in (excluir or ()) or clave.replace("-", " ") in NOMBRES_ESTANDAR:
             continue
         por_clave[clave] = {"clave": clave, "nombre": nombre, "valores": [], "valor_documento": valor}
         unicos.append(por_clave[clave])

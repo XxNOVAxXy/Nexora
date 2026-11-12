@@ -61,7 +61,7 @@ class CacheExtraccionTests(unittest.TestCase):
         self.addCleanup(read.stop)
         self.llamadas = 0
 
-        def generar(data: bytes, mime: str, filename: str, api_key: str, model: str):
+        def generar(data: bytes, mime: str, filename: str, api_key: str, model: str, campos=()):
             self.llamadas += 1
             return _extraccion(f"{100 * self.llamadas}.00"), model
 

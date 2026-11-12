@@ -91,7 +91,7 @@ export function combinarExtraccion(actual: Transaccion[], nuevas: Transaccion[],
         noAparecen += 1
       }
     } else if (indice !== undefined) {
-      if (transaccion.extras) base[indice] = { ...base[indice], extras: transaccion.extras }
+      if (transaccion.extras) base[indice] = { ...base[indice], extras: transaccion.extras, ...(transaccion.extras_ia ? { extras_ia: transaccion.extras_ia } : {}) }
       ancla = indice
     }
   }

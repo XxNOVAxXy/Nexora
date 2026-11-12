@@ -108,6 +108,8 @@ class TransaccionGuardada(BaseModel):
     revision: Literal["no_aparece_en_extraccion", "fila_de_saldo_con_importe"] | None = None
     # Valores de las columnas adicionales: {id de la columna: valor}.
     extras: dict[str, str] | None = None
+    # Ids de las columnas cuyas celdas en esta fila llenó la IA (se distinguen de lo escrito a mano).
+    extras_ia: list[str] | None = Field(default=None, max_length=MAX_CAMPOS_EXTRA)
 
     @field_validator("dudosos")
     @classmethod
@@ -189,6 +191,9 @@ class GuardarExtraccionRequest(BaseModel):
             if transaccion.extras:
                 limpios = {clave: texto for clave, texto in transaccion.extras.items() if clave in ids and texto.strip()}
                 transaccion.extras = limpios or None
+            # Solo se marca como de la IA una celda que existe y tiene valor.
+            marcadas = [campo for campo in dict.fromkeys(transaccion.extras_ia or []) if transaccion.extras and campo in transaccion.extras]
+            transaccion.extras_ia = marcadas or None
         return self
 
 

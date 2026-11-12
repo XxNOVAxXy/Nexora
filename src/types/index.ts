@@ -29,6 +29,8 @@ export type Transaccion = {
   revision?: RevisionTransaccion
   /** Valores de las columnas adicionales ({id del campo: valor}); no entran en la validación contable ni en SaveData. */
   extras?: Record<string, string>
+  /** Ids de las columnas cuyas celdas en esta fila llenó la IA (se distinguen de lo escrito a mano). */
+  extras_ia?: string[]
 }
 
 /** Columna adicional de la tabla de Movimientos (botón "+ Campo"). */
@@ -48,6 +50,15 @@ export type SugerenciaCampo = {
   /** Valores por fila, asociados a la huella del movimiento (en orden, por si dos filas comparten huella). */
   valores: { huella: string; valor: string }[]
   /** Valor único del documento: al elegirlo se repite en cada fila. */
+  valor_documento?: string
+}
+
+/** Lo que encontró la IA al buscar una columna manual en el documento. Si no está, `encontrado` es false. */
+export type ResultadoCampo = {
+  nombre: string
+  clave: string
+  encontrado: boolean
+  valores: { huella: string; valor: string }[]
   valor_documento?: string
 }
 

@@ -1,5 +1,5 @@
 import type { CampoExtra, Resumen, SugerenciaCampo, Transaccion } from '../types'
-import { rellenarColumnasIa } from './camposExtra'
+import { rellenarColumnas, type ResultadoLlenado } from './camposExtra'
 import type { FormatoNumerico, ValidacionContable } from './contabilidad'
 import { ErrorApi, type EstadoExtraccion, type ExtraccionGuardada, type ProblemasRevision } from './extraccionesApi'
 import type { GeminiExtractionResponse } from './geminiApi'
@@ -34,13 +34,15 @@ export const conColumnasExtra = (documento: Omit<DocumentoEditable, 'campos_extr
  * borrador local de una pestaña que nunca se abrió. Las columnas adicionales vigentes se conservan; las celdas
  * vacías de las columnas de la IA se rellenan y las sugerencias se reemplazan por las de esta extracción.
  */
-export function documentoDesdeExtraccion(result: GeminiExtractionResponse, actuales: Transaccion[], lote: string, campos: CampoExtra[] = []): { documento: DocumentoEditable; combinacion: ResultadoCombinacion } {
+export function documentoDesdeExtraccion(result: GeminiExtractionResponse, actuales: Transaccion[], lote: string, campos: CampoExtra[] = []): { documento: DocumentoEditable; combinacion: ResultadoCombinacion; llenado: ResultadoLlenado[] } {
   const combinacion = combinarExtraccion(actuales, result.transacciones, lote)
   const sugerencias = Array.isArray(result.sugerencias_campos) ? result.sugerencias_campos : []
-  const transacciones = rellenarColumnasIa(combinacion.transacciones, campos, sugerencias)
+  const resultados = Array.isArray(result.resultados_campos) ? result.resultados_campos : []
+  const { transacciones, llenado } = rellenarColumnas(combinacion.transacciones, campos, sugerencias, resultados)
   return {
     documento: { estado: 'borrador', resumen: result.resumen, transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version, campos_extra: campos, sugerencias_campos: sugerencias },
     combinacion: { ...combinacion, transacciones },
+    llenado,
   }
 }
 
