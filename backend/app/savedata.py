@@ -24,7 +24,8 @@ from typing import Any, Callable, Literal, Sequence
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .contabilidad import formatear_decimal, validar_contabilidad
-from .extracciones import AlmacenExtracciones, ConflictoVersion, escribir_atomico
+from .extracciones import AlmacenExtracciones, ConflictoVersion, escribir_atomico, migrar_columnas_unicas
+from .plantilla_campos import aplicar_plantilla
 
 logger = logging.getLogger("nexora.savedata")
 
@@ -202,29 +203,50 @@ CAMPOS_RESUMEN = ("banco", "titular", "cuenta", "periodo", "moneda", "saldo_inic
 CAMPOS_TRANSACCION = ("fecha", "concepto", "referencia", "cargo", "abono", "saldo")
 
 
-def datos_documento(documento: dict[str, Any], totales: TotalesEnvio) -> dict[str, Any]:
-    """Nuestra extracción revisada, limpia: solo datos del estado de cuenta.
+def _texto_o_nulo(valor: Any) -> str | None:
+    texto = str(valor or "").strip()
+    return texto or None
 
-    Sin campos internos de Nexora (id, huella, origen, dudosos, *_original) y sin filas vacías.
+
+def datos_documento(documento: dict[str, Any], totales: TotalesEnvio, configurados: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+    """ÚNICA función que arma el JSON interno de SaveData (formato provisional hasta que se confirme).
+
+    - "Resumen" y "Transacciones" como siempre: solo datos del estado de cuenta, sin campos internos de Nexora
+      (id, huella, origen, dudosos, *_original) y sin filas vacías.
+    - "Datos": los campos "Una vez" (datos del documento), una sola vez: {"Nombre del campo": valor}.
+    - Campos "En cada movimiento": dentro de cada movimiento, con su nombre, después de los campos fijos.
+    - Un campo vacío o no encontrado va como null. Los campos de la configuración (``configurados``) que el
+      documento no tiene también van, como null.
     """
+    # Lo mismo que ve el usuario al abrir el documento: columnas únicas migradas y campos vinculados a la
+    # configuración (con su nombre actual); los configurados que faltan se agregan vacíos y salen como null.
+    documento = aplicar_plantilla(migrar_columnas_unicas(documento), list(configurados))
     resumen = documento.get("resumen") or {}
-    transacciones = [
-        {campo: str(fila.get(campo) or "") for campo in CAMPOS_TRANSACCION}
-        for fila in documento.get("transacciones") or []
-    ]
+    campos = list(documento.get("campos_extra") or [])
+    del_documento = [campo for campo in campos if campo.get("alcance") == "documento"]
+    por_movimiento = [campo for campo in campos if campo.get("alcance") != "documento"]
+
+    transacciones = []
+    for fila in documento.get("transacciones") or []:
+        fijos = {campo: str(fila.get(campo) or "") for campo in CAMPOS_TRANSACCION}
+        if not any(valor.strip() for valor in fijos.values()):
+            continue
+        extras = fila.get("extras") or {}
+        transacciones.append({**fijos, **{str(campo["nombre"]): _texto_o_nulo(extras.get(campo["id"])) for campo in por_movimiento}})
     validacion = documento.get("validacion") or {}
     return {
         "Archivo": documento.get("filename"),
         "Resumen": {campo: resumen.get(campo, "") for campo in CAMPOS_RESUMEN},
-        "Transacciones": [fila for fila in transacciones if any(valor.strip() for valor in fila.values())],
+        "Datos": {str(campo["nombre"]): _texto_o_nulo(campo.get("valor")) for campo in del_documento},
+        "Transacciones": transacciones,
         "Validacion": {"cuadra": validacion.get("cuadra"), "suma_cargos": formatear_decimal(totales.cargos), "suma_abonos": formatear_decimal(totales.abonos)},
     }
 
 
-def preparar_envio(documento: dict[str, Any], *, sucursal: int, articulo: str, carga_inicial: bool) -> dict[str, Any]:
+def preparar_envio(documento: dict[str, Any], *, sucursal: int, articulo: str, carga_inicial: bool, configurados: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
     # Se envía solo nuestra extracción. construir_saldos() (formato H/S de SaveData) queda disponible pero no se usa.
     totales = totales_de(documento)
-    interno = datos_documento(documento, totales)
+    interno = datos_documento(documento, totales, configurados)
     return {"interno": interno, "cuerpo": serializar_cuerpo(interno), "totales": {"abonos": formatear_decimal(totales.abonos), "cargos": formatear_decimal(totales.cargos)}}
 
 
@@ -238,8 +260,10 @@ def motivos_para_no_enviar(documento: dict[str, Any], sin_url: bool) -> list[str
 
 
 class ServicioEnvio:
-    def __init__(self, almacen: AlmacenExtracciones, url: Callable[[], str], timeout: float = SAVEDATA_TIMEOUT_SECONDS, cliente: Callable[[str, str, float], RespuestaSaveData] = enviar_a_savedata) -> None:
+    def __init__(self, almacen: AlmacenExtracciones, url: Callable[[], str], timeout: float = SAVEDATA_TIMEOUT_SECONDS, cliente: Callable[[str, str, float], RespuestaSaveData] = enviar_a_savedata, configurados: Callable[[str], list[dict[str, Any]]] = lambda _email: []) -> None:
         self.almacen = almacen
+        # Configuración de campos de la cuenta: los campos configurados que falten en el documento van como null.
+        self.configurados = configurados
         self.url = url
         self.timeout = timeout
         self.cliente = cliente
@@ -248,7 +272,7 @@ class ServicioEnvio:
         documento = self.almacen.leer_completo(email, message_id, part_id)
         if documento is None:
             raise NoSePuedeEnviar("sin_extraccion", "Guarda la extraccion antes de prepararla para SaveData.", 404)
-        preparado = preparar_envio(documento, sucursal=sucursal, articulo=articulo, carga_inicial=carga_inicial)
+        preparado = preparar_envio(documento, sucursal=sucursal, articulo=articulo, carga_inicial=carga_inicial, configurados=self.configurados(email))
         motivos = motivos_para_no_enviar(documento, not self.url())
         previo = _requiere_confirmar_reenvio(documento)
         return {
@@ -285,7 +309,7 @@ class ServicioEnvio:
                 previo = _requiere_confirmar_reenvio(documento)
                 if previo is not None and not solicitud.confirmar_reenvio:
                     raise NoSePuedeEnviar("requiere_confirmar_reenvio", "Este documento ya se envio (o su resultado es incierto). Confirma explicitamente para reenviarlo.", 409, {"envio_previo": previo})
-                preparado.update(preparar_envio(documento, sucursal=solicitud.sucursal, articulo=solicitud.articulo, carga_inicial=solicitud.carga_inicial))
+                preparado.update(preparar_envio(documento, sucursal=solicitud.sucursal, articulo=solicitud.articulo, carga_inicial=solicitud.carga_inicial, configurados=self.configurados(email)))
                 intento = {
                     "id": intento_id,
                     "iniciado_en": _ahora(),

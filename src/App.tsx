@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type SetStateAction } from 'react'
 import { Link, NavLink, Route, Routes, useBlocker, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import type { AlcanceCampo, CampoExtra, CampoMonto, CampoMontoResumen, Resumen, SugerenciaCampo, Transaccion } from './types'
-import { agregarCampoManual, aplicarSugerencia, cambiarAlcance, camposParaSolicitar, editarExtra, editarValorDocumento, eliminarCampo, errorNombreCampo, esCeldaDeIa, esDelDocumento, filasConValor, fuenteDeLlenado, llenarColumnaManual, MAX_CAMPOS_EXTRA, mensajeLlenado, puedeSerDelDocumento, renombrarCampo, sugerenciasDisponibles, type ColumnasDocumento, type ResultadoLlenado } from './services/camposExtra'
+import { agregarCampoManual, aplicarSugerencia, cambiarAlcance, camposParaSolicitar, editarExtra, editarValorDocumento, eliminarCampo, errorNombreCampo, esBuscable, esCeldaDeIa, esDelDocumento, filasConValor, fuenteDeLlenado, llenarColumnaManual, MAX_CAMPOS_EXTRA, mensajeLlenado, nombreComparable, puedeSerDelDocumento, renombrarCampo, sugerenciasDisponibles, type ColumnasDocumento, type ResultadoLlenado } from './services/camposExtra'
 import { contarCorrecciones, editarCampo, etiquetaOrigen, moverTransaccion, nuevaTransaccion, type CampoEditable } from './services/transacciones'
 import { validarContabilidad, type ValidacionContable } from './services/contabilidad'
 import { crearControladorExtraccion, ejecutarExtraccion } from './services/extraccion'
@@ -10,6 +10,8 @@ import { geminiApi, type GeminiExtractionResponse, type GeminiStatus } from './s
 import { ejecutarEnvio, savedataApi, type ConfigSaveData, type VistaPreviaEnvio } from './services/savedataApi'
 import { claveEstado, inboxStore, type EstadosExtraccion, type Listado, type MailFolder } from './services/inboxStore'
 import { automaticoApi, type EstadoAutomatico } from './services/automaticoApi'
+import { plantillaCamposApi, plantillaVigente } from './services/plantillaCamposApi'
+import { agregarAPlantilla, aplicarPlantilla, CAMPOS_FIJOS, cambiarTipoEnPlantilla, errorNombrePlantilla, etiquetaAlcance, nuevoIdPlantilla, quitarDePlantilla, renombrarEnPlantilla, sugerenciasNuevas, type CampoPlantilla, type SugerenciaPlantilla } from './services/plantillaCampos'
 import { estadoDocumento, textoCamposAutomaticos, textoIndicador, type EstadoDocumento } from './services/estadoAutomatico'
 import { extraccionesApi, type EstadoExtraccion, type ExtraccionGuardada, type IntentoEnvio, type ProblemasRevision } from './services/extraccionesApi'
 import { crearColaExtraccion, type ColaExtraccion } from './services/colaExtraccion'
@@ -428,7 +430,9 @@ export function ExtractionTabsWorkspace({ archivos, lote, mode, onModeChange }: 
       extraer: async (archivo, signal) => {
         const status = await geminiApi.status()
         if (!status.enabled) throw new Error('Gemini no está conectado o habilitado en FastAPI.')
-        return geminiApi.extract(archivo.messageId, archivo.attachmentId, { signal })
+        // Se piden los campos de la configuración (Configuración → Campos que se capturan).
+        const plantilla = await plantillaVigente.cargar()
+        return geminiApi.extract(archivo.messageId, archivo.attachmentId, { signal, campos: camposParaSolicitar(aplicarPlantilla([], plantilla)) })
       },
       alCambiar: (clave, evento) => {
         if (evento.estado !== 'terminado') {
@@ -486,7 +490,7 @@ export function ExtractionTabsWorkspace({ archivos, lote, mode, onModeChange }: 
       const resultado = resultados[archivo.clave]
       if (!resultado || !archivo.partId || !sinAbrirConResultado(archivo.clave)) continue
       // Sin nada guardado en el backend (la cola no extrae lo guardado): el borrador parte de un documento vacío.
-      const { documento } = documentoDesdeExtraccion(resultado.datos, [], nuevoLoteExtraccion())
+      const { documento } = documentoDesdeExtraccion(resultado.datos, [], nuevoLoteExtraccion(), aplicarPlantilla([], plantillaVigente.actual()))
       borradores.guardar(claveBorrador(cuenta, archivo.messageId, archivo.partId), { version_base: null, guardadoEn: new Date().toISOString(), documento })
     }
   }
@@ -775,8 +779,55 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
     return { ...base, documento: { ...base.documento, estado: 'borrador', transacciones, campos_extra } }
   })
   const cambiarExtra = (id: string, campoId: string, valor: string) => setTransactions((items) => items.map((item) => item.id === id ? editarExtra(item, campoId, valor) : item))
-  const elegirSugerencia = (sugerencia: SugerenciaCampo) => setColumnas((columnas) => aplicarSugerencia(columnas, sugerencia))
-  const agregarCampo = (nombre: string, alcance: AlcanceCampo) => setColumnas((columnas) => ({ ...columnas, campos_extra: agregarCampoManual(columnas.campos_extra, nombre, alcance) }))
+  /**
+   * "Agregar también a la configuración": el campo nuevo del documento queda vinculado (plantilla_id) a un campo nuevo
+   * de la configuración. Si ya hay un campo configurado con ese nombre, se vincula a él; si no se puede guardar, el
+   * campo queda solo en el documento y se avisa junto a él.
+   */
+  const vincularConfiguracion = (plantillaId: string, configurado: Omit<CampoPlantilla, 'id'>) => {
+    const clave = documentKey
+    const fijarVinculo = (nuevoId: string | null, aviso?: AvisoCampo) => setLista((prev) => {
+      if (prev.documentKey !== clave) return prev
+      const campo = prev.documento.campos_extra.find((item) => item.plantilla_id === plantillaId)
+      if (!campo) return prev
+      const { plantilla_id: _vinculo, ...resto } = campo
+      const actualizado: CampoExtra = nuevoId ? { ...resto, plantilla_id: nuevoId } : resto
+      return {
+        ...prev,
+        documento: { ...prev.documento, campos_extra: prev.documento.campos_extra.map((item) => (item === campo ? actualizado : item)) },
+        avisosCampos: aviso ? { ...prev.avisosCampos, [campo.id]: aviso } : prev.avisosCampos,
+      }
+    })
+    void (async () => {
+      try {
+        const actual = await plantillaCamposApi.obtener()
+        const existente = actual.campos.find((campo) => nombreComparable(campo.nombre) === nombreComparable(configurado.nombre))
+        if (existente) { fijarVinculo(existente.id); return }
+        const guardada = await plantillaCamposApi.guardar(agregarAPlantilla(actual.campos, { ...configurado, id: plantillaId }))
+        plantillaVigente.fijar(guardada.campos)
+      } catch (error) {
+        fijarVinculo(null, { tipo: 'error', texto: `No se pudo agregar «${configurado.nombre}» a la configuración: ${error instanceof Error ? error.message : 'error desconocido'}` })
+      }
+    })()
+  }
+  /** Agrega el campo al documento y, si se pidió, lo vincula a la configuración con un id nuevo. */
+  const agregarYVincular = (actualizar: (columnas: ColumnasDocumento) => ColumnasDocumento, configurado: Omit<CampoPlantilla, 'id'> | null) => {
+    if (!configurado) { setColumnas(actualizar); return }
+    const plantillaId = nuevoIdPlantilla()
+    setColumnas((columnas) => {
+      const resultado = actualizar(columnas)
+      return { ...resultado, campos_extra: resultado.campos_extra.map((campo) => (columnas.campos_extra.some((previo) => previo.id === campo.id) ? campo : { ...campo, plantilla_id: plantillaId })) }
+    })
+    vincularConfiguracion(plantillaId, configurado)
+  }
+  const elegirSugerencia = (sugerencia: SugerenciaCampo, tambienConfiguracion = false) => agregarYVincular(
+    (columnas) => aplicarSugerencia(columnas, sugerencia),
+    tambienConfiguracion ? { nombre: sugerencia.nombre, origen: 'ia', alcance: sugerencia.valores.length > 0 ? 'movimiento' : 'documento', clave: sugerencia.clave } : null,
+  )
+  const agregarCampo = (nombre: string, alcance: AlcanceCampo, tambienConfiguracion = false) => agregarYVincular(
+    (columnas) => ({ ...columnas, campos_extra: agregarCampoManual(columnas.campos_extra, nombre, alcance) }),
+    tambienConfiguracion ? { nombre: nombre.replace(/\s+/g, ' ').trim(), origen: 'manual', alcance } : null,
+  )
   const cambiarValorDocumento = (id: string, valor: string) => setColumnas((columnas) => ({ ...columnas, campos_extra: editarValorDocumento(columnas.campos_extra, id, valor) }))
   /** El usuario corrige el tipo que eligió la IA (una vez para todos ↔ en cada movimiento). */
   const cambiarTipoCampo = (id: string, alcance: AlcanceCampo) => setColumnas((columnas) => cambiarAlcance(columnas, id, alcance))
@@ -974,7 +1025,9 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
     // Updater puro. El resultado queda como borrador con cambios sin guardar hasta que el usuario pulse Guardar.
     setLista((prev) => {
       const base = prev.documentKey === clave ? prev : listaVacia(clave)
-      const { documento: combinado, combinacion, llenado } = documentoDesdeExtraccion(result, base.documento.transacciones, lote, base.documento.campos_extra)
+      // Los campos de la configuración que el documento no tiene se agregan vacíos (nunca se borra nada).
+      const campos = aplicarPlantilla(base.documento.campos_extra, plantillaVigente.actual())
+      const { documento: combinado, combinacion, llenado } = documentoDesdeExtraccion(result, base.documento.transacciones, lote, campos)
       const mostrarAviso = forzar || combinacion.conservadas > 0 || llenado.length > 0
       return {
         documentKey: clave,
@@ -1016,7 +1069,8 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
     await ejecutarExtraccion(controlador, documentKey, async (signal) => {
       const status = geminiStatus ?? await geminiApi.status()
       if (!status.enabled) throw new Error('Gemini no está conectado o habilitado en FastAPI.')
-      return geminiApi.extract(messageId, attachmentId, { forzar, signal, campos: camposParaSolicitar(documento.campos_extra) })
+      const plantilla = await plantillaVigente.cargar()
+      return geminiApi.extract(messageId, attachmentId, { forzar, signal, campos: camposParaSolicitar(aplicarPlantilla(documento.campos_extra, plantilla)) })
     }, {
       exito: (result) => {
         aplicarResultadoGemini(result, forzar)
@@ -1390,7 +1444,7 @@ function EncabezadoCampo({ campo, campos, onRenombrar, onEliminar, onLlenar, lle
   return <div>
   <div className="flex items-center gap-1">
     <span className="min-w-0 flex-1 truncate" title={campo.origen === 'ia' ? `${campo.nombre} · sugerido por la IA` : campo.nombre}>{campo.origen === 'ia' && <Sparkles size={10} className="mr-1 inline text-violet-500" aria-hidden />}{campo.nombre}</span>
-    {campo.origen === 'manual' && <button type="button" onClick={onLlenar} disabled={llenando || motivoNoLlenar !== null} aria-label={`Llenar con IA el campo ${campo.nombre}`} title={motivoNoLlenar ?? (llenando ? 'Buscando en el documento…' : esDelDocumento(campo) ? 'Llenar con IA: busca este dato en el documento y llena su único valor' : 'Llenar con IA: busca este dato en el documento y llena solo las celdas vacías')} className="rounded p-0.5 text-violet-500 hover:bg-violet-100 hover:text-violet-700 disabled:cursor-not-allowed disabled:opacity-40">{llenando ? <RefreshCw size={11} className="animate-spin" /> : <Sparkles size={11} />}</button>}
+    {esBuscable(campo) && <button type="button" onClick={onLlenar} disabled={llenando || motivoNoLlenar !== null} aria-label={`Llenar con IA el campo ${campo.nombre}`} title={motivoNoLlenar ?? (llenando ? 'Buscando en el documento…' : esDelDocumento(campo) ? 'Llenar con IA: busca este dato en el documento y llena su único valor' : 'Llenar con IA: busca este dato en el documento y llena solo las celdas vacías')} className="rounded p-0.5 text-violet-500 hover:bg-violet-100 hover:text-violet-700 disabled:cursor-not-allowed disabled:opacity-40">{llenando ? <RefreshCw size={11} className="animate-spin" /> : <Sparkles size={11} />}</button>}
     {esDelDocumento(campo)
       ? <button type="button" onClick={() => onCambiarAlcance('movimiento')} aria-label={`Cambiar ${campo.nombre} a un valor en cada movimiento`} title="Es un dato del documento (una vez para todos). Cambiar a un valor en cada movimiento: el valor se copia a cada movimiento." className="rounded p-0.5 text-slate-400 hover:bg-slate-200 hover:text-ink"><ArrowRightLeft size={11} /></button>
       : <button type="button" onClick={() => onCambiarAlcance('documento')} disabled={!puedeSerDelDocumento} aria-label={`Cambiar ${campo.nombre} a dato del documento`} title={puedeSerDelDocumento ? 'Es un valor por movimiento. Cambiar a dato del documento (una vez para todos).' : 'Los movimientos tienen valores distintos: no puede ser un dato único del documento sin perder datos.'} className="rounded p-0.5 text-slate-400 hover:bg-slate-200 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"><ArrowRightLeft size={11} /></button>}
@@ -1402,8 +1456,9 @@ function EncabezadoCampo({ campo, campos, onRenombrar, onEliminar, onLlenar, lle
 }
 
 /** Botón "+ Campo": agrega una columna desde las sugerencias de la IA o con un nombre escrito a mano. */
-function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar, solicitudAbrir = 0 }: { campos: CampoExtra[]; sugerencias: SugerenciaCampo[]; huboExtraccionIa: boolean; onAplicar: (sugerencia: SugerenciaCampo) => void; onAgregar: (nombre: string, alcance: AlcanceCampo) => void; solicitudAbrir?: number }) {
+function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar, solicitudAbrir = 0 }: { campos: CampoExtra[]; sugerencias: SugerenciaCampo[]; huboExtraccionIa: boolean; onAplicar: (sugerencia: SugerenciaCampo, tambienConfiguracion: boolean) => void; onAgregar: (nombre: string, alcance: AlcanceCampo, tambienConfiguracion: boolean) => void; solicitudAbrir?: number }) {
   const [abierto, setAbierto] = useState(false)
+  const [tambienConfiguracion, setTambienConfiguracion] = useState(false)
   const [alcance, setAlcance] = useState<AlcanceCampo>('documento')
   const [posicion, setPosicion] = useState<{ top: number; right: number } | null>(null)
   const [nombre, setNombre] = useState('')
@@ -1445,7 +1500,7 @@ function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar
   const agregarManual = () => {
     setIntentado(true)
     if (error || lleno) return
-    onAgregar(nombre, alcance)
+    onAgregar(nombre, alcance, tambienConfiguracion)
     cerrar()
   }
   const vacio = sugerencias.length === 0 ? (huboExtraccionIa ? 'La IA no encontró campos adicionales en este documento.' : 'Extrae con Gemini para ver los campos que la IA encuentre en el documento.') : 'Ya agregaste todos los campos que sugirió la IA.'
@@ -1454,10 +1509,11 @@ function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar
     {abierto && <div ref={menu} role="dialog" aria-label="Agregar campo" style={posicion ?? undefined} className="fixed z-50 w-72 rounded-xl border border-slate-200 bg-white p-3 text-left text-xs font-normal normal-case tracking-normal text-slate-600 shadow-xl">
       <div className="flex items-center gap-1.5 text-[11px] font-bold text-violet-700"><Sparkles size={12} />Sugerencias de la IA</div>
       <p className="mt-0.5 text-[10px] leading-4 text-slate-400">Campos que aparecen en el documento y no están capturados. La IA no inventa campos ni valores.</p>
+      <label className="mt-2 flex cursor-pointer items-center gap-1.5 rounded-lg bg-slate-50 px-2 py-1.5 text-[11px] text-slate-600"><input type="checkbox" checked={tambienConfiguracion} onChange={(event) => setTambienConfiguracion(event.target.checked)} className="h-3.5 w-3.5 rounded border-slate-300 text-coral focus:ring-coral" />Agregar también a la configuración</label>
       {disponibles.length === 0 ? <div className="mt-2 rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] text-slate-500">{vacio}</div> : <ul className="scrollbar-thin mt-2 max-h-56 space-y-1 overflow-auto">{disponibles.map((sugerencia) => {
         const filas = filasConValor(sugerencia)
         const ejemplo = sugerencia.valores[0]?.valor ?? sugerencia.valor_documento ?? ''
-        return <li key={sugerencia.clave}><button type="button" disabled={lleno} onClick={() => { onAplicar(sugerencia); cerrar() }} className="w-full rounded-lg border border-slate-100 px-2.5 py-2 text-left hover:border-violet-200 hover:bg-violet-50/60 disabled:opacity-50">
+        return <li key={sugerencia.clave}><button type="button" disabled={lleno} onClick={() => { onAplicar(sugerencia, tambienConfiguracion); cerrar() }} className="w-full rounded-lg border border-slate-100 px-2.5 py-2 text-left hover:border-violet-200 hover:bg-violet-50/60 disabled:opacity-50">
           <div className="flex items-center justify-between gap-2"><span className="truncate font-bold text-ink">{sugerencia.nombre}</span>{filas === null ? <span className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-800">Valor único del documento</span> : <span className="shrink-0 text-[10px] text-slate-400">{filas} fila{filas === 1 ? '' : 's'} con dato</span>}</div>
           <div className="mt-0.5 truncate text-[10px] text-slate-500" title={ejemplo}>Ej.: {ejemplo}</div>
           {filas === null && <div className="mt-0.5 text-[10px] text-amber-700">Va una sola vez para todos los movimientos.</div>}
@@ -1556,7 +1612,106 @@ function SettingsPageV3() {
   const disableGemini = async () => {
     try { setGeminiStatus(await geminiApi.disable()); setNotice('Gemini quedó desactivado.'); setError(null) } catch (requestError) { setError(requestError instanceof Error ? requestError.message : 'No se pudo desactivar Gemini.') }
   }
-  return <><PageHeading eyebrow="Integraciones y preferencias" title="Configuración" description="Administra Gmail y Gemini desde Nexora sin editar el archivo .env."><span className="flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700"><ShieldCheck size={14} />Configuración en backend</span></PageHeading>{error && <ErrorNotice text={error} onClose={() => setError(null)} />}{notice && <Notice text={notice} onClose={() => setNotice(null)} />}<div className="mb-7 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500"><div className="flex items-center gap-2"><ShieldCheck size={16} className="text-emerald-600" /><span>Las claves se guardan en FastAPI y nunca se muestran completas ni se almacenan en el navegador.</span></div></div><div className="space-y-5"><IntegrationCard icon={Globe2} iconClass="bg-blue-50 text-blue-600" title="Gmail" description="Conexión real mediante OAuth 2.0." connected={Boolean(gmailStatus?.connected)} onToggle={() => void handleGmail()}><div className="grid gap-4 sm:grid-cols-2"><SettingField label="Cuenta asociada" value={gmailStatus?.email ?? 'No conectada'} /><SettingField label="Estado" value={gmailStatus?.connected ? 'OAuth activo · Gmail API' : 'Esperando autorización'} /></div></IntegrationCard><IntegrationCard icon={Gem} iconClass="bg-violet-50 text-violet-600" title="Gemini" description="Guarda tu API key y activa la extracción desde esta pantalla." connected={Boolean(geminiStatus?.enabled)} onToggle={() => void (geminiStatus?.enabled ? disableGemini() : saveGemini())}><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">API key de Gemini</span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} className="input" placeholder={geminiStatus?.maskedKey ?? 'Pega aquí tu API key'} autoComplete="new-password" /></label><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Modelo</span><select value={model} onChange={(event) => setModel(event.target.value)} className="input"><option value="gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option><option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite · respaldo</option><option value="gemini-3.8-flash">Gemini 3.8 Flash · documentos complejos</option></select></label></div><div className="mt-4 flex flex-wrap items-center gap-2"><button onClick={() => void saveGemini()} className="btn-primary"><Check size={14} />Guardar y activar</button><button onClick={() => void disableGemini()} className="btn-soft" disabled={!geminiStatus?.configured}><X size={14} />Desactivar</button>{geminiStatus?.configured && <span className="text-xs text-slate-500">Key guardada: {geminiStatus.maskedKey}</span>}</div></IntegrationCard><section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-savedata"><div className="mb-5 flex items-start gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600"><Send size={19} /></div><div><h3 id="titulo-config-savedata" className="font-display text-base font-bold text-ink">SaveData</h3><p className="mt-1 text-xs text-slate-500">Envío de extracciones revisadas. La URL se define en el backend con SAVEDATA_URL; el navegador nunca la llama directamente.</p></div></div><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Sucursal predeterminada</span><input type="text" inputMode="numeric" value={sucursalPredeterminada} onChange={(event) => setSucursalPredeterminada(event.target.value)} className="input" placeholder="Ej. 3102" /></label><SettingField label="URL de SaveData" value={savedata ? savedata.url ?? 'Sin configurar (SAVEDATA_URL)' : 'Consultando…'} /></div><div className="mt-4"><button type="button" onClick={() => void guardarSucursal()} className="btn-primary"><Check size={14} />Guardar sucursal</button></div></section>{gmailStatus?.connected && <TarjetaExtraccionAutomatica onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} />}</div><div className="mt-8 grid gap-4 md:grid-cols-3"><SmallSetting icon={ShieldCheck} title="Privacidad" description="Key protegida en el servidor" /><SmallSetting icon={Sparkles} title="Modelo activo" description={geminiStatus?.model ?? model} /><SmallSetting icon={Code2} title="API FastAPI" description="Configuración persistente" /></div></>
+  return <><PageHeading eyebrow="Integraciones y preferencias" title="Configuración" description="Administra Gmail y Gemini desde Nexora sin editar el archivo .env."><span className="flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700"><ShieldCheck size={14} />Configuración en backend</span></PageHeading>{error && <ErrorNotice text={error} onClose={() => setError(null)} />}{notice && <Notice text={notice} onClose={() => setNotice(null)} />}<div className="mb-7 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500"><div className="flex items-center gap-2"><ShieldCheck size={16} className="text-emerald-600" /><span>Las claves se guardan en FastAPI y nunca se muestran completas ni se almacenan en el navegador.</span></div></div><div className="space-y-5"><IntegrationCard icon={Globe2} iconClass="bg-blue-50 text-blue-600" title="Gmail" description="Conexión real mediante OAuth 2.0." connected={Boolean(gmailStatus?.connected)} onToggle={() => void handleGmail()}><div className="grid gap-4 sm:grid-cols-2"><SettingField label="Cuenta asociada" value={gmailStatus?.email ?? 'No conectada'} /><SettingField label="Estado" value={gmailStatus?.connected ? 'OAuth activo · Gmail API' : 'Esperando autorización'} /></div></IntegrationCard><IntegrationCard icon={Gem} iconClass="bg-violet-50 text-violet-600" title="Gemini" description="Guarda tu API key y activa la extracción desde esta pantalla." connected={Boolean(geminiStatus?.enabled)} onToggle={() => void (geminiStatus?.enabled ? disableGemini() : saveGemini())}><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">API key de Gemini</span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} className="input" placeholder={geminiStatus?.maskedKey ?? 'Pega aquí tu API key'} autoComplete="new-password" /></label><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Modelo</span><select value={model} onChange={(event) => setModel(event.target.value)} className="input"><option value="gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option><option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite · respaldo</option><option value="gemini-3.8-flash">Gemini 3.8 Flash · documentos complejos</option></select></label></div><div className="mt-4 flex flex-wrap items-center gap-2"><button onClick={() => void saveGemini()} className="btn-primary"><Check size={14} />Guardar y activar</button><button onClick={() => void disableGemini()} className="btn-soft" disabled={!geminiStatus?.configured}><X size={14} />Desactivar</button>{geminiStatus?.configured && <span className="text-xs text-slate-500">Key guardada: {geminiStatus.maskedKey}</span>}</div></IntegrationCard><section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-savedata"><div className="mb-5 flex items-start gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600"><Send size={19} /></div><div><h3 id="titulo-config-savedata" className="font-display text-base font-bold text-ink">SaveData</h3><p className="mt-1 text-xs text-slate-500">Envío de extracciones revisadas. La URL se define en el backend con SAVEDATA_URL; el navegador nunca la llama directamente.</p></div></div><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Sucursal predeterminada</span><input type="text" inputMode="numeric" value={sucursalPredeterminada} onChange={(event) => setSucursalPredeterminada(event.target.value)} className="input" placeholder="Ej. 3102" /></label><SettingField label="URL de SaveData" value={savedata ? savedata.url ?? 'Sin configurar (SAVEDATA_URL)' : 'Consultando…'} /></div><div className="mt-4"><button type="button" onClick={() => void guardarSucursal()} className="btn-primary"><Check size={14} />Guardar sucursal</button></div></section>{gmailStatus?.connected && <TarjetaCamposConfigurados onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} />}{gmailStatus?.connected && <TarjetaExtraccionAutomatica onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} />}</div><div className="mt-8 grid gap-4 md:grid-cols-3"><SmallSetting icon={ShieldCheck} title="Privacidad" description="Key protegida en el servidor" /><SmallSetting icon={Sparkles} title="Modelo activo" description={geminiStatus?.model ?? model} /><SmallSetting icon={Code2} title="API FastAPI" description="Configuración persistente" /></div></>
+}
+
+/**
+ * Configuración de campos: los campos que se capturan de cada estado de cuenta, definidos una vez por cuenta.
+ * Paso 1: la IA sugiere campos a partir de un estado de cuenta de ejemplo (no se guarda). Paso 2: la lista final.
+ */
+export function TarjetaCamposConfigurados({ onNotice, onError }: { onNotice: (texto: string) => void; onError: (texto: string) => void }) {
+  const [configurada, setConfigurada] = useState<boolean | null>(null)
+  const [campos, setCampos] = useState<CampoPlantilla[]>([])
+  const [guardados, setGuardados] = useState<string>('[]')
+  const [archivo, setArchivo] = useState<File | null>(null)
+  const [sugerencias, setSugerencias] = useState<SugerenciaPlantilla[] | null>(null)
+  const [marcadas, setMarcadas] = useState<Set<string>>(new Set())
+  const [sugiriendo, setSugiriendo] = useState(false)
+  const [guardando, setGuardando] = useState(false)
+  const [nombre, setNombre] = useState('')
+  const [alcance, setAlcance] = useState<AlcanceCampo>('documento')
+  const [renombrando, setRenombrando] = useState<{ id: string; nombre: string } | null>(null)
+  const mensaje = (requestError: unknown, defecto: string) => (requestError instanceof Error ? requestError.message : defecto)
+  useEffect(() => {
+    let vivo = true
+    void plantillaCamposApi.obtener().then((plantilla) => {
+      if (!vivo) return
+      setConfigurada(plantilla.configurada)
+      setCampos(plantilla.campos)
+      setGuardados(plantilla.configurada ? JSON.stringify(plantilla.campos) : '')
+    }).catch((requestError: unknown) => { if (vivo) onError(mensaje(requestError, 'No se pudo cargar la configuración de campos.')) })
+    return () => { vivo = false }
+  }, [])
+  const sinGuardar = configurada !== null && JSON.stringify(campos) !== guardados
+  const errorNombre = nombre.trim() ? errorNombrePlantilla(nombre, campos) : null
+  const nuevas = sugerencias ? sugerenciasNuevas(sugerencias, campos) : []
+
+  const sugerir = async () => {
+    if (!archivo) return
+    setSugiriendo(true)
+    try {
+      const lista = await plantillaCamposApi.sugerir(archivo)
+      setSugerencias(lista)
+      setMarcadas(new Set())
+    } catch (requestError) { onError(mensaje(requestError, 'No se pudieron sugerir campos.')) } finally { setSugiriendo(false) }
+  }
+  const agregarMarcadas = () => {
+    let lista = campos
+    for (const sugerencia of nuevas.filter((item) => marcadas.has(item.clave))) lista = agregarAPlantilla(lista, { nombre: sugerencia.nombre, origen: 'ia', alcance: sugerencia.alcance, clave: sugerencia.clave })
+    setCampos(lista)
+    setMarcadas(new Set())
+  }
+  const agregarManual = () => {
+    if (!nombre.trim() || errorNombre) return
+    setCampos((lista) => agregarAPlantilla(lista, { nombre, origen: 'manual', alcance }))
+    setNombre('')
+  }
+  const guardar = async () => {
+    setGuardando(true)
+    try {
+      const plantilla = await plantillaCamposApi.guardar(campos)
+      setConfigurada(true)
+      setCampos(plantilla.campos)
+      setGuardados(JSON.stringify(plantilla.campos))
+      plantillaVigente.fijar(plantilla.campos)
+      onNotice('Configuración de campos guardada. Se usará en la extracción automática, al extraer y en «Llenar con IA».')
+    } catch (requestError) { onError(mensaje(requestError, 'No se pudo guardar la configuración de campos.')) } finally { setGuardando(false) }
+  }
+  const alternarMarcada = (clave: string) => setMarcadas((previas) => { const siguiente = new Set(previas); if (siguiente.has(clave)) siguiente.delete(clave); else siguiente.add(clave); return siguiente })
+
+  return <section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-campos">
+    <div className="mb-5 flex items-start gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-orange-50 text-coral"><FileText size={19} /></div><div><h3 id="titulo-config-campos" className="font-display text-base font-bold text-ink">Campos que se capturan de cada estado de cuenta</h3><p className="mt-1 text-xs text-slate-500">Se definen una vez. Los usan la extracción automática, la extracción manual y «Llenar con IA». Un documento ya guardado conserva sus campos y recibe los nuevos vacíos.</p></div></div>
+    {configurada === false && <p className="mb-4 rounded-lg bg-blue-50 px-3 py-2 text-[11px] text-blue-800">Lista precargada con los campos de tus extracciones guardadas. Revísala y pulsa «Guardar campos» para confirmarla.</p>}
+
+    <div className="rounded-xl border border-slate-200 p-4">
+      <div className="text-xs font-bold text-ink">Paso 1 · Sugerencias con IA</div>
+      <p className="mt-1 text-[11px] text-slate-500">Sube un estado de cuenta de ejemplo (PDF o imagen). La IA sugiere los campos que encuentra; nunca inventa campos. El archivo no se guarda ni se envía a SaveData.</p>
+      <div className="mt-3 flex flex-wrap items-center gap-2"><input type="file" accept="application/pdf,image/png,image/jpeg,image/webp" aria-label="Estado de cuenta de ejemplo" onChange={(event) => { setArchivo(event.target.files?.[0] ?? null); setSugerencias(null) }} className="text-xs" /><button type="button" onClick={() => void sugerir()} disabled={!archivo || sugiriendo} className="btn-soft"><Sparkles size={14} className={sugiriendo ? 'animate-pulse' : ''} />{sugiriendo ? 'Leyendo el documento…' : 'Sugerir campos con IA'}</button></div>
+      {sugerencias && (nuevas.length === 0 ? <p className="mt-3 text-[11px] text-slate-500">{sugerencias.length === 0 ? 'La IA no encontró campos adicionales en este documento.' : 'Todos los campos sugeridos ya están en la lista.'}</p> : <div className="mt-3">
+        <ul className="space-y-1">{nuevas.map((sugerencia) => <li key={sugerencia.clave}><label className="flex cursor-pointer items-start gap-2 rounded-lg border border-slate-100 px-2.5 py-2 text-xs hover:bg-slate-50"><input type="checkbox" checked={marcadas.has(sugerencia.clave)} onChange={() => alternarMarcada(sugerencia.clave)} aria-label={`Usar ${sugerencia.nombre}`} className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-coral focus:ring-coral" /><span className="min-w-0 flex-1"><span className="font-bold text-ink">{sugerencia.nombre}</span> <span className="ml-1 rounded-full bg-slate-100 px-1.5 py-0.5 text-[9px] font-bold text-slate-600">{etiquetaAlcance(sugerencia.alcance)}</span><span className="mt-0.5 block truncate text-[10px] text-slate-500" title={sugerencia.ejemplo}>Ej.: {sugerencia.ejemplo}</span></span></label></li>)}</ul>
+        <button type="button" onClick={agregarMarcadas} disabled={marcadas.size === 0} className="btn-primary mt-2"><Plus size={14} />Agregar seleccionados</button>
+      </div>)}
+    </div>
+
+    <div className="mt-4 rounded-xl border border-slate-200 p-4">
+      <div className="text-xs font-bold text-ink">Paso 2 · Lista final</div>
+      <ul className="mt-3 space-y-1 text-xs" aria-label="Campos que se capturan">
+        {CAMPOS_FIJOS.map((fijo) => <li key={fijo} className="flex items-center gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5 text-slate-500"><span className="flex-1 font-semibold">{fijo}</span><span className="text-[10px]">Fijo · En cada movimiento</span></li>)}
+        {campos.map((campo) => <li key={campo.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-100 px-2.5 py-1.5">
+          {renombrando?.id === campo.id
+            ? <span className="flex flex-1 items-center gap-1"><input autoFocus aria-label={`Nuevo nombre de ${campo.nombre}`} value={renombrando.nombre} maxLength={60} onChange={(event) => setRenombrando({ id: campo.id, nombre: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter' && !errorNombrePlantilla(renombrando.nombre, campos, campo.id)) { setCampos((lista) => renombrarEnPlantilla(lista, campo.id, renombrando.nombre)); setRenombrando(null) } if (event.key === 'Escape') setRenombrando(null) }} className="input py-1 text-xs" /><button type="button" disabled={Boolean(errorNombrePlantilla(renombrando.nombre, campos, campo.id))} onClick={() => { setCampos((lista) => renombrarEnPlantilla(lista, campo.id, renombrando.nombre)); setRenombrando(null) }} className="btn-soft px-2 py-1 text-[11px]">Listo</button></span>
+            : <span className="min-w-0 flex-1 truncate font-semibold text-ink">{campo.nombre}</span>}
+          <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-bold ${campo.origen === 'ia' ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-600'}`}>{campo.origen === 'ia' ? 'IA' : 'Manual'}</span>
+          <select aria-label={`Tipo de ${campo.nombre}`} value={campo.alcance} onChange={(event) => setCampos((lista) => cambiarTipoEnPlantilla(lista, campo.id, event.target.value as AlcanceCampo))} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[11px]"><option value="documento">Una vez</option><option value="movimiento">En cada movimiento</option></select>
+          <button type="button" onClick={() => setRenombrando({ id: campo.id, nombre: campo.nombre })} aria-label={`Renombrar ${campo.nombre}`} className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-ink"><Pencil size={12} /></button>
+          <button type="button" onClick={() => setCampos((lista) => quitarDePlantilla(lista, campo.id))} aria-label={`Quitar ${campo.nombre}`} className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600"><X size={12} /></button>
+        </li>)}
+      </ul>
+      <div className="mt-3 flex flex-wrap items-center gap-2"><input value={nombre} maxLength={60} onChange={(event) => setNombre(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') agregarManual() }} placeholder="Nombre del campo" aria-label="Nombre del campo nuevo" className="input max-w-[14rem] py-1.5 text-xs" /><select aria-label="Tipo del campo nuevo" value={alcance} onChange={(event) => setAlcance(event.target.value as AlcanceCampo)} className="rounded-md border border-slate-200 bg-white px-1.5 py-1.5 text-[11px]"><option value="documento">Una vez</option><option value="movimiento">En cada movimiento</option></select><button type="button" onClick={agregarManual} disabled={!nombre.trim() || Boolean(errorNombre)} className="btn-soft"><Plus size={14} />Agregar a mano</button></div>
+      {errorNombre && <p role="alert" className="mt-1 text-[10px] text-red-600">{errorNombre}</p>}
+    </div>
+    <div className="mt-4 flex items-center gap-3"><button type="button" onClick={() => void guardar()} disabled={guardando || configurada === null || (!sinGuardar && configurada === true)} className="btn-primary"><Check size={14} />Guardar campos</button>{sinGuardar && configurada && <span className="text-[11px] font-semibold text-amber-700">Cambios sin guardar</span>}</div>
+  </section>
 }
 
 /** Configuración de la extracción automática: interruptor (activar o pausar), "Revisar ahora" y los campos que se pedirán. */

@@ -9,6 +9,11 @@ import type { Transaccion } from './types'
 const RequestDeNode = globalThis.Request
 const pendientes = new Map<string, { resolver: (valor: GeminiExtractionResponse) => void; signal?: AbortSignal }>()
 
+const plantillaPrueba = vi.hoisted(() => ({ campos: [] as { id: string; nombre: string; origen: 'ia' | 'manual'; alcance: 'documento' | 'movimiento'; clave?: string }[] }))
+vi.mock('./services/plantillaCamposApi', () => ({
+  plantillaCamposApi: { obtener: vi.fn(async () => ({ configurada: true, campos: plantillaPrueba.campos, actualizado: null })), guardar: vi.fn(async (campos: unknown[]) => ({ configurada: true, campos, actualizado: null })), sugerir: vi.fn(async () => []) },
+  plantillaVigente: { actual: () => plantillaPrueba.campos, cargar: async () => plantillaPrueba.campos, fijar: vi.fn() },
+}))
 vi.mock('./services/geminiApi', () => ({
   geminiApi: {
     status: vi.fn(async () => ({ configured: true, enabled: true, model: 'gemini-prueba', maskedKey: null })),

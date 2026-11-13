@@ -66,6 +66,8 @@ class CampoExtraGuardado(BaseModel):
     alcance: Literal["movimiento", "documento"] | None = None
     valor: str | None = Field(default=None, max_length=MAX_VALOR_CAMPO)
     valor_ia: bool | None = None
+    # Id del campo en la configuración de campos: así un campo renombrado en la configuración se reconoce.
+    plantilla_id: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def _valor_solo_del_documento(self) -> "CampoExtraGuardado":

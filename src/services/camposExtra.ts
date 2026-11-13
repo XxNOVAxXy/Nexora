@@ -142,7 +142,7 @@ export function eliminarCampo(documento: ColumnasDocumento, id: string): Columna
 export type ResultadoLlenado = {
   campoId: string
   nombre: string
-  estado: 'no_encontrado' | 'llenado' | 'completa' | 'sin_valores_para_vacias' | 'dato_del_documento' | 'unico_con_valores' | 'por_movimiento'
+  estado: 'no_encontrado' | 'llenado' | 'completa' | 'sin_valores_para_vacias' | 'dato_del_documento' | 'unico_con_valores' | 'por_movimiento' | 'tipo_distinto'
   llenadas: number
   /** Valor único que encontró la IA (para explicar por qué no se repitió en cada movimiento). */
   valor?: string
@@ -158,11 +158,27 @@ export function mensajeLlenado(resultado: ResultadoLlenado): string {
     case 'dato_del_documento': return `«${nombre}» aparece una sola vez en el documento: se guardó una vez, no en cada movimiento.`
     case 'unico_con_valores': return `La IA encontró «${nombre}» una sola vez en el documento (${resultado.valor ?? ''}); no se repitió en cada movimiento y lo capturado no cambió.`
     case 'por_movimiento': return `La IA encontró «${nombre}» en cada movimiento, no como un dato único; no se cambió nada.`
+    case 'tipo_distinto': return resultado.valor !== undefined
+      ? `La IA encontró «${nombre}» como un dato único del documento (${resultado.valor}), pero en Configuración es «En cada movimiento»; no se llenó. Revisa su tipo en Configuración.`
+      : `La IA encontró «${nombre}» con valores distintos en cada movimiento, pero en Configuración es «Una vez»; no se llenó. Revisa su tipo en Configuración.`
   }
 }
 
-/** Nombres de las columnas manuales que se piden a Gemini al extraer. */
-export const camposParaSolicitar = (campos: CampoExtra[]) => campos.filter((campo) => campo.origen === 'manual').map((campo) => campo.nombre)
+/** ¿El campo está vinculado a la configuración de campos? */
+export const esConfigurado = (campo: CampoExtra) => Boolean(campo.plantilla_id)
+
+/** Campos que se buscan por nombre en el documento (al extraer y con "Llenar con IA"): los manuales y los configurados. */
+export const esBuscable = (campo: CampoExtra) => campo.origen === 'manual' || esConfigurado(campo)
+
+/** Nombres de los campos que se piden a Gemini al extraer. */
+export const camposParaSolicitar = (campos: CampoExtra[]) => campos.filter(esBuscable).map((campo) => campo.nombre)
+
+/** Valores por fila que en realidad son uno solo (todos iguales y no vacíos); null si son distintos o no hay. */
+function valorUnicoDeFuente(fuente: FuenteValores): string | null {
+  const valores = 'unico' in fuente ? [fuente.unico] : 'porId' in fuente ? [...fuente.porId.values()] : fuente.porHuella.map((item) => item.valor)
+  const distintos = [...new Set(valores.map((valor) => valor.trim()).filter(Boolean))]
+  return distintos.length === 1 ? distintos[0].slice(0, MAX_VALOR_CAMPO) : null
+}
 
 /**
  * Llena un campo manual con lo que encontró la IA y describe el resultado. Nunca sobrescribe lo ya capturado.
@@ -175,11 +191,16 @@ export function llenarColumnaManual(transacciones: Transaccion[], campo: CampoEx
   if (!encontrado) return sinCambios('no_encontrado')
   const unico = 'unico' in fuente ? fuente.unico.trim().slice(0, MAX_VALOR_CAMPO) : null
   if (unico !== null && !unico) return sinCambios('no_encontrado')
+  // En un campo de la configuración el tipo configurado manda.
+  const configurado = esConfigurado(campo)
   if (esDelDocumento(campo)) {
-    if (unico === null) return sinCambios('por_movimiento')
+    // "Una vez" con valores por fila todos iguales: se acepta como valor único.
+    const valor = unico ?? (configurado ? valorUnicoDeFuente(fuente) : null)
+    if (valor === null) return sinCambios(configurado ? 'tipo_distinto' : 'por_movimiento')
     if (campo.valor?.trim()) return sinCambios('completa')
-    return { transacciones, campo: { ...campo, valor: unico, valor_ia: true }, resultado: { ...base, estado: 'dato_del_documento', llenadas: 1 } }
+    return { transacciones, campo: { ...campo, valor, valor_ia: true }, resultado: { ...base, estado: 'dato_del_documento', llenadas: 1 } }
   }
+  if (unico !== null && configurado) return sinCambios('tipo_distinto', { valor: unico })
   if (unico !== null) {
     const conValores = transacciones.some((transaccion) => transaccion.extras?.[campo.id]?.trim())
     if (conValores) return sinCambios('unico_con_valores', { valor: unico })
@@ -201,7 +222,7 @@ export function rellenarColumnas(transacciones: Transaccion[], campos: CampoExtr
   let actuales = transacciones
   const llenado: ResultadoLlenado[] = []
   const nuevos = campos.map((campo) => {
-    if (campo.origen === 'ia') {
+    if (!esBuscable(campo)) {
       const sugerencia = campo.clave ? sugerencias.find((item) => item.clave === campo.clave) : undefined
       if (!sugerencia) return campo
       if (esDelDocumento(campo)) return !campo.valor?.trim() && sugerencia.valor_documento ? { ...campo, valor: sugerencia.valor_documento.slice(0, MAX_VALOR_CAMPO) } : campo

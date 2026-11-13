@@ -5,13 +5,15 @@ from datetime import datetime, timedelta, timezone
 import logging
 from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 
 from .adjuntos import content_disposition
 from .automatico import ExtractorAutomatico, intervalo_desde_entorno
+from .plantilla_campos import AlmacenPlantillas, PlantillaRequest, aplicar_plantilla, deducir_campos, sugerencias_para_configurar
 from .config import settings
 from .preferencias import AlmacenClasificaciones, ClasificacionRequest, ConfiguracionCuenta, MigracionRequest, RemitentesRequest
 from .remitentes import CONSULTAS_CARPETA, ListaRemitentesInvalida, coincide, construir_query
@@ -51,9 +53,11 @@ almacen = AlmacenExtracciones(settings.extracciones_path)
 savedata_config = SaveDataConfig(settings.savedata_settings_path)
 configuracion = ConfiguracionCuenta(settings.configuracion_path)
 clasificaciones = AlmacenClasificaciones(settings.clasificaciones_path)
+# Configuración de campos por cuenta; mientras no se guarde, se deduce de las extracciones guardadas.
+plantillas = AlmacenPlantillas(settings.plantilla_campos_path, lambda email: deducir_campos(almacen, email))
 # La URL se lee en cada envío para que las pruebas puedan sustituirla.
-envios = ServicioEnvio(almacen, lambda: settings.savedata_url)
-automatico = ExtractorAutomatico(settings.automatico_path, gmail, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos))
+envios = ServicioEnvio(almacen, lambda: settings.savedata_url, configurados=lambda email: plantillas.efectiva(email))
+automatico = ExtractorAutomatico(settings.automatico_path, gmail, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos), plantillas=plantillas)
 oauth_states: dict[str, datetime] = {}
 
 
@@ -380,7 +384,9 @@ def obtener_extraccion(message_id: str, part_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(error)) from error
     if documento is None:
         raise HTTPException(status_code=404, detail="Este documento no tiene una extraccion guardada.")
-    return documento
+    # Campos de la configuración: los vinculados toman su nombre actual y los que faltan llegan vacíos. No se escribe
+    # en disco; queda así cuando el usuario guarde.
+    return aplicar_plantilla(documento, plantillas.efectiva(email))
 
 
 @app.put("/api/extracciones/{message_id}/{part_id}")
@@ -566,3 +572,52 @@ def revisar_automatico() -> dict[str, Any]:
     if not automatico.revisar_ahora():
         raise HTTPException(status_code=409, detail={"code": "revision_en_curso", "message": "Ya hay una revision en curso."})
     return automatico.estado(email)
+
+
+# --- Configuración de campos (se define una vez por cuenta) --------------------------------------
+
+MAX_ARCHIVO_EJEMPLO = 20 * 1024 * 1024
+
+
+@app.get("/api/configuracion/campos")
+def obtener_campos_configurados() -> dict[str, Any]:
+    return plantillas.leer(_cuenta_actual())
+
+
+@app.put("/api/configuracion/campos")
+def guardar_campos_configurados(payload: PlantillaRequest) -> dict[str, Any]:
+    email = _cuenta_actual()
+    try:
+        return plantillas.guardar(email, payload)
+    except OSError as error:
+        logger.exception("No se pudo guardar la configuracion de campos")
+        raise HTTPException(status_code=500, detail=f"No se pudo guardar la configuracion de campos: {error}") from error
+
+
+@app.post("/api/configuracion/campos/sugerir")
+async def sugerir_campos(request: Request, filename: str = Query("ejemplo.pdf", max_length=255), tipo: str = Query("", max_length=100)) -> dict[str, Any]:
+    """Sugerencias de campos a partir de un estado de cuenta de ejemplo (PDF o imagen) enviado como cuerpo binario.
+
+    Se reutilizan las sugerencias de la extracción (las mismas de "+ Campo"); la IA nunca inventa campos. El archivo
+    solo vive en memoria durante la petición: no se escribe en disco ni se envía a SaveData.
+    """
+    await run_in_threadpool(_cuenta_actual)
+    declarado = request.headers.get("content-length")
+    if declarado and declarado.isdigit() and int(declarado) > MAX_ARCHIVO_EJEMPLO:
+        raise HTTPException(status_code=413, detail="El archivo de ejemplo admite hasta 20 MB.")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=422, detail="Elige un estado de cuenta de ejemplo (PDF o imagen).")
+    if len(data) > MAX_ARCHIVO_EJEMPLO:
+        raise HTTPException(status_code=413, detail="El archivo de ejemplo admite hasta 20 MB.")
+    media_type = (tipo or request.headers.get("content-type") or "application/octet-stream").split(";")[0].strip().lower()
+    try:
+        resultado = await run_in_threadpool(gemini.extract_document, data, media_type, filename)
+    except GeminiUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except GeminiRequestError as error:
+        raise HTTPException(status_code=error.status_code, detail={"code": error.code, "message": str(error), "retryable": error.retryable}) from error
+    except Exception as error:
+        logger.exception("No se pudieron sugerir campos del archivo de ejemplo")
+        raise HTTPException(status_code=502, detail=f"No se pudo leer el archivo de ejemplo: {error}") from error
+    return {"sugerencias": sugerencias_para_configurar(resultado)}

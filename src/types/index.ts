@@ -50,6 +50,11 @@ export type CampoExtra = {
   valor?: string
   /** El valor del documento lo llenó la IA y el usuario no lo ha editado. */
   valor_ia?: boolean
+  /**
+   * Id del campo en la configuración de campos (Configuración). Un campo vinculado toma el nombre de la configuración
+   * aunque se renombre allí, y su tipo configurado manda al llenarlo con la IA.
+   */
+  plantilla_id?: string
 }
 
 export type AlcanceCampo = 'movimiento' | 'documento'

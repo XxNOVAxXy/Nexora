@@ -104,7 +104,8 @@ class EnvioTests(unittest.TestCase):
         self.assertEqual(list(externo), ["data"])
         self.assertIsInstance(externo["data"], str)
         interno = json.loads(externo["data"])
-        self.assertEqual(list(interno), ["Archivo", "Resumen", "Transacciones", "Validacion"])
+        self.assertEqual(list(interno), ["Archivo", "Resumen", "Datos", "Transacciones", "Validacion"])
+        self.assertEqual(interno["Datos"], {})
         self.assertEqual(interno["Archivo"], "estado.pdf")
         self.assertEqual(interno["Resumen"]["saldo_final"], RESUMEN["saldo_final"])
         self.assertEqual(interno["Transacciones"], [
@@ -121,7 +122,9 @@ class EnvioTests(unittest.TestCase):
         self.url = self.servidor.url
         almacen = AlmacenExtracciones(Path(self.directorio.name, "extracciones"))
         self.servicio = ServicioEnvio(almacen, lambda: self.url, timeout=5, cliente=cliente_solo_local)
-        for nombre, valor in {"almacen": almacen, "envios": self.servicio, "savedata_config": SaveDataConfig(Path(self.directorio.name, "savedata.json"))}.items():
+        # Configuración de campos aislada: nunca la del usuario en backend/data.
+        plantillas = main.AlmacenPlantillas(Path(self.directorio.name, "plantillas"))
+        for nombre, valor in {"almacen": almacen, "envios": self.servicio, "plantillas": plantillas, "savedata_config": SaveDataConfig(Path(self.directorio.name, "savedata.json"))}.items():
             parche = patch.object(main, nombre, valor)
             parche.start()
             self.addCleanup(parche.stop)

@@ -64,14 +64,13 @@ class DatosDelDocumento(Almacen):
             self.assertEqual([t.get("extras") for t in documento["transacciones"]], [{"c1": "12.5"}, {"c1": "13"}])
             self.assertTrue(all("extras_ia" not in t for t in documento["transacciones"]))
 
-    def test_savedata_no_cambia_con_datos_del_documento(self) -> None:
-        sin_campos = self.guardar()
-        self.almacen.guardar(EMAIL, "m2", "1", GuardarExtraccionRequest.model_validate(_cuerpo(campos_extra=[{"id": "rfc", "nombre": "RFC", "origen": "manual", "alcance": "documento", "valor": "XAXX010101000"}])))
-        con_campos = self.almacen.obtener(EMAIL, "m2", "1")
-        self.assertEqual(datos_documento(con_campos, totales_de(con_campos)), datos_documento(sin_campos, totales_de(sin_campos)))
-        cuerpo = preparar_envio(con_campos, sucursal=3102, articulo="10000453", carga_inicial=False)
-        self.assertEqual(cuerpo, preparar_envio(sin_campos, sucursal=3102, articulo="10000453", carga_inicial=False))
-        self.assertNotIn("XAXX010101000", json.dumps(cuerpo))
+    def test_el_dato_del_documento_va_una_sola_vez_en_datos(self) -> None:
+        self.guardar(campos_extra=[{"id": "rfc", "nombre": "RFC", "origen": "manual", "alcance": "documento", "valor": "XAXX010101000"}])
+        documento = self.almacen.obtener(EMAIL, "m1", "1")
+        cuerpo = preparar_envio(documento, sucursal=3102, articulo="10000453", carga_inicial=False)
+        self.assertEqual(cuerpo["interno"]["Datos"], {"RFC": "XAXX010101000"})
+        self.assertEqual(cuerpo["cuerpo"].count("XAXX010101000"), 1)
+        self.assertTrue(all("RFC" not in fila for fila in cuerpo["interno"]["Transacciones"]))
 
 
 class MigracionAlLeer(Almacen):
@@ -136,24 +135,35 @@ class ExtraccionAutomatica(unittest.TestCase):
             "sugerencias_campos": [], "resultados_campos": campos,
         }
 
-    def test_ordena_por_fecha_y_decide_el_tipo_de_cada_campo(self) -> None:
+    def test_ordena_por_fecha_y_el_tipo_configurado_manda(self) -> None:
+        configurados = [
+            {"id": "pl-rfc", "nombre": "RFC", "origen": "ia", "alcance": "documento"},
+            {"id": "pl-folio", "nombre": "Folio", "origen": "manual", "alcance": "movimiento"},
+            {"id": "pl-cliente", "nombre": "Cliente", "origen": "manual", "alcance": "documento"},
+            {"id": "pl-plaza", "nombre": "Plaza", "origen": "manual", "alcance": "documento"},
+            {"id": "pl-banca", "nombre": "Banca", "origen": "manual", "alcance": "documento"},
+            {"id": "pl-sucursal", "nombre": "Sucursal", "origen": "manual", "alcance": "movimiento"},
+        ]
         solicitud = borrador_desde_extraccion(self.resultado([
             {"nombre": "RFC", "clave": "rfc", "encontrado": True, "valores": [], "valor_documento": "XAXX010101000"},
             {"nombre": "Folio", "clave": "folio", "encontrado": True, "valores": [{"huella": "h1", "valor": "F-1"}]},
             {"nombre": "Cliente", "clave": "cliente", "encontrado": False, "valores": []},
-        ]), ["RFC", "Folio", "Cliente", "Sucursal"], filename="e.pdf", attachment_id=None, lote="L", alcances={"cliente": "documento", "sucursal": "movimiento"})
+            # "Una vez" con valores por fila todos iguales: se acepta como valor único.
+            {"nombre": "Plaza", "clave": "plaza", "encontrado": True, "valores": [{"huella": "h1", "valor": "CDMX"}, {"huella": "h2", "valor": "CDMX"}]},
+            # "Una vez" con valores distintos: no se llena.
+            {"nombre": "Banca", "clave": "banca", "encontrado": True, "valores": [{"huella": "h1", "valor": "A"}, {"huella": "h2", "valor": "B"}]},
+            # "En cada movimiento" con un valor único del documento: no se repite en cada fila.
+            {"nombre": "Sucursal", "clave": "sucursal", "encontrado": True, "valores": [], "valor_documento": "CENTRO"},
+        ]), configurados, filename="e.pdf", attachment_id=None, lote="L")
         self.assertEqual([t.concepto for t in solicitud.transacciones], ["PAGO 2", "PAGO 1"])
-        self.assertEqual([t.id for t in solicitud.transacciones], ["ia-L-1", "ia-L-2"])
         campos = {campo.nombre: campo for campo in solicitud.campos_extra}
+        self.assertEqual([campo.plantilla_id for campo in solicitud.campos_extra], [c["id"] for c in configurados])
         self.assertEqual((campos["RFC"].alcance, campos["RFC"].valor, campos["RFC"].valor_ia), ("documento", "XAXX010101000", True))
-        self.assertIsNone(campos["Folio"].alcance)
-        # No encontrado: conserva el tipo que tenía en la extracción de la que salió.
         self.assertEqual((campos["Cliente"].alcance, campos["Cliente"].valor), ("documento", ""))
-        self.assertIsNone(campos["Sucursal"].alcance)
-        folio = campos["Folio"].id
-        self.assertEqual([t.extras for t in solicitud.transacciones], [None, {folio: "F-1"}])
-        # El RFC nunca se repite en los movimientos.
-        self.assertTrue(all(campos["RFC"].id not in (t.extras or {}) for t in solicitud.transacciones))
+        self.assertEqual((campos["Plaza"].valor, campos["Plaza"].valor_ia), ("CDMX", True))
+        self.assertEqual(campos["Banca"].valor, "")
+        self.assertIsNone(campos["Folio"].alcance)
+        self.assertEqual([t.extras for t in solicitud.transacciones], [None, {"pl-folio": "F-1"}])
 
 
 if __name__ == "__main__":

@@ -3,12 +3,19 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryRouter, RouterProvider } from 'react-router-dom'
 import type { ExtraccionGuardada } from './services/extraccionesApi'
+import { extraccionesApi } from './services/extraccionesApi'
 import { geminiApi, type GeminiExtractionResponse } from './services/geminiApi'
+import { plantillaCamposApi } from './services/plantillaCamposApi'
 import type { ArchivoExtraccion } from './services/pestanasExtraccion'
 import type { Transaccion } from './types'
 
 let guardado: ExtraccionGuardada | null = null
 
+const plantillaPrueba = vi.hoisted(() => ({ campos: [] as { id: string; nombre: string; origen: 'ia' | 'manual'; alcance: 'documento' | 'movimiento'; clave?: string }[] }))
+vi.mock('./services/plantillaCamposApi', () => ({
+  plantillaCamposApi: { obtener: vi.fn(async () => ({ configurada: true, campos: plantillaPrueba.campos, actualizado: null })), guardar: vi.fn(async (campos: unknown[]) => ({ configurada: true, campos, actualizado: null })), sugerir: vi.fn(async () => []) },
+  plantillaVigente: { actual: () => plantillaPrueba.campos, cargar: async () => plantillaPrueba.campos, fijar: vi.fn() },
+}))
 vi.mock('./services/geminiApi', () => ({
   geminiApi: { status: vi.fn(async () => ({ configured: true, enabled: true, model: 'gemini-prueba', maskedKey: '....1234' })), extract: vi.fn(), llenarCampo: vi.fn() },
 }))
@@ -46,6 +53,7 @@ const encabezado = (campo: string) => screen.getByRole('button', { name: `Renomb
 
 beforeEach(() => {
   guardado = base()
+  plantillaPrueba.campos = []
   window.localStorage.clear()
   URL.createObjectURL = vi.fn(() => 'blob:prueba')
   URL.revokeObjectURL = vi.fn()
@@ -156,3 +164,68 @@ describe('datos del documento y movimientos numerados', () => {
     expect(screen.getByText('Cambios sin guardar')).toBeTruthy()
   })
 })
+
+describe('configuración de campos en la extracción', () => {
+  const rfc = { id: 'pl-rfc', nombre: 'RFC', origen: 'ia' as const, alcance: 'documento' as const, clave: 'rfc' }
+  const plaza = { id: 'pl-plaza', nombre: 'Plaza', origen: 'manual' as const, alcance: 'documento' as const }
+  const banca = { id: 'pl-banca', nombre: 'Banca', origen: 'manual' as const, alcance: 'documento' as const }
+
+  it('la extracción manual pide los campos configurados, los agrega y respeta su tipo', async () => {
+    plantillaPrueba.campos = [rfc, plaza, banca]
+    vi.mocked(geminiApi.extract).mockResolvedValue({
+      filename: 'estado.png', model: 'gemini-prueba', prompt_version: 'v2', formato_numerico: 'us', resumen, warnings: [], validacion: {} as never,
+      transacciones: [fila('ia-1', 'h1', 'PAGO A'), fila('ia-2', 'h2', 'PAGO B'), fila('ia-3', 'h3', 'PAGO C')],
+      sugerencias_campos: [],
+      resultados_campos: [
+        { nombre: 'RFC', clave: 'rfc', encontrado: true, valores: [], valor_documento: 'XAXX010101000' },
+        // "Una vez" con valores por fila todos iguales: se acepta como valor único.
+        { nombre: 'Plaza', clave: 'plaza', encontrado: true, valores: [{ huella: 'h1', valor: 'CDMX' }, { huella: 'h2', valor: 'CDMX' }] },
+        // "Una vez" con valores distintos: no se llena y se pide revisar el tipo.
+        { nombre: 'Banca', clave: 'banca', encontrado: true, valores: [{ huella: 'h1', valor: 'A' }, { huella: 'h2', valor: 'B' }] },
+      ],
+    } as GeminiExtractionResponse)
+    montar()
+    const boton = await screen.findByRole('button', { name: 'Re-extraer con Gemini' })
+    await waitFor(() => expect((boton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(boton)
+
+    await screen.findByText('Extracción combinada con tus correcciones.')
+    expect(vi.mocked(geminiApi.extract).mock.calls[0][2]).toMatchObject({ campos: ['Nombre', 'Folio', 'RFC', 'Plaza', 'Banca'] })
+    expect((screen.getByLabelText('RFC del documento') as HTMLInputElement).value).toBe('XAXX010101000')
+    expect((screen.getByLabelText('Plaza del documento') as HTMLInputElement).value).toBe('CDMX')
+    expect((screen.getByLabelText('Banca del documento') as HTMLInputElement).value).toBe('')
+    expect(within(encabezado('Banca')).getByText(/valores distintos en cada movimiento.*Revisa su tipo en Configuración/)).toBeTruthy()
+    // Los campos del documento que ya existían se conservan.
+    expect(celda('Nombre', 1).value).toBe('Juan')
+  })
+
+  it('"+ Campo" con "Agregar también a la configuración" guarda el campo en la configuración y lo vincula', async () => {
+    montar()
+    fireEvent.click(await screen.findByRole('button', { name: 'Campo' }))
+    const menu = screen.getByRole('dialog', { name: 'Agregar campo' })
+    fireEvent.click(within(menu).getByLabelText('Agregar también a la configuración'))
+    fireEvent.change(within(menu).getByLabelText('Manual'), { target: { value: 'Contrato' } })
+    fireEvent.click(within(menu).getByRole('button', { name: 'Agregar' }))
+    expect(screen.getByLabelText('Contrato del documento')).toBeTruthy()
+
+    await waitFor(() => expect(plantillaCamposApi.guardar).toHaveBeenCalledTimes(1))
+    const [configurado] = vi.mocked(plantillaCamposApi.guardar).mock.calls[0][0]
+    expect(configurado).toMatchObject({ nombre: 'Contrato', origen: 'manual', alcance: 'documento' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Guardar' }))
+    await waitFor(() => expect(extraccionesApi.guardar).toHaveBeenCalled())
+    const solicitud = vi.mocked(extraccionesApi.guardar).mock.calls[0][2]
+    expect(solicitud.campos_extra?.find((campo) => campo.nombre === 'Contrato')).toMatchObject({ alcance: 'documento', plantilla_id: configurado.id })
+  })
+
+  it('sin la casilla, el campo queda solo en el documento', async () => {
+    montar()
+    fireEvent.click(await screen.findByRole('button', { name: 'Campo' }))
+    const menu = screen.getByRole('dialog', { name: 'Agregar campo' })
+    fireEvent.change(within(menu).getByLabelText('Manual'), { target: { value: 'Contrato' } })
+    fireEvent.click(within(menu).getByRole('button', { name: 'Agregar' }))
+    expect(screen.getByLabelText('Contrato del documento')).toBeTruthy()
+    expect(plantillaCamposApi.guardar).not.toHaveBeenCalled()
+  })
+})
+

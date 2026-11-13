@@ -128,11 +128,13 @@ class PersistenciaCamposTests(unittest.TestCase):
             with self.subTest(cambios=list(cambios)), self.assertRaises(ValidationError):
                 GuardarExtraccionRequest.model_validate(_cuerpo(**cambios))
 
-    def test_savedata_no_envia_columnas_adicionales(self) -> None:
+    def test_savedata_envia_las_columnas_adicionales_por_movimiento(self) -> None:
         guardado = self.almacen.guardar(EMAIL, "m1", "1", GuardarExtraccionRequest.model_validate(_cuerpo()))
         datos = datos_documento(guardado, totales_de(guardado))
-        self.assertEqual(list(datos["Transacciones"][0]), ["fecha", "concepto", "referencia", "cargo", "abono", "saldo"])
-        self.assertNotIn("12.5", json.dumps(datos))
+        # Dentro de cada movimiento, con su nombre y después de los campos fijos; vacío va como null.
+        self.assertEqual(list(datos["Transacciones"][0]), ["fecha", "concepto", "referencia", "cargo", "abono", "saldo", "VSM", "Notas"])
+        self.assertEqual((datos["Transacciones"][0]["VSM"], datos["Transacciones"][0]["Notas"]), ("12.5", None))
+        self.assertEqual(datos["Datos"], {})
         self.assertNotIn("campos_extra", datos)
 
 

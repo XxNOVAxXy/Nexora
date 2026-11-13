@@ -16,7 +16,10 @@ export type VistaPreviaEnvio = {
   interno: {
     Archivo: string | null
     Resumen: Record<string, string>
-    Transacciones: { fecha: string; concepto: string; referencia: string; cargo: string; abono: string; saldo: string }[]
+    /** Campos "Una vez" (datos del documento): {"Nombre del campo": valor}; null si no se encontró. */
+    Datos: Record<string, string | null>
+    /** Campos fijos más los campos "En cada movimiento" con su nombre (null si están vacíos). */
+    Transacciones: ({ fecha: string; concepto: string; referencia: string; cargo: string; abono: string; saldo: string } & Record<string, string | null>)[]
     Validacion: { cuadra: boolean | null; suma_cargos: string; suma_abonos: string }
   }
   totales: { abonos: string; cargos: string }

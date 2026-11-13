@@ -318,8 +318,10 @@ class ColumnasYBorrador(Base):
         self.assertEqual(self.gemini.llamadas, [("Nombre", "RFC")])
         guardado = self.almacen.obtener(EMAIL, "m1", "1")
         self.assertEqual([c["nombre"] for c in guardado["campos_extra"]], ["Nombre", "RFC"])
-        # Valor único del documento: una sola vez en el campo, nunca en cada movimiento.
-        self.assertEqual([(c["alcance"], c["valor"], c["valor_ia"]) for c in guardado["campos_extra"]], [("documento", "Persona", True)] * 2)
+        # Sin configuración guardada se usan los campos deducidos, con su tipo ("En cada movimiento") y vinculados.
+        self.assertEqual([c.get("plantilla_id") for c in guardado["campos_extra"]], ["pl-nombre", "pl-rfc"])
+        # El tipo configurado manda: un valor único del documento no se repite en cada movimiento.
+        self.assertTrue(all("alcance" not in c for c in guardado["campos_extra"]))
         self.assertTrue(all("extras" not in t for t in guardado["transacciones"]))
         self.assertEqual([s["clave"] for s in guardado["sugerencias_campos"]], ["folio"])
 
@@ -332,7 +334,7 @@ class ColumnasYBorrador(Base):
         self.assertEqual(len({n.lower().replace(" ", "") for n in nombres}), 30)
 
     def test_borrador_equivale_al_del_frontend(self) -> None:
-        solicitud = borrador_desde_extraccion(_resultado(["Nombre"]), ["Nombre"], filename="e.pdf", attachment_id="att", lote="L")
+        solicitud = borrador_desde_extraccion(_resultado(["Nombre"]), [{"id": "pl-nombre", "nombre": "Nombre", "alcance": "documento"}], filename="e.pdf", attachment_id="att", lote="L")
         self.assertEqual([t.id for t in solicitud.transacciones], ["ia-L-1", "ia-L-2"])
         self.assertTrue(all(t.origen == "ia" for t in solicitud.transacciones))
         self.assertEqual(solicitud.estado, "borrador")
@@ -342,9 +344,9 @@ class ColumnasYBorrador(Base):
     def test_valores_por_huella(self) -> None:
         resultado = _resultado()
         resultado["resultados_campos"] = [{"nombre": "Folio", "clave": "folio", "encontrado": True, "valores": [{"huella": "h2", "valor": "F2"}]}]
-        solicitud = borrador_desde_extraccion(resultado, ["Folio"], filename="e.pdf", attachment_id=None, lote="L")
+        solicitud = borrador_desde_extraccion(resultado, [{"id": "pl-folio", "nombre": "Folio", "alcance": "movimiento"}], filename="e.pdf", attachment_id=None, lote="L")
         self.assertIsNone(solicitud.transacciones[0].extras)
-        self.assertEqual(solicitud.transacciones[1].extras, {"campo-auto-L-1": "F2"})
+        self.assertEqual(solicitud.transacciones[1].extras, {"pl-folio": "F2"})
 
 
 class Programacion(Base):

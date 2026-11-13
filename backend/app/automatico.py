@@ -38,7 +38,6 @@ from .extracciones import (
     MAX_VALOR_CAMPO,
     ConflictoVersion,
     EnvioEnCurso,
-    ExtraccionDanada,
     GuardarExtraccionRequest,
     cuenta_id,
     escribir_atomico,
@@ -46,6 +45,7 @@ from .extracciones import (
 from .gemini import GeminiRequestError, GeminiUnavailableError, clave_campo, normalizar_campos_solicitados
 from .gmail import GmailNotConnectedError, GmailRateLimitError
 from .orden_fechas import ordenar_por_fecha
+from .plantilla_campos import AlmacenPlantillas, deducir_campos
 
 logger = logging.getLogger("nexora.automatico")
 
@@ -95,24 +95,34 @@ class _CortarCiclo(Exception):
 
 # --- Conversión del resultado de Gemini en borrador (port de documentoDesdeExtraccion del frontend) ----------
 
-def borrador_desde_extraccion(resultado: dict[str, Any], campos: list[str], *, filename: str, attachment_id: str | None, lote: str, alcances: dict[str, str] | None = None) -> GuardarExtraccionRequest:
-    """Documento nuevo (sin filas previas): filas de la IA con ids únicos del lote y ordenadas por fecha, las columnas
-    pedidas creadas como campos del usuario y llenadas con lo que la IA encontró, y las sugerencias de la IA guardadas
-    para el menú "+ Campo" (no se convierten en campos: eso lo decide el usuario).
+def _valor_unico(valores: list[dict[str, Any]]) -> str | None:
+    """Valores por fila que en realidad son uno solo: todos iguales (y no vacíos)."""
+    distintos = {str(item.get("valor") or "").strip() for item in valores} - {""}
+    return distintos.pop()[:MAX_VALOR_CAMPO] if len(distintos) == 1 else None
 
-    El tipo de cada campo lo decide la IA: un valor único del documento se guarda una sola vez en el campo
-    (``alcance="documento"``) y valores por fila llenan el renglón de cada movimiento (celdas en ``extras_ia``).
-    Si la IA no lo encontró, el campo conserva el tipo que tenía en la extracción de la que salió (``alcances``,
-    por clave del nombre).
+
+def borrador_desde_extraccion(resultado: dict[str, Any], campos: list[dict[str, Any]], *, filename: str, attachment_id: str | None, lote: str) -> GuardarExtraccionRequest:
+    """Documento nuevo (sin filas previas) a partir de la configuración de campos.
+
+    Filas de la IA con ids únicos del lote y ordenadas por fecha; los campos configurados creados vinculados a la
+    configuración (``plantilla_id``) y llenados con lo que la IA encontró; las sugerencias de la IA guardadas para el
+    menú "+ Campo" (no se convierten en campos: eso lo decide el usuario).
+
+    El tipo configurado manda:
+    - "Una vez" (documento): toma el valor único; si la IA lo encontró por fila con todos los valores iguales, se
+      acepta como valor único. Con valores distintos no se llena (hay que revisar el tipo en Configuración).
+    - "En cada movimiento": toma los valores por fila; un valor único del documento no se repite en cada fila.
     """
     transacciones = [
         {**fila, "id": f"ia-{lote}-{indice + 1}", "origen": "ia"}
         for indice, fila in enumerate(ordenar_por_fecha(list(resultado.get("transacciones") or []), (resultado.get("resumen") or {}).get("periodo", "")))
     ]
     columnas: list[dict[str, Any]] = []
-    for indice, nombre in enumerate(campos[:MAX_CAMPOS_EXTRA]):
-        columna: dict[str, Any] = {"id": f"campo-auto-{lote}-{indice + 1}", "nombre": nombre, "origen": "manual"}
-        if (alcances or {}).get(clave_campo(nombre)) == "documento":
+    for configurado in campos[:MAX_CAMPOS_EXTRA]:
+        columna: dict[str, Any] = {"id": configurado["id"], "nombre": configurado["nombre"], "origen": configurado.get("origen", "manual"), "plantilla_id": configurado["id"]}
+        if configurado.get("clave"):
+            columna["clave"] = configurado["clave"]
+        if configurado.get("alcance") == "documento":
             columna.update(alcance="documento", valor="")
         columnas.append(columna)
     resultados = {clave_campo(item.get("nombre", "")): item for item in resultado.get("resultados_campos") or []}
@@ -122,13 +132,13 @@ def borrador_desde_extraccion(resultado: dict[str, Any], campos: list[str], *, f
             continue
         valores = encontrado.get("valores") or []
         unico = (encontrado.get("valor_documento") or "").strip()[:MAX_VALOR_CAMPO]
-        if not valores:
-            # Valor único del documento: una sola vez en el campo, nunca repetido en cada movimiento.
-            if unico:
-                columna.update(alcance="documento", valor=unico, valor_ia=True)
+        if columna.get("alcance") == "documento":
+            valor = unico if not valores else _valor_unico(valores)
+            if valor:
+                columna.update(valor=valor, valor_ia=True)
             continue
-        columna.pop("alcance", None)
-        columna.pop("valor", None)
+        if not valores:
+            continue  # Valor único del documento en un campo "En cada movimiento": nunca se repite en cada fila.
         por_huella: dict[str, list[str]] = {}
         for item in valores:
             por_huella.setdefault(item.get("huella", ""), []).append(item.get("valor", ""))
@@ -163,8 +173,11 @@ class ExtractorAutomatico:
         almacen: Any,
         intervalo_minutos: float = INTERVALO_PREDETERMINADO,
         reloj: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        plantillas: AlmacenPlantillas | None = None,
     ) -> None:
         self.raiz = raiz
+        # Configuración de campos; sin ella, la lista efectiva es la deducida de las extracciones guardadas.
+        self.plantillas = plantillas or AlmacenPlantillas(raiz / "_sin_configuracion", lambda email: deducir_campos(almacen, email))
         self.gmail = gmail
         self.gemini = gemini
         self.almacen = almacen
@@ -176,8 +189,6 @@ class ExtractorAutomatico:
         self._despertar = threading.Event()
         self._hilo: threading.Thread | None = None
         self._proxima: datetime | None = None
-        # Tipo de cada campo en las extracciones guardadas; se calcula al inicio de cada ciclo.
-        self._alcances: dict[str, str] = {}
 
     # --- Estado persistente -------------------------------------------------------------------
 
@@ -222,29 +233,13 @@ class ExtractorAutomatico:
             self.revisar_ahora()
         return self.estado(email)
 
-    def _campos_guardados(self, email: str) -> list[dict[str, Any]]:
-        """Campos que el usuario agregó o aceptó en sus extracciones guardadas, las más recientes primero."""
-        listado = sorted(self.almacen.listar(email), key=lambda item: item.get("actualizado") or "", reverse=True)
-        campos: list[dict[str, Any]] = []
-        for entrada in listado:
-            try:
-                documento = self.almacen.obtener(email, entrada["messageId"], entrada["partId"])
-            except (ExtraccionDanada, ValueError, TypeError, KeyError):
-                continue
-            campos += list((documento or {}).get("campos_extra") or [])
-        return campos
+    def campos_configurados(self, email: str) -> list[dict[str, Any]]:
+        """Campos de la configuración (o, si nunca se guardó, los deducidos de las extracciones guardadas)."""
+        return self.plantillas.efectiva(email)
 
     def campos_a_buscar(self, email: str) -> list[str]:
-        """Columnas que el usuario agregó o aceptó en sus extracciones guardadas (más recientes primero, máx. 30).
-        Las sugerencias que no eligió no están en ``campos_extra`` y nunca se piden."""
-        return normalizar_campos_solicitados([campo.get("nombre", "") for campo in self._campos_guardados(email)])[:MAX_CAMPOS_EXTRA]
-
-    def alcances_guardados(self, email: str) -> dict[str, str]:
-        """Tipo de cada campo (por clave del nombre) en la extracción más reciente que lo tiene."""
-        alcances: dict[str, str] = {}
-        for campo in self._campos_guardados(email):
-            alcances.setdefault(clave_campo(campo.get("nombre", "")), campo.get("alcance") or "movimiento")
-        return alcances
+        """Nombres que se piden a Gemini: los de la configuración de campos."""
+        return normalizar_campos_solicitados([campo["nombre"] for campo in self.campos_configurados(email)])[:MAX_CAMPOS_EXTRA]
 
     def estado(self, email: str) -> dict[str, Any]:
         estado = self._leer(email)
@@ -363,8 +358,7 @@ class ExtractorAutomatico:
         return list(dict.fromkeys([*pendientes, *ids]))
 
     def _procesar(self, email: str, estado: dict[str, Any], activado: datetime, resumen: dict[str, Any]) -> None:
-        campos = self.campos_a_buscar(email)
-        self._alcances = self.alcances_guardados(email)
+        campos = self.campos_configurados(email)
         ultimo: dict[str, Any] | None = estado.get("ultimo_correo")
         for message_id in self._candidatos(estado, activado):
             if self._parar.is_set():
@@ -389,7 +383,7 @@ class ExtractorAutomatico:
                 ultimo = {"id": message_id, "recibido": _iso(recibido)}
                 self._mutar(email, lambda e, u=ultimo: e.__setitem__("ultimo_correo", u))
 
-    def _procesar_adjunto(self, email: str, message_id: str, part_id: str, adjunto: dict[str, Any], campos: list[str], resumen: dict[str, Any]) -> str:
+    def _procesar_adjunto(self, email: str, message_id: str, part_id: str, adjunto: dict[str, Any], campos: list[dict[str, Any]], resumen: dict[str, Any]) -> str:
         clave = f"{message_id}__{part_id}"
         entrada = self._leer(email)["adjuntos"].get(clave) or {}
         if entrada.get("estado") in TERMINALES:
@@ -411,7 +405,7 @@ class ExtractorAutomatico:
         attachment_id = str(adjunto.get("id") or "")
         try:
             data, media_type, nombre = self.gmail.attachment(message_id, attachment_id)
-            resultado = self.gemini.extract_document(data, media_type, nombre or filename, campos_solicitados=campos)
+            resultado = self.gemini.extract_document(data, media_type, nombre or filename, campos_solicitados=[campo["nombre"] for campo in campos])
         except (GmailRateLimitError, GmailNotConnectedError, GeminiUnavailableError) as error:
             # No es culpa del documento: el intento no cuenta y se sigue en el siguiente ciclo.
             self._anotar(email, clave, estado="pendiente", intentos=intentos, error=str(error))
@@ -426,7 +420,7 @@ class ExtractorAutomatico:
             return self._fallo(email, clave, intentos + 1, str(error) or error.__class__.__name__, resumen)
 
         try:
-            solicitud = borrador_desde_extraccion(resultado, campos, filename=nombre or filename, attachment_id=attachment_id or None, lote=uuid.uuid4().hex[:8], alcances=self._alcances)
+            solicitud = borrador_desde_extraccion(resultado, campos, filename=nombre or filename, attachment_id=attachment_id or None, lote=uuid.uuid4().hex[:8])
             documento = self.almacen.guardar(email, message_id, part_id, solicitud)
         except (ConflictoVersion, EnvioEnCurso):
             # El usuario guardó este documento mientras Gemini extraía: lo suyo se conserva.

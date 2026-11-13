@@ -53,6 +53,10 @@ class ApiExtraccionesTests(unittest.TestCase):
         almacen = patch.object(main, "almacen", AlmacenExtracciones(Path(self.directorio.name)))
         almacen.start()
         self.addCleanup(almacen.stop)
+        # Configuración de campos aislada: nunca la del usuario en backend/data.
+        plantillas = patch.object(main, "plantillas", main.AlmacenPlantillas(Path(self.directorio.name, "plantillas")))
+        plantillas.start()
+        self.addCleanup(plantillas.stop)
         perfil = patch.object(main.gmail, "profile", side_effect=lambda: {"email": self.email})
         perfil.start()
         self.addCleanup(perfil.stop)
