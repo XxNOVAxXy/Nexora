@@ -51,7 +51,11 @@ def _nombre_campo(valor: str) -> str:
 
 
 class CampoExtraGuardado(BaseModel):
-    """Columna adicional de la tabla. ``clave`` enlaza la columna con la sugerencia de la IA que la creó."""
+    """Campo adicional. ``clave`` enlaza el campo con la sugerencia de la IA que lo creó.
+
+    ``alcance="documento"``: dato que aparece una sola vez en el estado de cuenta (RFC, número de crédito…); su valor
+    se guarda una sola vez en ``valor`` y nunca en cada movimiento. Sin ``alcance``: un valor por movimiento.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -59,6 +63,18 @@ class CampoExtraGuardado(BaseModel):
     nombre: str = Field(max_length=200)
     origen: Literal["ia", "manual"]
     clave: str | None = Field(default=None, max_length=64)
+    alcance: Literal["movimiento", "documento"] | None = None
+    valor: str | None = Field(default=None, max_length=MAX_VALOR_CAMPO)
+    valor_ia: bool | None = None
+
+    @model_validator(mode="after")
+    def _valor_solo_del_documento(self) -> "CampoExtraGuardado":
+        if self.alcance != "documento":
+            self.alcance, self.valor, self.valor_ia = None, None, None
+        else:
+            self.valor = (self.valor or "").strip()
+            self.valor_ia = True if self.valor_ia and self.valor else None
+        return self
 
     @field_validator("nombre")
     @classmethod
@@ -186,7 +202,8 @@ class GuardarExtraccionRequest(BaseModel):
     @model_validator(mode="after")
     def _extras_de_campos_existentes(self) -> "GuardarExtraccionRequest":
         """Descarta valores de columnas que no existen (y los vacíos): nunca se guardan datos huérfanos."""
-        ids = {campo.id for campo in self.campos_extra}
+        # Los campos del documento guardan su valor una sola vez: nunca se repite en cada movimiento.
+        ids = {campo.id for campo in self.campos_extra if campo.alcance != "documento"}
         for transaccion in self.transacciones:
             if transaccion.extras:
                 limpios = {clave: texto for clave, texto in transaccion.extras.items() if clave in ids and texto.strip()}
@@ -240,6 +257,47 @@ def contar_problemas(validacion: dict[str, Any], resumen: dict[str, Any], transa
         "validacion_incompleta": incompleta,
         "total": total,
     }
+
+
+def migrar_columnas_unicas(documento: dict[str, Any]) -> dict[str, Any]:
+    """Extracciones guardadas antes de los datos del documento: una columna por movimiento con el mismo valor (no
+    vacío) en todos los movimientos (2 o más) se devuelve como dato del documento, con ese valor una sola vez.
+    No reescribe el archivo: queda así en disco la próxima vez que el usuario guarde."""
+    campos = documento.get("campos_extra") or []
+    transacciones = documento.get("transacciones") or []
+    if len(transacciones) < 2 or not campos:
+        return documento
+    nuevos_campos: list[dict[str, Any]] = []
+    convertidos: set[str] = set()
+    for campo in campos:
+        if campo.get("alcance") == "documento":
+            nuevos_campos.append(campo)
+            continue
+        valores = {(t.get("extras") or {}).get(campo.get("id"), "").strip() for t in transacciones}
+        if len(valores) != 1 or "" in valores:
+            nuevos_campos.append(campo)
+            continue
+        de_ia = all(campo.get("id") in (t.get("extras_ia") or []) for t in transacciones)
+        nuevo = {**campo, "alcance": "documento", "valor": valores.pop()}
+        if de_ia:
+            nuevo["valor_ia"] = True
+        nuevos_campos.append(nuevo)
+        convertidos.add(campo.get("id"))
+    if not convertidos:
+        return documento
+    nuevas: list[dict[str, Any]] = []
+    for transaccion in transacciones:
+        fila = dict(transaccion)
+        extras = {clave: valor for clave, valor in (fila.get("extras") or {}).items() if clave not in convertidos}
+        marcadas = [clave for clave in (fila.get("extras_ia") or []) if clave not in convertidos]
+        fila.pop("extras", None)
+        fila.pop("extras_ia", None)
+        if extras:
+            fila["extras"] = extras
+        if marcadas:
+            fila["extras_ia"] = marcadas
+        nuevas.append(fila)
+    return {**documento, "campos_extra": nuevos_campos, "transacciones": nuevas}
 
 
 def escribir_atomico(ruta: Path, datos: dict[str, Any]) -> None:
@@ -301,7 +359,7 @@ class AlmacenExtracciones:
 
     def obtener(self, email: str, message_id: str, part_id: str) -> dict[str, Any] | None:
         documento = self._leer(self._ruta(email, message_id, part_id))
-        return None if documento is None else self._publica(documento)
+        return None if documento is None else migrar_columnas_unicas(self._publica(documento))
 
     def listar(self, email: str) -> list[dict[str, Any]]:
         directorio = self.raiz / cuenta_id(email)

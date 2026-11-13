@@ -92,7 +92,28 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
+/** Encabezado «Movimiento N» de la columna a la que pertenece una casilla (ahí están sus etiquetas). */
+const columnaDe = (casilla: HTMLElement) => {
+  const numero = /del movimiento (\d+)$/.exec(casilla.getAttribute('aria-label') ?? '')?.[1]
+  return screen.getByRole('columnheader', { name: `Movimiento ${numero}` })
+}
+
 describe('verificación visual', () => {
+  it('un dato del documento (como el RFC) se copia haciendo clic en cualquier texto del documento', async () => {
+    guardado = { ...extraccionGuardada(capturados()), campos_extra: [{ id: 'c-cli', nombre: 'Cliente', origen: 'manual', alcance: 'documento', valor: '' }] }
+    montar('estado-a.pdf', FICTICIO)
+    await cobertura('movimientos')
+
+    fireEvent.focus(screen.getByLabelText('Cliente del documento'))
+    expect(await screen.findByText('Cliente del documento')).toBeTruthy()
+    // Todo el texto del documento se puede pulsar, no solo los datos reconocidos.
+    fireEvent.click(screen.getAllByRole('button', { name: /^Texto del documento «.*CLIENTE DE PRUEBA NEXORA.*»/ })[0])
+    expect((screen.getByLabelText('Cliente del documento') as HTMLInputElement).value).toMatch(/CLIENTE DE PRUEBA NEXORA$/)
+    expect(screen.getByText(/^Copiado a Cliente del documento:/)).toBeTruthy()
+    expect(screen.queryAllByRole('button', { name: /^Texto del documento/ })).toHaveLength(0)
+    expect(screen.getAllByText('Cambios sin guardar').length).toBeGreaterThan(0)
+  })
+
   it('marca lo capturado contra el PDF y copia un importe normalizado al hacer clic en el documento', async () => {
     const transacciones = capturados()
     transacciones[1] = { ...transacciones[1], cargo: '' }
@@ -110,7 +131,7 @@ describe('verificación visual', () => {
     fireEvent.click(recuadro('Cargo: documento «4,250.00», capturado «vacío». Falta capturar'))
 
     expect((screen.getByLabelText('Cargo del movimiento 2') as HTMLInputElement).value).toBe('4250.00')
-    const fila = screen.getByLabelText('Cargo del movimiento 2').closest('tr')!
+    const fila = columnaDe(screen.getByLabelText('Cargo del movimiento 2'))
     expect(within(fila).getByText('IA editada')).toBeTruthy()
     expect(await cobertura('movimientos')).toContain('75 coinciden · 0 con diferencia · 0 faltantes')
     // Es un cambio sin guardar como cualquier edición.
@@ -147,7 +168,7 @@ describe('verificación visual', () => {
 
     expect(await cobertura('movimientos')).toContain('5 faltantes')
     expect(screen.getByText('1 movimiento capturado no aparece en el documento')).toBeTruthy()
-    const extra = screen.getByDisplayValue('MOVIMIENTO INVENTADO').closest('tr')!
+    const extra = columnaDe(screen.getByDisplayValue('MOVIMIENTO INVENTADO'))
     expect(within(extra).getByText('No aparece en el documento')).toBeTruthy()
 
     fireEvent.click(recuadro('Concepto: documento «PAGO DE SERVICIOS», capturado «vacío». Falta capturar'))
@@ -159,7 +180,7 @@ describe('verificación visual', () => {
     expect((screen.getByLabelText('Concepto del movimiento 5') as HTMLTextAreaElement).value).toBe('PAGO DE SERVICIOS')
     expect((screen.getByLabelText('Cargo del movimiento 5') as HTMLInputElement).value).toBe('1875.50')
     expect((screen.getByLabelText('Saldo del movimiento 5') as HTMLInputElement).value).toBe('37474.50')
-    expect(within(screen.getByLabelText('Cargo del movimiento 5').closest('tr')!).getByText('Manual')).toBeTruthy()
+    expect(within(columnaDe(screen.getByLabelText('Cargo del movimiento 5'))).getByText('Manual')).toBeTruthy()
     expect(await cobertura('movimientos')).toContain('75 coinciden · 0 con diferencia · 0 faltantes')
   })
 

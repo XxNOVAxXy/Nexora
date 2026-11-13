@@ -13,7 +13,8 @@ export type EstadoVerificacion = 'coincide' | 'difiere' | 'falta' | 'no_se_captu
 export type CampoVerificable = CampoMovimientoDocumento | CampoResumenDocumento
 export type MarcaVerificacion = {
   id: string
-  grupo: 'resumen' | 'movimientos'
+  /** 'texto': cualquier texto del documento, clicable para copiarlo a un dato del documento (RFC, etc.). */
+  grupo: 'resumen' | 'movimientos' | 'texto'
   campo: CampoVerificable
   etiqueta: string
   textoDocumento: string

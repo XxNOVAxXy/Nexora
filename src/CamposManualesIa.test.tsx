@@ -42,7 +42,7 @@ function montar() {
   return render(<RouterProvider router={router} />)
 }
 const celda = (campo: string, fila: number) => screen.getByLabelText(`${campo} del movimiento ${fila}`) as HTMLInputElement
-const encabezado = (campo: string) => screen.getByRole('button', { name: `Renombrar el campo ${campo}` }).closest('th') as HTMLElement
+const encabezado = (campo: string) => screen.getByRole('button', { name: `Renombrar el campo ${campo}` }).closest('[data-campo]') as HTMLElement
 
 beforeEach(() => {
   guardado = base()
@@ -108,10 +108,51 @@ describe('la IA llena columnas manuales', () => {
 
     const aviso = await screen.findByText('Extracción combinada con tus correcciones.')
     const contenedor = aviso.closest('[role="status"]') as HTMLElement
-    expect(within(contenedor).getByText('Se llenaron 2 celdas de «Nombre».')).toBeTruthy()
+    expect(within(contenedor).getByText('La IA encontró «Nombre» una sola vez en el documento (Persona Prueba); no se repitió en cada movimiento y lo capturado no cambió.')).toBeTruthy()
     expect(within(contenedor).getByText('No se encontró «Folio» en el documento.')).toBeTruthy()
     expect(vi.mocked(geminiApi.extract).mock.calls[0][2]).toMatchObject({ forzar: true, campos: ['Nombre', 'Folio'] })
-    expect([1, 2, 3].map((n) => celda('Nombre', n).value)).toEqual(['Juan', 'Persona Prueba', 'Persona Prueba'])
+    // «Nombre» ya tenía «Juan» en un movimiento: el dato único del documento no se repite en cada fila.
+    expect([1, 2, 3].map((n) => celda('Nombre', n).value)).toEqual(['Juan', '', ''])
     expect(within(encabezado('Folio')).getByText('No se encontró «Folio» en el documento.')).toBeTruthy()
+  })
+})
+
+describe('datos del documento y movimientos numerados', () => {
+  it('"Llenar con IA" en un dato del documento llena su único valor, sin repetirlo en los movimientos', async () => {
+    guardado = { ...base(), campos_extra: [...base().campos_extra!, { id: 'c-rfc', nombre: 'RFC', origen: 'manual', alcance: 'documento', valor: '' }] }
+    vi.mocked(geminiApi.llenarCampo).mockResolvedValue({ nombre: 'RFC', encontrado: true, valores: [], valor_documento: 'XAXX010101000' })
+    montar()
+    const boton = await screen.findByRole('button', { name: 'Llenar con IA el campo RFC' })
+    await waitFor(() => expect((boton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(boton)
+    expect(await within(encabezado('RFC')).findByText('«RFC» aparece una sola vez en el documento: se guardó una vez, no en cada movimiento.')).toBeTruthy()
+    expect((screen.getByLabelText('RFC del documento') as HTMLInputElement).value).toBe('XAXX010101000')
+    expect(screen.queryByLabelText('RFC del movimiento 1')).toBeNull()
+  })
+
+  it('el usuario corrige el tipo de un campo en las dos direcciones, sin perder datos', async () => {
+    montar()
+    await screen.findByLabelText('Folio del movimiento 1')
+    fireEvent.click(screen.getByRole('button', { name: 'Cambiar Folio a dato del documento' }))
+    expect(screen.getByLabelText('Folio del documento')).toBeTruthy()
+    expect(screen.queryByLabelText('Folio del movimiento 1')).toBeNull()
+    fireEvent.change(screen.getByLabelText('Folio del documento'), { target: { value: 'F-9' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Cambiar Folio a un valor en cada movimiento' }))
+    expect([1, 2, 3].map((n) => celda('Folio', n).value)).toEqual(['F-9', 'F-9', 'F-9'])
+
+    // «Nombre» con valores distintos no puede ser un dato único del documento.
+    fireEvent.change(celda('Nombre', 2), { target: { value: 'Ana' } })
+    expect((screen.getByRole('button', { name: 'Cambiar Nombre a dato del documento' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('cada movimiento es una columna numerada y escribir otro número lo mueve', async () => {
+    montar()
+    await screen.findByLabelText('Concepto del movimiento 1')
+    expect(screen.getAllByRole('columnheader', { name: /^Movimiento \d+$/ })).toHaveLength(3)
+    const numero = screen.getByLabelText('Número del movimiento 3')
+    fireEvent.change(numero, { target: { value: '1' } })
+    fireEvent.blur(numero)
+    expect([1, 2, 3].map((n) => (screen.getByLabelText(`Concepto del movimiento ${n}`) as HTMLTextAreaElement).value)).toEqual(['PAGO C', 'PAGO A', 'PAGO B'])
+    expect(screen.getByText('Cambios sin guardar')).toBeTruthy()
   })
 })

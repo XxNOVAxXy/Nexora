@@ -1,7 +1,10 @@
-import type { CampoExtra, ResultadoCampo, SugerenciaCampo, Transaccion } from '../types'
+import type { AlcanceCampo, CampoExtra, ResultadoCampo, SugerenciaCampo, Transaccion } from '../types'
 
 /**
- * Columnas adicionales de la tabla de Movimientos (botón "+ Campo").
+ * Campos adicionales de Movimientos (botón "+ Campo"). Hay dos tipos:
+ * - del documento (`alcance: 'documento'`): un dato que aparece una sola vez (RFC, número de crédito…). Se guarda
+ *   una sola vez en el propio campo y nunca se repite en cada movimiento;
+ * - por movimiento: un valor en cada movimiento (`extras`).
  * Se editan, se guardan y se conservan al re-extraer como las demás columnas, pero no entran en la validación
  * contable ni se envían a SaveData. La IA puede llenar las celdas vacías de las columnas manuales; esas celdas
  * quedan marcadas en `extras_ia` hasta que el usuario las edite.
@@ -16,6 +19,9 @@ const nuevoIdCampo = () => {
   secuencia += 1
   return `campo-${Date.now().toString(36)}-${secuencia}`
 }
+
+/** ¿El campo es un dato único del documento (no uno por movimiento)? */
+export const esDelDocumento = (campo: CampoExtra) => campo.alcance === 'documento'
 
 /** Nombre comparable: sin acentos, sin mayúsculas y con espacios simples ("Número  de crédito" = "numero de credito"). */
 export const nombreComparable = (nombre: string) => nombre.normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim().toLowerCase()
@@ -96,13 +102,25 @@ export type ColumnasDocumento = { transacciones: Transaccion[]; campos_extra: Ca
 export function aplicarSugerencia(documento: ColumnasDocumento, sugerencia: SugerenciaCampo): ColumnasDocumento {
   if (documento.campos_extra.length >= MAX_CAMPOS_EXTRA) return documento
   const campo: CampoExtra = { id: nuevoIdCampo(), nombre: limpiarNombre(sugerencia.nombre).slice(0, MAX_NOMBRE_CAMPO), origen: 'ia', clave: sugerencia.clave }
+  // Un valor único del documento se guarda una sola vez en el campo, no en cada movimiento.
+  if (sugerencia.valores.length === 0) return { ...documento, campos_extra: [...documento.campos_extra, { ...campo, alcance: 'documento', valor: (sugerencia.valor_documento ?? '').slice(0, MAX_VALOR_CAMPO) }] }
   return { campos_extra: [...documento.campos_extra, campo], transacciones: llenarColumna(documento.transacciones, campo.id, fuenteDeSugerencia(sugerencia), { soloVacias: false, marcar: false }).transacciones }
 }
 
-/** Agrega una columna vacía con el nombre que escribió el usuario (validado antes con errorNombreCampo). */
-export function agregarCampoManual(campos: CampoExtra[], nombre: string): CampoExtra[] {
+/** Agrega un campo vacío con el nombre que escribió el usuario (validado antes con errorNombreCampo). */
+export function agregarCampoManual(campos: CampoExtra[], nombre: string, alcance: AlcanceCampo = 'movimiento'): CampoExtra[] {
   if (campos.length >= MAX_CAMPOS_EXTRA || errorNombreCampo(nombre, campos)) return campos
-  return [...campos, { id: nuevoIdCampo(), nombre: limpiarNombre(nombre), origen: 'manual' }]
+  const campo: CampoExtra = { id: nuevoIdCampo(), nombre: limpiarNombre(nombre), origen: 'manual' }
+  return [...campos, alcance === 'documento' ? { ...campo, alcance, valor: '' } : campo]
+}
+
+/** Edición a mano del valor de un campo del documento: deja de contar como llenado por la IA. */
+export function editarValorDocumento(campos: CampoExtra[], id: string, valor: string): CampoExtra[] {
+  return campos.map((campo) => {
+    if (campo.id !== id || (campo.valor ?? '') === valor) return campo
+    const { valor_ia: _ia, ...resto } = campo
+    return { ...resto, valor: valor.slice(0, MAX_VALOR_CAMPO) }
+  })
 }
 
 export function renombrarCampo(campos: CampoExtra[], id: string, nombre: string): CampoExtra[] {
@@ -124,8 +142,10 @@ export function eliminarCampo(documento: ColumnasDocumento, id: string): Columna
 export type ResultadoLlenado = {
   campoId: string
   nombre: string
-  estado: 'no_encontrado' | 'llenado' | 'completa' | 'sin_valores_para_vacias'
+  estado: 'no_encontrado' | 'llenado' | 'completa' | 'sin_valores_para_vacias' | 'dato_del_documento' | 'unico_con_valores' | 'por_movimiento'
   llenadas: number
+  /** Valor único que encontró la IA (para explicar por qué no se repitió en cada movimiento). */
+  valor?: string
 }
 
 export function mensajeLlenado(resultado: ResultadoLlenado): string {
@@ -135,47 +155,124 @@ export function mensajeLlenado(resultado: ResultadoLlenado): string {
     case 'llenado': return `Se llenaron ${llenadas} celda${llenadas === 1 ? '' : 's'} de «${nombre}».`
     case 'completa': return 'La columna ya estaba completa; no se cambió nada.'
     case 'sin_valores_para_vacias': return `La IA encontró «${nombre}», pero no para las celdas vacías; no se cambió nada.`
+    case 'dato_del_documento': return `«${nombre}» aparece una sola vez en el documento: se guardó una vez, no en cada movimiento.`
+    case 'unico_con_valores': return `La IA encontró «${nombre}» una sola vez en el documento (${resultado.valor ?? ''}); no se repitió en cada movimiento y lo capturado no cambió.`
+    case 'por_movimiento': return `La IA encontró «${nombre}» en cada movimiento, no como un dato único; no se cambió nada.`
   }
 }
 
 /** Nombres de las columnas manuales que se piden a Gemini al extraer. */
 export const camposParaSolicitar = (campos: CampoExtra[]) => campos.filter((campo) => campo.origen === 'manual').map((campo) => campo.nombre)
 
-/** Llena las celdas vacías de una columna manual con lo que encontró la IA y describe el resultado. */
-export function llenarColumnaManual(transacciones: Transaccion[], campo: CampoExtra, encontrado: boolean, fuente: FuenteValores): { transacciones: Transaccion[]; resultado: ResultadoLlenado } {
+/**
+ * Llena un campo manual con lo que encontró la IA y describe el resultado. Nunca sobrescribe lo ya capturado.
+ * Un valor único del documento no se repite en cada movimiento: se guarda una vez en el campo (si el campo todavía
+ * no tiene valores por movimiento, pasa a ser un dato del documento).
+ */
+export function llenarColumnaManual(transacciones: Transaccion[], campo: CampoExtra, encontrado: boolean, fuente: FuenteValores): { transacciones: Transaccion[]; campo: CampoExtra; resultado: ResultadoLlenado } {
   const base = { campoId: campo.id, nombre: campo.nombre }
+  const sinCambios = (estado: ResultadoLlenado['estado'], extra: Partial<ResultadoLlenado> = {}) => ({ transacciones, campo, resultado: { ...base, estado, llenadas: 0, ...extra } })
+  if (!encontrado) return sinCambios('no_encontrado')
+  const unico = 'unico' in fuente ? fuente.unico.trim().slice(0, MAX_VALOR_CAMPO) : null
+  if (unico !== null && !unico) return sinCambios('no_encontrado')
+  if (esDelDocumento(campo)) {
+    if (unico === null) return sinCambios('por_movimiento')
+    if (campo.valor?.trim()) return sinCambios('completa')
+    return { transacciones, campo: { ...campo, valor: unico, valor_ia: true }, resultado: { ...base, estado: 'dato_del_documento', llenadas: 1 } }
+  }
+  if (unico !== null) {
+    const conValores = transacciones.some((transaccion) => transaccion.extras?.[campo.id]?.trim())
+    if (conValores) return sinCambios('unico_con_valores', { valor: unico })
+    return { transacciones, campo: { ...campo, alcance: 'documento', valor: unico, valor_ia: true }, resultado: { ...base, estado: 'dato_del_documento', llenadas: 1 } }
+  }
   const tieneVacias = transacciones.some((transaccion) => !transaccion.extras?.[campo.id]?.trim())
-  if (!encontrado) return { transacciones, resultado: { ...base, estado: 'no_encontrado', llenadas: 0 } }
-  if (!tieneVacias) return { transacciones, resultado: { ...base, estado: 'completa', llenadas: 0 } }
+  if (!tieneVacias) return sinCambios('completa')
   const llenado = llenarColumna(transacciones, campo.id, fuente, { soloVacias: true, marcar: true })
-  return { transacciones: llenado.transacciones, resultado: { ...base, estado: llenado.llenadas > 0 ? 'llenado' : 'sin_valores_para_vacias', llenadas: llenado.llenadas } }
+  return { transacciones: llenado.transacciones, campo, resultado: { ...base, estado: llenado.llenadas > 0 ? 'llenado' : 'sin_valores_para_vacias', llenadas: llenado.llenadas } }
 }
 
 /**
- * Tras extraer o re-extraer: las columnas y lo capturado se conservan (combinarExtraccion ya pasó los valores de las
- * filas de la IA sin editar a su fila nueva). Las celdas vacías de las columnas de la IA se rellenan con las nuevas
- * sugerencias, y las de las columnas manuales con lo que la IA encontró al buscarlas. Solo se llenan celdas vacías.
+ * Tras extraer o re-extraer: los campos y lo capturado se conservan (combinarExtraccion ya pasó los valores de las
+ * filas de la IA sin editar a su fila nueva). Los campos de la IA se completan con las nuevas sugerencias y los
+ * manuales con lo que la IA encontró al buscarlos. Solo se llena lo vacío; un dato único del documento se guarda una
+ * sola vez en su campo, nunca en cada movimiento.
  */
-export function rellenarColumnas(transacciones: Transaccion[], campos: CampoExtra[], sugerencias: SugerenciaCampo[], resultados: ResultadoCampo[]): { transacciones: Transaccion[]; llenado: ResultadoLlenado[] } {
+export function rellenarColumnas(transacciones: Transaccion[], campos: CampoExtra[], sugerencias: SugerenciaCampo[], resultados: ResultadoCampo[]): { transacciones: Transaccion[]; campos: CampoExtra[]; llenado: ResultadoLlenado[] } {
   let actuales = transacciones
   const llenado: ResultadoLlenado[] = []
-  for (const campo of campos) {
+  const nuevos = campos.map((campo) => {
     if (campo.origen === 'ia') {
       const sugerencia = campo.clave ? sugerencias.find((item) => item.clave === campo.clave) : undefined
-      if (sugerencia) actuales = llenarColumna(actuales, campo.id, fuenteDeSugerencia(sugerencia), { soloVacias: true, marcar: false }).transacciones
-      continue
+      if (!sugerencia) return campo
+      if (esDelDocumento(campo)) return !campo.valor?.trim() && sugerencia.valor_documento ? { ...campo, valor: sugerencia.valor_documento.slice(0, MAX_VALOR_CAMPO) } : campo
+      if (sugerencia.valores.length > 0) actuales = llenarColumna(actuales, campo.id, fuenteDeSugerencia(sugerencia), { soloVacias: true, marcar: false }).transacciones
+      return campo
     }
     const resultado = resultados.find((item) => nombreComparable(item.nombre) === nombreComparable(campo.nombre))
-    if (!resultado) continue
+    if (!resultado) return campo
     const paso = llenarColumnaManual(actuales, campo, resultado.encontrado, fuenteDeSugerencia(resultado))
     actuales = paso.transacciones
     llenado.push(paso.resultado)
-  }
-  return { transacciones: actuales, llenado }
+    return paso.campo
+  })
+  const cambiaron = nuevos.some((campo, indice) => campo !== campos[indice])
+  return { transacciones: actuales, campos: cambiaron ? nuevos : campos, llenado }
 }
 
 /** Respuesta de "Llenar con IA" (por índice de las filas enviadas) → fuente por id de fila. */
 export function fuenteDeLlenado(respuesta: { valores: { indice: number; valor: string }[]; valor_documento?: string }, idsEnviados: string[]): FuenteValores {
   if (respuesta.valores.length === 0) return { unico: respuesta.valor_documento ?? '' }
   return { porId: new Map(respuesta.valores.filter((item) => idsEnviados[item.indice] !== undefined).map((item) => [idsEnviados[item.indice], item.valor])) }
+}
+
+// --- Corregir el tipo de un campo y migrar extracciones anteriores --------------------------------
+
+/** Valores distintos (no vacíos) que tiene un campo por movimiento. */
+const valoresDeFilas = (transacciones: Transaccion[], id: string) => [...new Set(transacciones.map((transaccion) => transaccion.extras?.[id]?.trim() ?? '').filter(Boolean))]
+
+/** Un campo por movimiento puede pasar a dato del documento solo si no se pierde nada: todos sus valores son iguales. */
+export const puedeSerDelDocumento = (transacciones: Transaccion[], campo: CampoExtra) => esDelDocumento(campo) || valoresDeFilas(transacciones, campo.id).length <= 1
+
+/**
+ * El usuario corrige el tipo que eligió la IA.
+ * - documento → movimiento: el valor se copia a cada movimiento (marcado como de la IA si lo llenó la IA).
+ * - movimiento → documento: solo si todos los valores capturados son iguales; ese valor queda una sola vez.
+ * Si el cambio perdería datos, devuelve el mismo documento.
+ */
+export function cambiarAlcance(documento: ColumnasDocumento, id: string, alcance: AlcanceCampo): ColumnasDocumento {
+  const campo = documento.campos_extra.find((item) => item.id === id)
+  if (!campo || (alcance === 'documento') === esDelDocumento(campo)) return documento
+  const { alcance: _alcance, valor: _valor, valor_ia: _valorIa, ...base } = campo
+  if (alcance === 'movimiento') {
+    const valor = campo.valor?.trim() ?? ''
+    return {
+      campos_extra: documento.campos_extra.map((item) => (item.id === id ? base : item)),
+      transacciones: valor ? llenarColumna(documento.transacciones, id, { unico: valor }, { soloVacias: false, marcar: Boolean(campo.valor_ia) }).transacciones : documento.transacciones,
+    }
+  }
+  const valores = valoresDeFilas(documento.transacciones, id)
+  if (valores.length > 1) return documento
+  const conValor = documento.transacciones.filter((transaccion) => transaccion.extras?.[id]?.trim())
+  const deIa = conValor.length > 0 && conValor.every((transaccion) => esCeldaDeIa(transaccion, id))
+  return {
+    campos_extra: documento.campos_extra.map((item) => (item.id === id ? { ...base, alcance: 'documento', valor: valores[0] ?? '', ...(deIa ? { valor_ia: true } : {}) } : item)),
+    transacciones: documento.transacciones.map((transaccion) => (transaccion.extras && id in transaccion.extras ? fijarExtra(transaccion, id, '') : transaccion)),
+  }
+}
+
+/**
+ * Extracciones y borradores anteriores a los datos del documento: una columna por movimiento con el mismo valor
+ * (no vacío) en todos los movimientos (2 o más) pasa a ser dato del documento. Mismo criterio que el backend
+ * (migrar_columnas_unicas). Si no hay nada que migrar devuelve el mismo documento.
+ */
+export function migrarColumnasUnicas<T extends ColumnasDocumento>(documento: T): T {
+  if (documento.transacciones.length < 2) return documento
+  let actual: ColumnasDocumento = documento
+  for (const campo of documento.campos_extra) {
+    if (esDelDocumento(campo)) continue
+    const todas = documento.transacciones.map((transaccion) => transaccion.extras?.[campo.id]?.trim() ?? '')
+    if (todas.some((valor) => !valor) || new Set(todas).size !== 1) continue
+    actual = cambiarAlcance(actual, campo.id, 'documento')
+  }
+  return actual === documento ? documento : { ...documento, ...actual }
 }

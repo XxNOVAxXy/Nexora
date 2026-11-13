@@ -69,7 +69,7 @@ describe('botón "+ Campo"', () => {
     let menu = await abrirMenu()
     expect(within(menu).getByText('2 filas con dato')).toBeTruthy()
     expect(within(menu).getByText('Valor único del documento')).toBeTruthy()
-    expect(within(menu).getByText('Se repetirá en cada fila.')).toBeTruthy()
+    expect(within(menu).getByText('Va una sola vez para todos los movimientos.')).toBeTruthy()
     fireEvent.click(within(menu).getByText('VSM'))
     expect((screen.getByLabelText('VSM del movimiento 1') as HTMLInputElement).value).toBe('12.5')
     expect((screen.getByLabelText('VSM del movimiento 2') as HTMLInputElement).value).toBe('13')
@@ -77,7 +77,9 @@ describe('botón "+ Campo"', () => {
     menu = await abrirMenu()
     expect(within(menu).queryByText('VSM')).toBeNull()
     fireEvent.click(within(menu).getByText('Número de crédito'))
-    expect((screen.getByLabelText('Número de crédito del movimiento 2') as HTMLInputElement).value).toBe('CR-778')
+    // Un dato único del documento aparece una sola vez, no en cada movimiento.
+    expect((screen.getByLabelText('Número de crédito del documento') as HTMLInputElement).value).toBe('CR-778')
+    expect(screen.queryByLabelText('Número de crédito del movimiento 1')).toBeNull()
 
     menu = await abrirMenu()
     expect(within(menu).getByText('Ya agregaste todos los campos que sugirió la IA.')).toBeTruthy()
@@ -85,6 +87,7 @@ describe('botón "+ Campo"', () => {
     fireEvent.click(within(menu).getByRole('button', { name: 'Agregar' }))
     expect(within(menu).getByRole('alert').textContent).toBe('Ya existe un campo con ese nombre.')
     fireEvent.change(within(menu).getByLabelText('Manual'), { target: { value: 'Sucursal' } })
+    fireEvent.click(within(menu).getByLabelText(/En cada movimiento/))
     fireEvent.click(within(menu).getByRole('button', { name: 'Agregar' }))
     fireEvent.change(screen.getByLabelText('Sucursal del movimiento 1'), { target: { value: 'Centro' } })
     expect(screen.getAllByText('IA editada')).toHaveLength(1)
@@ -96,7 +99,7 @@ describe('botón "+ Campo"', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Eliminar el campo Número de crédito' }))
     fireEvent.click(within(screen.getByRole('alertdialog', { name: 'Eliminar el campo Número de crédito' })).getByRole('button', { name: 'Eliminar' }))
-    expect(screen.queryByLabelText('Número de crédito del movimiento 1')).toBeNull()
+    expect(screen.queryByLabelText('Número de crédito del documento')).toBeNull()
     expect(within(await abrirMenu()).getByText('Número de crédito')).toBeTruthy()
     fireEvent.keyDown(document, { key: 'Escape' })
 
@@ -106,8 +109,30 @@ describe('botón "+ Campo"', () => {
     expect(solicitud.campos_extra?.map((campo) => [campo.nombre, campo.origen])).toEqual([['VSM', 'ia'], ['Plaza', 'manual']])
     const [vsm, plaza] = solicitud.campos_extra!.map((campo) => campo.id)
     expect(solicitud.transacciones.map((t) => t.extras)).toEqual([{ [vsm]: '12.5', [plaza]: 'Centro' }, { [vsm]: '13' }])
+    expect(solicitud.campos_extra!.every((campo) => campo.alcance !== 'documento')).toBe(true)
     expect(solicitud.sugerencias_campos).toHaveLength(2)
     expect(await screen.findByText(/versión 2/)).toBeTruthy()
+  })
+
+  it('un dato agregado a mano como «una vez en el documento» aparece una sola vez y se guarda así', async () => {
+    guardado = base()
+    vi.mocked(extraccionesApi.guardar).mockImplementation(async (_m: string, _p: string, solicitud: SolicitudGuardado) => base({ version: 2, transacciones: solicitud.transacciones, campos_extra: solicitud.campos_extra }))
+    montar()
+    const menu = await abrirMenu()
+    fireEvent.change(within(menu).getByLabelText('Manual'), { target: { value: 'RFC' } })
+    expect((within(menu).getByLabelText(/Una vez para todos/) as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(within(menu).getByRole('button', { name: 'Agregar' }))
+
+    fireEvent.change(screen.getByLabelText('RFC del documento'), { target: { value: 'XAXX010101000' } })
+    expect(screen.queryByLabelText('RFC del movimiento 1')).toBeNull()
+    expect(screen.queryByLabelText('RFC del movimiento 2')).toBeNull()
+    expect(screen.getByText('Cambios sin guardar')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Guardar' }))
+    await waitFor(() => expect(extraccionesApi.guardar).toHaveBeenCalledTimes(1))
+    const solicitud = vi.mocked(extraccionesApi.guardar).mock.calls[0][2]
+    expect(solicitud.campos_extra).toEqual([expect.objectContaining({ nombre: 'RFC', origen: 'manual', alcance: 'documento', valor: 'XAXX010101000' })])
+    expect(solicitud.transacciones.every((t) => !t.extras)).toBe(true)
   })
 
   it('abre documentos guardados sin columnas y explica que hay que extraer para ver sugerencias', async () => {

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type SetStateAction } from 'react'
 import { Link, NavLink, Route, Routes, useBlocker, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import type { CampoExtra, CampoMonto, CampoMontoResumen, Resumen, SugerenciaCampo, Transaccion } from './types'
-import { agregarCampoManual, aplicarSugerencia, camposParaSolicitar, editarExtra, eliminarCampo, errorNombreCampo, esCeldaDeIa, filasConValor, fuenteDeLlenado, llenarColumnaManual, MAX_CAMPOS_EXTRA, mensajeLlenado, renombrarCampo, sugerenciasDisponibles, type ColumnasDocumento, type ResultadoLlenado } from './services/camposExtra'
-import { contarCorrecciones, editarCampo, etiquetaOrigen, nuevaTransaccion, type CampoEditable } from './services/transacciones'
+import type { AlcanceCampo, CampoExtra, CampoMonto, CampoMontoResumen, Resumen, SugerenciaCampo, Transaccion } from './types'
+import { agregarCampoManual, aplicarSugerencia, cambiarAlcance, camposParaSolicitar, editarExtra, editarValorDocumento, eliminarCampo, errorNombreCampo, esCeldaDeIa, esDelDocumento, filasConValor, fuenteDeLlenado, llenarColumnaManual, MAX_CAMPOS_EXTRA, mensajeLlenado, puedeSerDelDocumento, renombrarCampo, sugerenciasDisponibles, type ColumnasDocumento, type ResultadoLlenado } from './services/camposExtra'
+import { contarCorrecciones, editarCampo, etiquetaOrigen, moverTransaccion, nuevaTransaccion, type CampoEditable } from './services/transacciones'
 import { validarContabilidad, type ValidacionContable } from './services/contabilidad'
 import { crearControladorExtraccion, ejecutarExtraccion } from './services/extraccion'
 import { gmailApi, type FiltroCorreo, type GmailAttachment, type GmailMessage, type GmailStatus } from './services/gmailApi'
@@ -23,6 +23,7 @@ import { PanelVerificacion, VisorPdf, type EstadoTextoDocumento, type Resaltado 
 import {
   ArrowDownToLine,
   ArrowLeft,
+  ArrowRightLeft,
   Bell,
   Check,
   CheckCircle2,
@@ -546,7 +547,16 @@ type AvisoCombinacion = { conservadas: number; noAparecen: number; campos: strin
 /** Una sola lista por documento: los modos manual y Gemini muestran y editan el mismo documento. */
 type CampoResumenEditable = 'banco' | 'titular' | 'cuenta' | 'periodo' | 'moneda' | CampoMontoResumen
 /** Celda a la que se copia el dato del documento al hacer clic en su recuadro. */
-type DestinoCaptura = { tipo: 'movimiento'; id: string; campo: CampoEditable } | { tipo: 'resumen'; campo: Exclude<CampoResumenEditable, 'banco'> }
+type DestinoCaptura = { tipo: 'movimiento'; id: string; campo: CampoEditable } | { tipo: 'resumen'; campo: Exclude<CampoResumenEditable, 'banco'> } | { tipo: 'documento'; campoId: string }
+/** «RFC: XAXX…» → «XAXX…» cuando el texto del documento trae delante el nombre del dato. */
+const sinNombreDelante = (texto: string, nombre: string) => {
+  const limpio = texto.replace(/\s+/g, ' ').trim()
+  const comparable = (valor: string) => valor.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+  const prefijo = comparable(nombre).replace(/\s+/g, ' ').trim()
+  if (!prefijo || !comparable(limpio).startsWith(prefijo)) return limpio
+  const resto = limpio.slice(prefijo.length).replace(/^[\s:.#-]+/, '').trim()
+  return resto || limpio
+}
 const resumenVacio = (): Resumen => ({ banco: '', titular: '', cuenta: '', periodo: '', moneda: '', saldo_inicial: '', total_cargos: '', total_abonos: '', saldo_final: '', dudosos: [] })
 const etiquetaResumen: Record<CampoResumenEditable, string> = { banco: 'Banco', titular: 'Titular', cuenta: 'Cuenta', periodo: 'Periodo', moneda: 'Moneda', saldo_inicial: 'Saldo inicial', total_abonos: 'Total abonos', total_cargos: 'Total cargos', saldo_final: 'Saldo final' }
 const camposResumen: CampoResumenEditable[] = ['banco', 'titular', 'cuenta', 'periodo', 'moneda', 'saldo_inicial', 'total_abonos', 'total_cargos', 'saldo_final']
@@ -555,7 +565,7 @@ type VerificacionVisor = { estado: EstadoTextoDocumento; onTexto: (paginas: Pagi
 type ListaDocumento = { documentKey: string | null; documento: DocumentoEditable; aviso: AvisoCombinacion | null; warnings: string[]; avisosCampos: Record<string, AvisoCampo> }
 /** Mensaje junto a una columna manual tras buscarla con la IA. */
 type AvisoCampo = { tipo: 'exito' | 'info' | 'error'; texto: string }
-const avisoDeLlenado = (resultado: ResultadoLlenado): AvisoCampo => ({ tipo: resultado.estado === 'llenado' ? 'exito' : 'info', texto: mensajeLlenado(resultado) })
+const avisoDeLlenado = (resultado: ResultadoLlenado): AvisoCampo => ({ tipo: resultado.estado === 'llenado' || resultado.estado === 'dato_del_documento' ? 'exito' : 'info', texto: mensajeLlenado(resultado) })
 /** Última versión confirmada por el backend para este documento. */
 type VersionGuardada = { documentKey: string; version: number; estado: EstadoExtraccion; actualizado: string; firma: string; envios: IntentoEnvio[]; enviado_en: string | null }
 type OfertaBorrador = { documentKey: string; borrador: BorradorLocal; versionGuardada: number | null }
@@ -654,6 +664,15 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const datosDocumento = useMemo(() => (textoActual?.estado === 'listo' ? detectarDatos(textoActual.paginas) : null), [textoActual])
   const verificacion = useMemo(() => (datosDocumento ? verificar(datosDocumento, { resumen: documento.resumen, transacciones: transactions, formato_numerico: documento.formato_numerico }) : null), [datosDocumento, documento.resumen, transactions, documento.formato_numerico])
   const verificando = verificacionVisible && verificacion !== null
+  // Copiar a un dato del documento (RFC…): todo el texto del documento se vuelve clicable, no solo lo reconocido.
+  const destinoDocumento = destino?.tipo === 'documento' ? destino.campoId : null
+  const marcasTexto = useMemo<MarcaVerificacion[] | null>(() => {
+    if (!destinoDocumento || textoActual?.estado !== 'listo') return null
+    return textoActual.paginas.flatMap((pagina) => pagina.fragmentos.map((fragmento, indice) => ({
+      id: `texto-${pagina.numero}-${indice}`, grupo: 'texto' as const, campo: 'concepto' as const, etiqueta: 'Texto', textoDocumento: fragmento.texto.trim(), valorCapturado: '', estado: 'no_se_captura' as const,
+      recuadro: { pagina: pagina.numero, x: fragmento.x, y: fragmento.y, ancho: fragmento.ancho, alto: fragmento.alto }, filaDocumento: null, transaccionId: null,
+    })).filter((marca) => marca.textoDocumento))
+  }, [destinoDocumento, textoActual])
   const sinRespaldo = useMemo(() => new Set(verificando ? verificacion!.sinRespaldo : []), [verificando, verificacion])
 
   const aplicadoCola = useRef<number | null>(null)
@@ -747,6 +766,8 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const cambiarCampo = (id: string, campo: CampoEditable, valor: string) => setTransactions((items) => items.map((item) => item.id === id ? editarCampo(item, campo, valor) : item))
   const eliminarTransaccion = (id: string) => setTransactions((items) => items.filter((item) => item.id !== id))
   const agregarTransaccion = () => setTransactions((items) => [...items, nuevaTransaccion()])
+  /** Número del movimiento: escribir otro número lo mueve a esa posición (el orden por fecha se aplica al extraer). */
+  const moverMovimiento = (id: string, numero: number) => setTransactions((items) => moverTransaccion(items, id, numero))
   /** Columnas adicionales ("+ Campo"): como cualquier cambio de contenido, vuelven el documento a borrador. */
   const setColumnas = (actualizar: (columnas: ColumnasDocumento) => ColumnasDocumento) => setLista((prev) => {
     const base = prev.documentKey === documentKey ? prev : listaVacia(documentKey)
@@ -755,7 +776,10 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   })
   const cambiarExtra = (id: string, campoId: string, valor: string) => setTransactions((items) => items.map((item) => item.id === id ? editarExtra(item, campoId, valor) : item))
   const elegirSugerencia = (sugerencia: SugerenciaCampo) => setColumnas((columnas) => aplicarSugerencia(columnas, sugerencia))
-  const agregarCampo = (nombre: string) => setColumnas((columnas) => ({ ...columnas, campos_extra: agregarCampoManual(columnas.campos_extra, nombre) }))
+  const agregarCampo = (nombre: string, alcance: AlcanceCampo) => setColumnas((columnas) => ({ ...columnas, campos_extra: agregarCampoManual(columnas.campos_extra, nombre, alcance) }))
+  const cambiarValorDocumento = (id: string, valor: string) => setColumnas((columnas) => ({ ...columnas, campos_extra: editarValorDocumento(columnas.campos_extra, id, valor) }))
+  /** El usuario corrige el tipo que eligió la IA (una vez para todos ↔ en cada movimiento). */
+  const cambiarTipoCampo = (id: string, alcance: AlcanceCampo) => setColumnas((columnas) => cambiarAlcance(columnas, id, alcance))
   const renombrarColumna = (id: string, nombre: string) => setColumnas((columnas) => ({ ...columnas, campos_extra: renombrarCampo(columnas.campos_extra, id, nombre) }))
   const eliminarColumna = (id: string) => setColumnas((columnas) => eliminarCampo(columnas, id))
   const cerrarAvisoCampo = (id: string) => setLista((prev) => (prev.documentKey === documentKey ? { ...prev, avisosCampos: Object.fromEntries(Object.entries(prev.avisosCampos).filter(([clave]) => clave !== id)) } : prev))
@@ -783,8 +807,10 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
       if (!actual) return prev
       if (!respuesta) return { ...prev, avisosCampos: { ...prev.avisosCampos, [campoId]: aviso! } }
       // Las filas borradas mientras se buscaba se ignoran; solo se llenan las celdas que siguen vacías.
-      const { transacciones, resultado } = llenarColumnaManual(prev.documento.transacciones, actual, respuesta.encontrado, fuenteDeLlenado(respuesta, ids))
-      const documentoNuevo = resultado.llenadas > 0 ? { ...prev.documento, estado: 'borrador' as const, transacciones } : prev.documento
+      const { transacciones, campo: campoNuevo, resultado } = llenarColumnaManual(prev.documento.transacciones, actual, respuesta.encontrado, fuenteDeLlenado(respuesta, ids))
+      // Un dato del documento se llena una sola vez en el campo, nunca en cada movimiento.
+      const campos_extra = campoNuevo === actual ? prev.documento.campos_extra : prev.documento.campos_extra.map((item) => (item.id === campoId ? campoNuevo : item))
+      const documentoNuevo = resultado.llenadas > 0 ? { ...prev.documento, estado: 'borrador' as const, transacciones, campos_extra } : prev.documento
       return { ...prev, documento: documentoNuevo, avisosCampos: { ...prev.avisosCampos, [campoId]: avisoDeLlenado(resultado) } }
     })
   }
@@ -800,6 +826,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
     setTextoDocumento({ documentKey, estado: paginas === null ? 'error' : tieneCapaDeTexto(paginas) ? 'listo' : 'sin_texto', paginas: paginas ?? [] })
   }, [documentKey])
   const nombreDestino = (valor: DestinoCaptura) => {
+    if (valor.tipo === 'documento') return `${documento.campos_extra.find((campo) => campo.id === valor.campoId)?.nombre ?? 'Dato'} del documento`
     if (valor.tipo === 'resumen') return `${etiquetaResumen[valor.campo]} del resumen`
     const posicion = transactions.findIndex((transaccion) => transaccion.id === valor.id)
     return `${ETIQUETA_CAMPO[valor.campo]} del movimiento ${posicion + 1}`
@@ -809,6 +836,13 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
     setResaltado({ transaccionId: id, filaDocumento: null, origen: 'tabla' })
     setFilaPorAgregar(null)
   }
+  /** Dato del documento (RFC…): con el texto del documento listo, cualquier texto del documento se puede copiar a él. */
+  const enfocarValorDocumento = (campoId: string) => {
+    setFilaPorAgregar(null)
+    if (estadoTexto !== 'listo') { setDestino(null); return }
+    setDestino({ tipo: 'documento', campoId })
+    setVerificacionVisible(true)
+  }
   const enfocarCampoResumen = (campo: CampoResumenEditable) => {
     // El banco no se verifica en el documento: no tiene recuadro del que copiar.
     setDestino(campo === 'banco' ? null : { tipo: 'resumen', campo })
@@ -817,6 +851,15 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   /** Clic en un recuadro: copia a la celda destino, ofrece agregar un movimiento faltante o resalta su fila. */
   const clicMarca = (marca: MarcaVerificacion) => {
     setMensajeCaptura(null)
+    if (destino?.tipo === 'documento') {
+      const campo = documento.campos_extra.find((item) => item.id === destino.campoId)
+      if (!campo) { setDestino(null); return }
+      const texto = sinNombreDelante(marca.textoDocumento, campo.nombre).slice(0, 500)
+      cambiarValorDocumento(campo.id, texto)
+      setMensajeCaptura({ tipo: 'info', texto: `Copiado a ${campo.nombre} del documento: ${texto}` })
+      setDestino(null)
+      return
+    }
     if (destino && verificacion) {
       if (!compatibles(destino.campo, marca.campo)) {
         setMensajeCaptura({ tipo: 'error', texto: `No se copió: ${marca.etiqueta.toLowerCase()} no corresponde a ${nombreDestino(destino).toLowerCase()}. Haz clic en ${destino.campo === 'fecha' ? 'una fecha' : ['cargo', 'abono', 'saldo', 'saldo_inicial', 'total_cargos', 'total_abonos', 'saldo_final'].includes(destino.campo) ? 'un importe' : 'un texto'} del documento.` })
@@ -1033,7 +1076,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
       <section className="h-[75vh] min-h-[520px] min-w-0 overflow-hidden rounded-2xl 2xl:h-full"><DocumentViewer messageId={messageId} attachmentId={attachmentId} filename={filename} page={page} setPage={setPage} verificacion={{
         estado: estadoTexto,
         onTexto: textoRecibido,
-        marcas: verificando ? verificacion!.marcas : [],
+        marcas: marcasTexto ?? (verificando ? verificacion!.marcas : []),
         disponible: estadoTexto === 'listo',
         visible: verificacionVisible,
         onAlternar: () => { setVerificacionVisible((valor) => !valor); setDestino(null); setFilaPorAgregar(null) },
@@ -1048,6 +1091,10 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
         {!cargando && <div className="min-h-0 flex-1 overflow-auto scrollbar-thin"><TablaTransacciones transacciones={transactions} columnas={{
           campos: documento.campos_extra,
           onCambiar: cambiarExtra,
+          onCambiarValorDocumento: cambiarValorDocumento,
+          onEnfocarDocumento: enfocarValorDocumento,
+          destinoDocumento: destino?.tipo === 'documento' ? destino.campoId : null,
+          onCambiarAlcance: cambiarTipoCampo,
           onRenombrar: renombrarColumna,
           onEliminar: eliminarColumna,
           onLlenar: (id) => void llenarConIa(id),
@@ -1056,7 +1103,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
           avisos: deEsteDocumento ? lista.avisosCampos : {},
           onCerrarAviso: cerrarAvisoCampo,
           menu: <MenuCampo campos={documento.campos_extra} sugerencias={documento.sugerencias_campos} huboExtraccionIa={huboExtraccion} onAplicar={elegirSugerencia} onAgregar={agregarCampo} solicitudAbrir={abrirMenuCampo} />,
-        }} alertas={alertas} onCambiar={cambiarCampo} onEliminar={eliminarTransaccion} sinRespaldo={sinRespaldo} resaltado={resaltado} destino={verificando && destino?.tipo === 'movimiento' ? destino : null} onEnfocar={enfocarCeldaMovimiento} /></div>}
+        }} alertas={alertas} onCambiar={cambiarCampo} onEliminar={eliminarTransaccion} onMover={moverMovimiento} sinRespaldo={sinRespaldo} resaltado={resaltado} destino={verificando && destino?.tipo === 'movimiento' ? destino : null} onEnfocar={enfocarCeldaMovimiento} /></div>}
         <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-4 py-2.5 text-[11px] text-slate-400"><div className="flex flex-wrap items-center gap-1.5"><CircleHelp size={13} />{`${transactions.length} movimiento${transactions.length === 1 ? '' : 's'}.`}{dudososCount > 0 && <span className="font-semibold text-amber-700">{dudososCount} importe{dudososCount === 1 ? '' : 's'} dudoso{dudososCount === 1 ? '' : 's'}: revísalo{dudososCount === 1 ? '' : 's'} contra el documento.</span>}</div></div>
       </section>
     </div>
@@ -1224,9 +1271,30 @@ const tonoOrigen: Record<Transaccion['origen'], string> = { ia: 'bg-violet-50 te
 
 const etiquetaRevision: Record<NonNullable<Transaccion['revision']>, string> = { no_aparece_en_extraccion: 'No aparece en extracción', fila_de_saldo_con_importe: 'Fila de saldo: no se suma' }
 
+function NumeroMovimiento({ numero, total, onMover }: { numero: number; total: number; onMover: (numero: number) => void }) {
+  const [texto, setTexto] = useState(String(numero))
+  useEffect(() => { setTexto(String(numero)) }, [numero])
+  const aplicar = () => {
+    const valor = Number(texto.trim())
+    if (!/^\d+$/.test(texto.trim()) || valor < 1) { setTexto(String(numero)); return }
+    if (valor !== numero) onMover(Math.min(valor, total))
+    else setTexto(String(numero))
+  }
+  return <input aria-label={`Número del movimiento ${numero}`} title={`Movimiento ${numero} de ${total}. Escribe otro número para moverlo a esa posición.`} value={texto} inputMode="numeric"
+    onChange={(event) => setTexto(event.target.value.replace(/\D/g, ''))} onBlur={aplicar}
+    onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); aplicar(); (event.target as HTMLInputElement).blur() } else if (event.key === 'Escape') { setTexto(String(numero)); (event.target as HTMLInputElement).blur() } }}
+    className="w-full rounded-md border border-transparent bg-transparent px-1 py-1.5 text-center text-xs font-bold tabular-nums text-slate-500 outline-none transition hover:border-slate-200 focus:border-coral focus:bg-white focus:text-ink focus:ring-2 focus:ring-coral/10" />
+}
+
 type ColumnasTabla = {
   campos: CampoExtra[]
   onCambiar: (id: string, campoId: string, valor: string) => void
+  /** Valor de un campo del documento (se guarda una sola vez). */
+  onCambiarValorDocumento: (id: string, valor: string) => void
+  /** Al enfocar un dato del documento: se puede copiar a él cualquier texto del documento. */
+  onEnfocarDocumento: (id: string) => void
+  /** Dato del documento que recibirá el texto pulsado en el documento. */
+  destinoDocumento: string | null
   onRenombrar: (id: string, nombre: string) => void
   onEliminar: (id: string) => void
   /** "Llenar con IA" de una columna manual. */
@@ -1236,24 +1304,71 @@ type ColumnasTabla = {
   motivoNoLlenar: string | null
   avisos: Record<string, AvisoCampo>
   onCerrarAviso: (id: string) => void
+  /** Corrige el tipo del campo: una vez para todos ↔ en cada movimiento. */
+  onCambiarAlcance: (id: string, alcance: AlcanceCampo) => void
   menu: React.ReactNode
 }
 
-function TablaTransacciones({ transacciones, columnas, alertas, onCambiar, onEliminar, sinRespaldo, resaltado, destino, onEnfocar }: { transacciones: Transaccion[]; columnas: ColumnasTabla; alertas: Record<string, string[]>; onCambiar: (id: string, campo: CampoEditable, valor: string) => void; onEliminar: (id: string) => void; sinRespaldo: Set<string>; resaltado: Resaltado | null; destino: { id: string; campo: CampoEditable } | null; onEnfocar: (id: string, campo: CampoEditable) => void }) {
-  const tabla = useRef<HTMLTableElement>(null)
+function TablaTransacciones({ transacciones, columnas, alertas, onCambiar, onEliminar, onMover, sinRespaldo, resaltado, destino, onEnfocar }: { transacciones: Transaccion[]; columnas: ColumnasTabla; alertas: Record<string, string[]>; onCambiar: (id: string, campo: CampoEditable, valor: string) => void; onEliminar: (id: string) => void; onMover: (id: string, numero: number) => void; sinRespaldo: Set<string>; resaltado: Resaltado | null; destino: { id: string; campo: CampoEditable } | null; onEnfocar: (id: string, campo: CampoEditable) => void }) {
+  const tabla = useRef<HTMLDivElement>(null)
   const filaResaltada = resaltado?.transaccionId ?? null
-  // Desde el documento: lleva la tabla a la fila del recuadro pulsado.
+  // Desde el documento: lleva la lista al movimiento del recuadro pulsado.
   useEffect(() => {
     if (!filaResaltada || resaltado?.origen !== "documento") return
     const fila = [...(tabla.current?.querySelectorAll<HTMLElement>("[data-movimiento]") ?? [])].find((elemento) => elemento.dataset.movimiento === filaResaltada)
-    fila?.scrollIntoView?.({ block: "nearest" })
+    fila?.scrollIntoView?.({ block: "nearest", inline: "nearest" })
   }, [filaResaltada, resaltado?.origen])
-  if (transacciones.length === 0) return <div className="px-5 py-14 text-center text-xs text-slate-400">Sin movimientos. Usa <strong>Agregar</strong> para capturar uno.</div>
-  return <table ref={tabla} style={{ minWidth: 744 + columnas.campos.length * 140 }} className="w-full table-fixed border-collapse text-xs"><thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase tracking-wider text-slate-400"><tr>{columnasTabla.map((columna) => <th key={columna.campo} scope="col" className={`${columna.ancho} border-b border-slate-200 px-2 py-2 font-bold ${columna.monto ? 'text-right' : 'text-left'}`}>{columna.etiqueta}</th>)}{columnas.campos.map((campo) => <th key={campo.id} scope="col" className="w-[140px] border-b border-slate-200 px-2 py-2 text-left font-bold"><EncabezadoCampo campo={campo} campos={columnas.campos} onRenombrar={columnas.onRenombrar} onEliminar={columnas.onEliminar} onLlenar={() => columnas.onLlenar(campo.id)} llenando={columnas.llenando.includes(campo.id)} motivoNoLlenar={columnas.motivoNoLlenar} aviso={columnas.avisos[campo.id] ?? null} onCerrarAviso={() => columnas.onCerrarAviso(campo.id)} /></th>)}<th scope="col" className="w-[84px] border-b border-slate-200 px-1 py-1.5 text-right normal-case tracking-normal">{columnas.menu}</th><th scope="col" className="w-9 border-b border-slate-200"><span className="sr-only">Acciones</span></th></tr></thead><tbody>{transacciones.map((transaccion, index) => <tr key={transaccion.id} data-movimiento={transaccion.id} aria-selected={filaResaltada === transaccion.id || undefined} className={`border-b border-slate-100 align-top ${filaResaltada === transaccion.id ? 'bg-blue-50/70 outline outline-1 -outline-offset-1 outline-blue-300' : alertas[transaccion.id] ? 'bg-red-50/40' : transaccion.revision ? 'bg-amber-50/40' : 'hover:bg-slate-50/50'}`}>{columnasTabla.map((columna) => { const dudoso = columna.monto && transaccion.dudosos.includes(columna.campo as CampoMonto); const esDestino = destino?.id === transaccion.id && destino.campo === columna.campo; const clases = `w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${esDestino ? 'ring-2 ring-blue-400' : ''} ${columna.monto ? 'text-right tabular-nums' : ''} ${dudoso ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-transparent bg-transparent hover:border-slate-200'}`; const comunes = { 'aria-label': `${columna.etiqueta} del movimiento ${index + 1}`, value: transaccion[columna.campo], onFocus: () => onEnfocar(transaccion.id, columna.campo), title: dudoso ? 'Importe dudoso: no se pudo interpretar sin adivinar. Revísalo contra el documento.' : transaccion[columna.campo] || undefined }; return <td key={columna.campo} className="px-1 py-1">{columna.campo === 'concepto' ? <><textarea {...comunes} rows={1} style={{ fieldSizing: 'content' } as React.CSSProperties} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={`${clases} block min-h-[30px] resize-none overflow-hidden leading-snug`} /><div className="mt-0.5 flex flex-wrap gap-1 px-1.5"><span className={`inline-flex whitespace-nowrap rounded-full px-1.5 py-0.5 text-[9px] font-bold ${tonoOrigen[transaccion.origen]}`}>{etiquetaOrigen(transaccion.origen)}</span>{transaccion.revision && <span className="inline-flex rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-800">{etiquetaRevision[transaccion.revision]}</span>}{sinRespaldo.has(transaccion.id) && <span title="La verificación visual no encontró este movimiento en el texto del documento." className="inline-flex rounded-full bg-rose-100 px-1.5 py-0.5 text-[9px] font-bold text-rose-700">No aparece en el documento</span>}{alertas[transaccion.id] && <span title={alertas[transaccion.id].join(' ')} className="inline-flex cursor-help rounded-full bg-red-100 px-1.5 py-0.5 text-[9px] font-bold text-red-700">{alertas[transaccion.id].length} alerta{alertas[transaccion.id].length === 1 ? '' : 's'}</span>}</div></> : <input {...comunes} inputMode={columna.monto ? 'decimal' : undefined} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={clases} />}</td> })}{columnas.campos.map((campo) => { const valor = transaccion.extras?.[campo.id] ?? ''; const deIa = esCeldaDeIa(transaccion, campo.id); return <td key={campo.id} className="relative px-1 py-1"><input aria-label={`${campo.nombre} del movimiento ${index + 1}`} data-ia={deIa || undefined} value={valor} title={deIa ? `Llenado por la IA: ${valor}` : valor || undefined} maxLength={500} onChange={(event) => columnas.onCambiar(transaccion.id, campo.id, event.target.value)} className={`w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${deIa ? 'border-violet-100 bg-violet-50 pr-5 text-violet-900' : 'border-transparent bg-transparent hover:border-slate-200'}`} />{deIa && <Sparkles size={10} aria-hidden className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-violet-400" />}</td> })}<td /><td className="px-1 py-1"><button type="button" onClick={() => onEliminar(transaccion.id)} className="rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600" aria-label={`Eliminar movimiento ${index + 1}`}><Trash2 size={13} /></button></td></tr>)}</tbody></table>
+  const delDocumento = columnas.campos.filter(esDelDocumento)
+  const porMovimiento = columnas.campos.filter((campo) => !esDelDocumento(campo))
+  const encabezado = (campo: CampoExtra) => <EncabezadoCampo campo={campo} campos={columnas.campos} onRenombrar={columnas.onRenombrar} onEliminar={columnas.onEliminar} onLlenar={() => columnas.onLlenar(campo.id)} llenando={columnas.llenando.includes(campo.id)} motivoNoLlenar={columnas.motivoNoLlenar} aviso={columnas.avisos[campo.id] ?? null} onCerrarAviso={() => columnas.onCerrarAviso(campo.id)} onCambiarAlcance={(alcance) => columnas.onCambiarAlcance(campo.id, alcance)} puedeSerDelDocumento={puedeSerDelDocumento(transacciones, campo)} />
+  const claseEntrada = (resaltada: boolean, extra = '') => `w-full rounded-md border px-2 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${resaltada ? 'border-violet-100 bg-violet-50 text-violet-900' : 'border-transparent bg-slate-50/70 hover:border-slate-200'} ${extra}`
+  return <div ref={tabla} className="text-xs">
+    <table aria-label="Movimientos del estado de cuenta" style={{ width: 112 + transacciones.length * 188 }} className="table-fixed border-collapse text-xs">
+        <colgroup><col className="w-28" />{transacciones.map((transaccion) => <col key={transaccion.id} className="w-[188px]" />)}</colgroup>
+        <thead><tr>
+          <th scope="col" className="sticky left-0 top-0 z-20 border-b border-r border-slate-200 bg-slate-50 px-2 py-1.5 text-left align-top text-[10px] font-bold uppercase tracking-wider text-slate-400"><div title="Número del movimiento. Escribe otro número para moverlo.">#</div><div className="mt-1 normal-case tracking-normal">{columnas.menu}</div></th>
+          {transacciones.map((transaccion, index) => {
+            const activa = filaResaltada === transaccion.id
+            return <th key={transaccion.id} scope="col" data-movimiento={transaccion.id} data-activo={activa || undefined} aria-label={`Movimiento ${index + 1}`} className={`sticky top-0 z-10 border-b border-r border-slate-200 px-1.5 py-1.5 text-left align-top font-normal ${activa ? 'bg-blue-50' : alertas[transaccion.id] ? 'bg-red-50' : transaccion.revision ? 'bg-amber-50' : 'bg-slate-50'}`}>
+              <div className="flex items-center gap-1"><div className="w-10"><NumeroMovimiento numero={index + 1} total={transacciones.length} onMover={(numero) => onMover(transaccion.id, numero)} /></div><span className="flex-1" /><button type="button" onClick={() => onEliminar(transaccion.id)} className="rounded-md p-1 text-slate-400 hover:bg-red-50 hover:text-red-600" aria-label={`Eliminar movimiento ${index + 1}`}><Trash2 size={13} /></button></div>
+              <div className="mt-0.5 flex flex-wrap gap-1"><span className={`inline-flex whitespace-nowrap rounded-full px-1.5 py-0.5 text-[9px] font-bold ${tonoOrigen[transaccion.origen]}`}>{etiquetaOrigen(transaccion.origen)}</span>{transaccion.revision && <span className="inline-flex rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-800">{etiquetaRevision[transaccion.revision]}</span>}{sinRespaldo.has(transaccion.id) && <span title="La verificación visual no encontró este movimiento en el texto del documento." className="inline-flex rounded-full bg-rose-100 px-1.5 py-0.5 text-[9px] font-bold text-rose-700">No aparece en el documento</span>}{alertas[transaccion.id] && <span title={alertas[transaccion.id].join(' ')} className="inline-flex cursor-help rounded-full bg-red-100 px-1.5 py-0.5 text-[9px] font-bold text-red-700">{alertas[transaccion.id].length} alerta{alertas[transaccion.id].length === 1 ? '' : 's'}</span>}</div>
+            </th>
+          })}
+        </tr></thead>
+        <tbody>
+          {transacciones.length > 0 && columnasTabla.map((columna) => <tr key={columna.campo} className="border-b border-slate-100 align-top">
+            <th scope="row" className="sticky left-0 z-[5] border-r border-slate-200 bg-white px-2 py-2.5 text-left text-[10px] font-bold uppercase tracking-wider text-slate-400">{columna.etiqueta}</th>
+            {transacciones.map((transaccion, index) => {
+              const dudoso = columna.monto && transaccion.dudosos.includes(columna.campo as CampoMonto)
+              const esDestino = destino?.id === transaccion.id && destino.campo === columna.campo
+              const clases = `w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${esDestino ? 'ring-2 ring-blue-400' : ''} ${columna.monto ? 'text-right tabular-nums' : ''} ${dudoso ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-transparent bg-transparent hover:border-slate-200'}`
+              const comunes = { 'aria-label': `${columna.etiqueta} del movimiento ${index + 1}`, value: transaccion[columna.campo], onFocus: () => onEnfocar(transaccion.id, columna.campo), title: dudoso ? 'Importe dudoso: no se pudo interpretar sin adivinar. Revísalo contra el documento.' : transaccion[columna.campo] || undefined }
+              return <td key={transaccion.id} className={`border-r border-slate-100 px-1 py-1 ${filaResaltada === transaccion.id ? 'bg-blue-50/70' : ''}`}>{columna.campo === 'concepto'
+                ? <textarea {...comunes} rows={1} style={{ fieldSizing: 'content' } as React.CSSProperties} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={`${clases} block min-h-[30px] resize-none overflow-hidden leading-snug`} />
+                : <input {...comunes} inputMode={columna.monto ? 'decimal' : undefined} onChange={(event) => onCambiar(transaccion.id, columna.campo, event.target.value)} className={clases} />}</td>
+            })}
+          </tr>)}
+          {transacciones.length > 0 && porMovimiento.map((campo) => <tr key={campo.id} className="border-b border-slate-100 align-top">
+            <th scope="row" data-campo={campo.id} className="sticky left-0 z-[5] border-r border-slate-200 bg-white px-2 py-2 text-left text-[10px] font-bold uppercase tracking-wider text-slate-500">{encabezado(campo)}</th>
+            {transacciones.map((transaccion, index) => {
+              const valor = transaccion.extras?.[campo.id] ?? ''
+              const deIa = esCeldaDeIa(transaccion, campo.id)
+              return <td key={transaccion.id} className={`relative border-r border-slate-100 px-1 py-1 ${filaResaltada === transaccion.id ? 'bg-blue-50/70' : ''}`}><input aria-label={`${campo.nombre} del movimiento ${index + 1}`} data-ia={deIa || undefined} value={valor} title={deIa ? `Llenado por la IA: ${valor}` : valor || undefined} maxLength={500} onChange={(event) => columnas.onCambiar(transaccion.id, campo.id, event.target.value)} className={`w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${deIa ? 'border-violet-100 bg-violet-50 pr-5 text-violet-900' : 'border-transparent bg-transparent hover:border-slate-200'}`} />{deIa && <Sparkles size={10} aria-hidden className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-violet-400" />}</td>
+            })}
+          </tr>)}
+          {delDocumento.map((campo) => <tr key={campo.id} className="border-b border-slate-100 align-top">
+            <th scope="row" data-campo={campo.id} className="sticky left-0 z-[5] border-r border-slate-200 bg-white px-2 py-2 text-left text-[10px] font-bold uppercase tracking-wider text-slate-500">{encabezado(campo)}</th>
+            {/* Dato que aparece una sola vez en el estado de cuenta: una sola casilla para todos los movimientos. */}
+            <td colSpan={Math.max(1, transacciones.length)} className="px-1 py-1"><div className="sticky left-[7.25rem] w-[min(100%,22rem)]" title="Aparece una sola vez en el estado de cuenta: vale para todos los movimientos."><div className="relative"><input aria-label={`${campo.nombre} del documento`} data-ia={campo.valor_ia || undefined} value={campo.valor ?? ''} title={campo.valor_ia ? `Llenado por la IA: ${campo.valor}` : campo.valor || undefined} maxLength={500} placeholder="Sin capturar" onFocus={() => columnas.onEnfocarDocumento(campo.id)} onChange={(event) => columnas.onCambiarValorDocumento(campo.id, event.target.value)} className={claseEntrada(Boolean(campo.valor_ia), `bg-white ${campo.valor_ia ? 'pr-6' : ''} ${columnas.destinoDocumento === campo.id ? 'ring-2 ring-blue-400' : ''}`)} />{campo.valor_ia && <Sparkles size={10} aria-hidden className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-violet-400" />}</div></div></td>
+          </tr>)}
+        </tbody>
+      </table>
+    {transacciones.length === 0 && <div className="px-5 py-14 text-center text-xs text-slate-400">Sin movimientos. Usa <strong>Agregar</strong> para capturar uno.</div>}
+  </div>
 }
 
 /** Encabezado de una columna adicional: nombre, renombrar y eliminar (con confirmación, porque borra sus valores). */
-function EncabezadoCampo({ campo, campos, onRenombrar, onEliminar, onLlenar, llenando, motivoNoLlenar, aviso, onCerrarAviso }: { campo: CampoExtra; campos: CampoExtra[]; onRenombrar: (id: string, nombre: string) => void; onEliminar: (id: string) => void; onLlenar: () => void; llenando: boolean; motivoNoLlenar: string | null; aviso: AvisoCampo | null; onCerrarAviso: () => void }) {
+function EncabezadoCampo({ campo, campos, onRenombrar, onEliminar, onLlenar, llenando, motivoNoLlenar, aviso, onCerrarAviso, onCambiarAlcance = () => undefined, puedeSerDelDocumento = true }: { campo: CampoExtra; campos: CampoExtra[]; onRenombrar: (id: string, nombre: string) => void; onEliminar: (id: string) => void; onLlenar: () => void; llenando: boolean; motivoNoLlenar: string | null; aviso: AvisoCampo | null; onCerrarAviso: () => void; onCambiarAlcance?: (alcance: AlcanceCampo) => void; puedeSerDelDocumento?: boolean }) {
   const [modo, setModo] = useState<'normal' | 'renombrar' | 'confirmar'>('normal')
   const [nombre, setNombre] = useState(campo.nombre)
   const error = modo === 'renombrar' ? errorNombreCampo(nombre, campos, campo.id) : null
@@ -1275,7 +1390,10 @@ function EncabezadoCampo({ campo, campos, onRenombrar, onEliminar, onLlenar, lle
   return <div>
   <div className="flex items-center gap-1">
     <span className="min-w-0 flex-1 truncate" title={campo.origen === 'ia' ? `${campo.nombre} · sugerido por la IA` : campo.nombre}>{campo.origen === 'ia' && <Sparkles size={10} className="mr-1 inline text-violet-500" aria-hidden />}{campo.nombre}</span>
-    {campo.origen === 'manual' && <button type="button" onClick={onLlenar} disabled={llenando || motivoNoLlenar !== null} aria-label={`Llenar con IA el campo ${campo.nombre}`} title={motivoNoLlenar ?? (llenando ? 'Buscando en el documento…' : 'Llenar con IA: busca este dato en el documento y llena solo las celdas vacías')} className="rounded p-0.5 text-violet-500 hover:bg-violet-100 hover:text-violet-700 disabled:cursor-not-allowed disabled:opacity-40">{llenando ? <RefreshCw size={11} className="animate-spin" /> : <Sparkles size={11} />}</button>}
+    {campo.origen === 'manual' && <button type="button" onClick={onLlenar} disabled={llenando || motivoNoLlenar !== null} aria-label={`Llenar con IA el campo ${campo.nombre}`} title={motivoNoLlenar ?? (llenando ? 'Buscando en el documento…' : esDelDocumento(campo) ? 'Llenar con IA: busca este dato en el documento y llena su único valor' : 'Llenar con IA: busca este dato en el documento y llena solo las celdas vacías')} className="rounded p-0.5 text-violet-500 hover:bg-violet-100 hover:text-violet-700 disabled:cursor-not-allowed disabled:opacity-40">{llenando ? <RefreshCw size={11} className="animate-spin" /> : <Sparkles size={11} />}</button>}
+    {esDelDocumento(campo)
+      ? <button type="button" onClick={() => onCambiarAlcance('movimiento')} aria-label={`Cambiar ${campo.nombre} a un valor en cada movimiento`} title="Es un dato del documento (una vez para todos). Cambiar a un valor en cada movimiento: el valor se copia a cada movimiento." className="rounded p-0.5 text-slate-400 hover:bg-slate-200 hover:text-ink"><ArrowRightLeft size={11} /></button>
+      : <button type="button" onClick={() => onCambiarAlcance('documento')} disabled={!puedeSerDelDocumento} aria-label={`Cambiar ${campo.nombre} a dato del documento`} title={puedeSerDelDocumento ? 'Es un valor por movimiento. Cambiar a dato del documento (una vez para todos).' : 'Los movimientos tienen valores distintos: no puede ser un dato único del documento sin perder datos.'} className="rounded p-0.5 text-slate-400 hover:bg-slate-200 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"><ArrowRightLeft size={11} /></button>}
     <button type="button" onClick={() => { setNombre(campo.nombre); setModo('renombrar') }} aria-label={`Renombrar el campo ${campo.nombre}`} className="rounded p-0.5 text-slate-400 hover:bg-slate-200 hover:text-ink"><Pencil size={11} /></button>
     <button type="button" onClick={() => setModo('confirmar')} aria-label={`Eliminar el campo ${campo.nombre}`} className="rounded p-0.5 text-slate-400 hover:bg-red-50 hover:text-red-600"><X size={11} /></button>
   </div>
@@ -1284,8 +1402,9 @@ function EncabezadoCampo({ campo, campos, onRenombrar, onEliminar, onLlenar, lle
 }
 
 /** Botón "+ Campo": agrega una columna desde las sugerencias de la IA o con un nombre escrito a mano. */
-function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar, solicitudAbrir = 0 }: { campos: CampoExtra[]; sugerencias: SugerenciaCampo[]; huboExtraccionIa: boolean; onAplicar: (sugerencia: SugerenciaCampo) => void; onAgregar: (nombre: string) => void; solicitudAbrir?: number }) {
+function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar, solicitudAbrir = 0 }: { campos: CampoExtra[]; sugerencias: SugerenciaCampo[]; huboExtraccionIa: boolean; onAplicar: (sugerencia: SugerenciaCampo) => void; onAgregar: (nombre: string, alcance: AlcanceCampo) => void; solicitudAbrir?: number }) {
   const [abierto, setAbierto] = useState(false)
+  const [alcance, setAlcance] = useState<AlcanceCampo>('documento')
   const [posicion, setPosicion] = useState<{ top: number; right: number } | null>(null)
   const [nombre, setNombre] = useState('')
   const [intentado, setIntentado] = useState(false)
@@ -1326,7 +1445,7 @@ function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar
   const agregarManual = () => {
     setIntentado(true)
     if (error || lleno) return
-    onAgregar(nombre)
+    onAgregar(nombre, alcance)
     cerrar()
   }
   const vacio = sugerencias.length === 0 ? (huboExtraccionIa ? 'La IA no encontró campos adicionales en este documento.' : 'Extrae con Gemini para ver los campos que la IA encuentre en el documento.') : 'Ya agregaste todos los campos que sugirió la IA.'
@@ -1341,14 +1460,16 @@ function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar
         return <li key={sugerencia.clave}><button type="button" disabled={lleno} onClick={() => { onAplicar(sugerencia); cerrar() }} className="w-full rounded-lg border border-slate-100 px-2.5 py-2 text-left hover:border-violet-200 hover:bg-violet-50/60 disabled:opacity-50">
           <div className="flex items-center justify-between gap-2"><span className="truncate font-bold text-ink">{sugerencia.nombre}</span>{filas === null ? <span className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-800">Valor único del documento</span> : <span className="shrink-0 text-[10px] text-slate-400">{filas} fila{filas === 1 ? '' : 's'} con dato</span>}</div>
           <div className="mt-0.5 truncate text-[10px] text-slate-500" title={ejemplo}>Ej.: {ejemplo}</div>
-          {filas === null && <div className="mt-0.5 text-[10px] text-amber-700">Se repetirá en cada fila.</div>}
+          {filas === null && <div className="mt-0.5 text-[10px] text-amber-700">Va una sola vez para todos los movimientos.</div>}
         </button></li>
       })}</ul>}
       <div className="mt-3 border-t border-slate-100 pt-2.5">
         <label htmlFor="nombre-campo-manual" className="flex items-center gap-1.5 text-[11px] font-bold text-ink"><UserRound size={12} />Manual</label>
         <div className="mt-1.5 flex gap-1.5"><input id="nombre-campo-manual" value={nombre} maxLength={60} placeholder="Nombre del campo" onChange={(event) => setNombre(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') agregarManual() }} className="min-w-0 flex-1 rounded-md border border-slate-200 px-2 py-1.5 text-xs text-ink outline-none focus:border-coral focus:ring-2 focus:ring-coral/10" /><button type="button" onClick={agregarManual} className="btn-primary px-2.5 py-1.5 text-xs">Agregar</button></div>
         {intentado && (error || lleno) && <div role="alert" className="mt-1 text-[10px] text-red-600">{lleno ? `La tabla admite hasta ${MAX_CAMPOS_EXTRA} campos adicionales.` : error}</div>}
-        <p className="mt-1 text-[10px] text-slate-400">Se agrega una columna vacía para llenarla a mano.</p>
+        <fieldset className="mt-2"><legend className="text-[10px] font-semibold text-slate-500">¿Dónde aparece este dato?</legend>
+          <div className="mt-1 grid grid-cols-2 gap-1">{([['documento', 'Una vez para todos', 'Ej.: RFC, número de crédito'], ['movimiento', 'En cada movimiento', 'Ej.: sucursal, folio']] as const).map(([valor, titulo, ejemplo]) => <label key={valor} className={`cursor-pointer rounded-lg border px-2 py-1.5 ${alcance === valor ? 'border-coral bg-coral/5 text-ink' : 'border-slate-200 text-slate-500 hover:border-slate-300'}`}><input type="radio" name="alcance-campo" value={valor} checked={alcance === valor} onChange={() => setAlcance(valor)} className="sr-only" /><span className="block text-[11px] font-bold">{titulo}</span><span className="block text-[10px] text-slate-400">{ejemplo}</span></label>)}</div>
+        </fieldset>
       </div>
     </div>}
   </>

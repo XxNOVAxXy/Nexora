@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { CampoExtra, ResultadoCampo, SugerenciaCampo, Transaccion } from '../types'
-import { agregarCampoManual, aplicarSugerencia, camposParaSolicitar, editarExtra, eliminarCampo, errorNombreCampo, esCeldaDeIa, filasConValor, fuenteDeLlenado, llenarColumnaManual, mensajeLlenado, rellenarColumnas, renombrarCampo, sugerenciasDisponibles } from './camposExtra'
+import { agregarCampoManual, aplicarSugerencia, camposParaSolicitar, editarExtra, editarValorDocumento, eliminarCampo, errorNombreCampo, esCeldaDeIa, filasConValor, fuenteDeLlenado, llenarColumnaManual, mensajeLlenado, rellenarColumnas, renombrarCampo, sugerenciasDisponibles } from './camposExtra'
 import { borradoresLocales, documentoDesdeExtraccion, documentoDesdeGuardado, documentoVacio, firmaContenido, hayCambios } from './guardado'
 import type { ExtraccionGuardada } from './extraccionesApi'
 import type { GeminiExtractionResponse } from './geminiApi'
@@ -26,10 +26,13 @@ describe('aplicar sugerencias', () => {
     expect(transacciones.map((t) => t.extras?.[campos_extra[0].id])).toEqual(['F1', 'F2'])
   })
 
-  it('un valor único del documento llena todas las filas, también las manuales', () => {
+  it('un valor único del documento se guarda una sola vez en el campo, no en cada movimiento', () => {
     const manual = { ...nuevaTransaccion(), concepto: 'A MANO' }
-    const { campos_extra, transacciones } = aplicarSugerencia({ transacciones: [fila('a', 'h1'), manual], campos_extra: [] }, credito)
-    expect(transacciones.map((t) => t.extras?.[campos_extra[0].id])).toEqual(['CR-778', 'CR-778'])
+    const actuales = [fila('a', 'h1'), manual]
+    const { campos_extra, transacciones } = aplicarSugerencia({ transacciones: actuales, campos_extra: [] }, credito)
+    expect(campos_extra).toEqual([expect.objectContaining({ nombre: 'Número de crédito', origen: 'ia', alcance: 'documento', valor: 'CR-778' })])
+    expect(transacciones).toBe(actuales)
+    expect(transacciones.every((t) => t.extras === undefined)).toBe(true)
     expect(filasConValor(credito)).toBeNull()
     expect(filasConValor(vsm)).toBe(2)
   })
@@ -148,15 +151,37 @@ describe('la IA llena columnas manuales', () => {
     expect(llenado.map(mensajeLlenado)).toEqual(['No se encontró «Nombre» en el documento.'])
   })
 
-  it('un dato único del documento se repite en cada fila vacía, también en las manuales', () => {
+  it('un dato único del documento no se repite en cada fila: el campo pasa a ser del documento', () => {
+    const actuales = filas()
+    const { transacciones, campos, llenado } = rellenarColumnas(actuales, [nombre], [], [resultado({ valor_documento: 'Persona Prueba' })])
+    expect(transacciones).toBe(actuales)
+    expect(campos).toEqual([{ ...nombre, alcance: 'documento', valor: 'Persona Prueba', valor_ia: true }])
+    expect(llenado.map(mensajeLlenado)).toEqual(['«Nombre» aparece una sola vez en el documento: se guardó una vez, no en cada movimiento.'])
+  })
+
+  it('si el campo ya tiene valores por movimiento, un dato único no los toca ni se repite', () => {
     const actuales = [fila('a', 'h1', { extras: { 'c-nom': 'Juan' } }), ...filas().slice(1)]
-    const { transacciones } = rellenarColumnas(actuales, [nombre], [], [resultado({ valor_documento: 'Persona Prueba' })])
-    expect(transacciones.map((t) => t.extras?.['c-nom'])).toEqual(['Juan', 'Persona Prueba', 'Persona Prueba'])
+    const { transacciones, campos, llenado } = rellenarColumnas(actuales, [nombre], [], [resultado({ valor_documento: 'Persona Prueba' })])
+    expect(transacciones).toBe(actuales)
+    expect(campos).toEqual([nombre])
+    expect(llenado[0]).toMatchObject({ estado: 'unico_con_valores', llenadas: 0 })
+  })
+
+  it('un campo del documento se llena una sola vez, no se sobrescribe y se edita a mano', () => {
+    const rfc: CampoExtra = { id: 'c-rfc', nombre: 'RFC', origen: 'manual', alcance: 'documento', valor: '' }
+    const actuales = filas()
+    const lleno = llenarColumnaManual(actuales, rfc, true, { unico: 'XAXX010101000' })
+    expect(lleno.transacciones).toBe(actuales)
+    expect(lleno.campo).toEqual({ ...rfc, valor: 'XAXX010101000', valor_ia: true })
+    expect(llenarColumnaManual(actuales, lleno.campo, true, { unico: 'OTRO' }).resultado.estado).toBe('completa')
+    expect(llenarColumnaManual(actuales, rfc, true, { porId: new Map([['a', 'X']]) }).resultado.estado).toBe('por_movimiento')
+    expect(editarValorDocumento([lleno.campo], 'c-rfc', 'XAXX010101001')).toEqual([{ ...rfc, valor: 'XAXX010101001' }])
+    expect(agregarCampoManual([], 'RFC', 'documento')).toEqual([expect.objectContaining({ nombre: 'RFC', origen: 'manual', alcance: 'documento', valor: '' })])
   })
 
   it('una columna completa no cambia y lo dice', () => {
     const actuales = [fila('a', 'h1', { extras: { 'c-nom': 'Juan' } })]
-    const { transacciones, resultado: r } = llenarColumnaManual(actuales, nombre, true, { unico: 'Otro' })
+    const { transacciones, resultado: r } = llenarColumnaManual(actuales, nombre, true, { porId: new Map([['a', 'Otro']]) })
     expect(transacciones).toBe(actuales)
     expect(mensajeLlenado(r)).toBe('La columna ya estaba completa; no se cambió nada.')
   })
@@ -170,7 +195,8 @@ describe('la IA llena columnas manuales', () => {
   })
 
   it('editar una celda llenada por la IA le quita la marca y pasa la fila a "IA editada"', () => {
-    const [llena] = rellenarColumnas([fila('a', 'h1')], [nombre], [], [resultado({ valor_documento: 'Ana' })]).transacciones
+    const [llena] = rellenarColumnas([fila('a', 'h1')], [nombre], [], [resultado({ valores: [{ huella: 'h1', valor: 'Ana' }] })]).transacciones
+    expect(esCeldaDeIa(llena, 'c-nom')).toBe(true)
     const editada = editarExtra(llena, 'c-nom', 'Ana María')
     expect(esCeldaDeIa(editada, 'c-nom')).toBe(false)
     expect(editada.origen).toBe('ia_editada')

@@ -318,9 +318,9 @@ class ColumnasYBorrador(Base):
         self.assertEqual(self.gemini.llamadas, [("Nombre", "RFC")])
         guardado = self.almacen.obtener(EMAIL, "m1", "1")
         self.assertEqual([c["nombre"] for c in guardado["campos_extra"]], ["Nombre", "RFC"])
-        fila = guardado["transacciones"][0]
-        self.assertEqual(sorted(fila["extras"].values()), ["Persona", "Persona"])
-        self.assertEqual(sorted(fila["extras_ia"]), sorted(fila["extras"]))
+        # Valor único del documento: una sola vez en el campo, nunca en cada movimiento.
+        self.assertEqual([(c["alcance"], c["valor"], c["valor_ia"]) for c in guardado["campos_extra"]], [("documento", "Persona", True)] * 2)
+        self.assertTrue(all("extras" not in t for t in guardado["transacciones"]))
         self.assertEqual([s["clave"] for s in guardado["sugerencias_campos"]], ["folio"])
 
     def test_columnas_sin_duplicados_y_maximo_treinta(self) -> None:
@@ -336,8 +336,8 @@ class ColumnasYBorrador(Base):
         self.assertEqual([t.id for t in solicitud.transacciones], ["ia-L-1", "ia-L-2"])
         self.assertTrue(all(t.origen == "ia" for t in solicitud.transacciones))
         self.assertEqual(solicitud.estado, "borrador")
-        self.assertEqual(solicitud.transacciones[0].extras, {"campo-auto-L-1": "Persona"})
-        self.assertEqual(solicitud.transacciones[0].extras_ia, ["campo-auto-L-1"])
+        self.assertIsNone(solicitud.transacciones[0].extras)
+        self.assertEqual((solicitud.campos_extra[0].alcance, solicitud.campos_extra[0].valor), ("documento", "Persona"))
 
     def test_valores_por_huella(self) -> None:
         resultado = _resultado()

@@ -1,9 +1,9 @@
 import type { CampoExtra, Resumen, SugerenciaCampo, Transaccion } from '../types'
-import { rellenarColumnas, type ResultadoLlenado } from './camposExtra'
+import { migrarColumnasUnicas, rellenarColumnas, type ResultadoLlenado } from './camposExtra'
 import type { FormatoNumerico, ValidacionContable } from './contabilidad'
 import { ErrorApi, type EstadoExtraccion, type ExtraccionGuardada, type ProblemasRevision } from './extraccionesApi'
 import type { GeminiExtractionResponse } from './geminiApi'
-import { combinarExtraccion, type ResultadoCombinacion } from './transacciones'
+import { combinarExtraccion, ordenarPorFecha, type ResultadoCombinacion } from './transacciones'
 
 /** Lo que el usuario edita de un documento y se persiste en el backend. */
 export type DocumentoEditable = {
@@ -35,12 +35,13 @@ export const conColumnasExtra = (documento: Omit<DocumentoEditable, 'campos_extr
  * vacías de las columnas de la IA se rellenan y las sugerencias se reemplazan por las de esta extracción.
  */
 export function documentoDesdeExtraccion(result: GeminiExtractionResponse, actuales: Transaccion[], lote: string, campos: CampoExtra[] = []): { documento: DocumentoEditable; combinacion: ResultadoCombinacion; llenado: ResultadoLlenado[] } {
-  const combinacion = combinarExtraccion(actuales, result.transacciones, lote)
+  // Los movimientos nuevos se ordenan por fecha (estable) antes de combinarlos; después se pueden renumerar a mano.
+  const combinacion = combinarExtraccion(actuales, ordenarPorFecha(result.transacciones, result.resumen?.periodo ?? ''), lote)
   const sugerencias = Array.isArray(result.sugerencias_campos) ? result.sugerencias_campos : []
   const resultados = Array.isArray(result.resultados_campos) ? result.resultados_campos : []
-  const { transacciones, llenado } = rellenarColumnas(combinacion.transacciones, campos, sugerencias, resultados)
+  const { transacciones, campos: camposLlenos, llenado } = rellenarColumnas(combinacion.transacciones, campos, sugerencias, resultados)
   return {
-    documento: { estado: 'borrador', resumen: result.resumen, transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version, campos_extra: campos, sugerencias_campos: sugerencias },
+    documento: { estado: 'borrador', resumen: result.resumen, transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version, campos_extra: camposLlenos, sugerencias_campos: sugerencias },
     combinacion: { ...combinacion, transacciones },
     llenado,
   }
@@ -136,7 +137,8 @@ export function borradoresLocales(almacen: AlmacenLocal | null = almacenNavegado
         if (!crudo) return null
         const valor = JSON.parse(crudo) as BorradorLocal
         // Un borrador escrito antes de las columnas adicionales abre igual, sin columnas.
-        return valor && Array.isArray(valor.documento?.transacciones) ? { ...valor, documento: conColumnasExtra(valor.documento) } : null
+        // Un borrador anterior a los datos del documento se migra igual que lo guardado en el backend.
+        return valor && Array.isArray(valor.documento?.transacciones) ? { ...valor, documento: migrarColumnasUnicas(conColumnasExtra(valor.documento)) } : null
       } catch {
         return null
       }

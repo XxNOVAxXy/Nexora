@@ -41,7 +41,18 @@ export type CampoExtra = {
   origen: 'ia' | 'manual'
   /** Clave de la sugerencia que la creó: enlaza la columna con la misma sugerencia al re-extraer. */
   clave?: string
+  /**
+   * 'documento': dato que aparece una sola vez en el estado de cuenta (RFC, número de crédito…); se guarda una vez
+   * en `valor` y nunca se repite en cada movimiento. 'movimiento' (o ausente): un valor por movimiento en `extras`.
+   */
+  alcance?: AlcanceCampo
+  /** Valor de un campo del documento. */
+  valor?: string
+  /** El valor del documento lo llenó la IA y el usuario no lo ha editado. */
+  valor_ia?: boolean
 }
+
+export type AlcanceCampo = 'movimiento' | 'documento'
 
 /** Campo que la IA encontró en el documento y no está capturado. Nunca inventa campos ni valores. */
 export type SugerenciaCampo = {

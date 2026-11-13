@@ -45,6 +45,7 @@ from .extracciones import (
 )
 from .gemini import GeminiRequestError, GeminiUnavailableError, clave_campo, normalizar_campos_solicitados
 from .gmail import GmailNotConnectedError, GmailRateLimitError
+from .orden_fechas import ordenar_por_fecha
 
 logger = logging.getLogger("nexora.automatico")
 
@@ -94,36 +95,46 @@ class _CortarCiclo(Exception):
 
 # --- Conversión del resultado de Gemini en borrador (port de documentoDesdeExtraccion del frontend) ----------
 
-def borrador_desde_extraccion(resultado: dict[str, Any], campos: list[str], *, filename: str, attachment_id: str | None, lote: str) -> GuardarExtraccionRequest:
-    """Documento nuevo (sin filas previas): filas de la IA con ids únicos del lote, las columnas pedidas creadas como
-    columnas del usuario y llenadas con lo que la IA encontró (celdas marcadas en ``extras_ia``), y las sugerencias
-    de la IA guardadas para el menú "+ Campo". Las sugerencias no se convierten en columnas: eso lo decide el usuario.
+def borrador_desde_extraccion(resultado: dict[str, Any], campos: list[str], *, filename: str, attachment_id: str | None, lote: str, alcances: dict[str, str] | None = None) -> GuardarExtraccionRequest:
+    """Documento nuevo (sin filas previas): filas de la IA con ids únicos del lote y ordenadas por fecha, las columnas
+    pedidas creadas como campos del usuario y llenadas con lo que la IA encontró, y las sugerencias de la IA guardadas
+    para el menú "+ Campo" (no se convierten en campos: eso lo decide el usuario).
+
+    El tipo de cada campo lo decide la IA: un valor único del documento se guarda una sola vez en el campo
+    (``alcance="documento"``) y valores por fila llenan el renglón de cada movimiento (celdas en ``extras_ia``).
+    Si la IA no lo encontró, el campo conserva el tipo que tenía en la extracción de la que salió (``alcances``,
+    por clave del nombre).
     """
     transacciones = [
         {**fila, "id": f"ia-{lote}-{indice + 1}", "origen": "ia"}
-        for indice, fila in enumerate(resultado.get("transacciones") or [])
+        for indice, fila in enumerate(ordenar_por_fecha(list(resultado.get("transacciones") or []), (resultado.get("resumen") or {}).get("periodo", "")))
     ]
-    columnas = [
-        {"id": f"campo-auto-{lote}-{indice + 1}", "nombre": nombre, "origen": "manual"}
-        for indice, nombre in enumerate(campos[:MAX_CAMPOS_EXTRA])
-    ]
+    columnas: list[dict[str, Any]] = []
+    for indice, nombre in enumerate(campos[:MAX_CAMPOS_EXTRA]):
+        columna: dict[str, Any] = {"id": f"campo-auto-{lote}-{indice + 1}", "nombre": nombre, "origen": "manual"}
+        if (alcances or {}).get(clave_campo(nombre)) == "documento":
+            columna.update(alcance="documento", valor="")
+        columnas.append(columna)
     resultados = {clave_campo(item.get("nombre", "")): item for item in resultado.get("resultados_campos") or []}
     for columna in columnas:
         encontrado = resultados.get(clave_campo(columna["nombre"]))
         if not encontrado or not encontrado.get("encontrado"):
             continue
         valores = encontrado.get("valores") or []
+        unico = (encontrado.get("valor_documento") or "").strip()[:MAX_VALOR_CAMPO]
+        if not valores:
+            # Valor único del documento: una sola vez en el campo, nunca repetido en cada movimiento.
+            if unico:
+                columna.update(alcance="documento", valor=unico, valor_ia=True)
+            continue
+        columna.pop("alcance", None)
+        columna.pop("valor", None)
         por_huella: dict[str, list[str]] = {}
         for item in valores:
             por_huella.setdefault(item.get("huella", ""), []).append(item.get("valor", ""))
-        unico = encontrado.get("valor_documento") or ""
         for fila in transacciones:
-            if valores:
-                cola = por_huella.get(fila.get("huella") or "")
-                valor = cola.pop(0) if cola else ""
-            else:
-                valor = unico
-            valor = valor[:MAX_VALOR_CAMPO]
+            cola = por_huella.get(fila.get("huella") or "")
+            valor = (cola.pop(0) if cola else "")[:MAX_VALOR_CAMPO]
             if not valor:
                 continue
             fila["extras"] = {**(fila.get("extras") or {}), columna["id"]: valor}
@@ -165,6 +176,8 @@ class ExtractorAutomatico:
         self._despertar = threading.Event()
         self._hilo: threading.Thread | None = None
         self._proxima: datetime | None = None
+        # Tipo de cada campo en las extracciones guardadas; se calcula al inicio de cada ciclo.
+        self._alcances: dict[str, str] = {}
 
     # --- Estado persistente -------------------------------------------------------------------
 
@@ -209,18 +222,29 @@ class ExtractorAutomatico:
             self.revisar_ahora()
         return self.estado(email)
 
-    def campos_a_buscar(self, email: str) -> list[str]:
-        """Columnas que el usuario agregó o aceptó en sus extracciones guardadas (más recientes primero, máx. 30).
-        Las sugerencias que no eligió no están en ``campos_extra`` y nunca se piden."""
+    def _campos_guardados(self, email: str) -> list[dict[str, Any]]:
+        """Campos que el usuario agregó o aceptó en sus extracciones guardadas, las más recientes primero."""
         listado = sorted(self.almacen.listar(email), key=lambda item: item.get("actualizado") or "", reverse=True)
-        nombres: list[str] = []
+        campos: list[dict[str, Any]] = []
         for entrada in listado:
             try:
                 documento = self.almacen.obtener(email, entrada["messageId"], entrada["partId"])
             except (ExtraccionDanada, ValueError, TypeError, KeyError):
                 continue
-            nombres += [campo.get("nombre", "") for campo in (documento or {}).get("campos_extra") or []]
-        return normalizar_campos_solicitados(nombres)[:MAX_CAMPOS_EXTRA]
+            campos += list((documento or {}).get("campos_extra") or [])
+        return campos
+
+    def campos_a_buscar(self, email: str) -> list[str]:
+        """Columnas que el usuario agregó o aceptó en sus extracciones guardadas (más recientes primero, máx. 30).
+        Las sugerencias que no eligió no están en ``campos_extra`` y nunca se piden."""
+        return normalizar_campos_solicitados([campo.get("nombre", "") for campo in self._campos_guardados(email)])[:MAX_CAMPOS_EXTRA]
+
+    def alcances_guardados(self, email: str) -> dict[str, str]:
+        """Tipo de cada campo (por clave del nombre) en la extracción más reciente que lo tiene."""
+        alcances: dict[str, str] = {}
+        for campo in self._campos_guardados(email):
+            alcances.setdefault(clave_campo(campo.get("nombre", "")), campo.get("alcance") or "movimiento")
+        return alcances
 
     def estado(self, email: str) -> dict[str, Any]:
         estado = self._leer(email)
@@ -340,6 +364,7 @@ class ExtractorAutomatico:
 
     def _procesar(self, email: str, estado: dict[str, Any], activado: datetime, resumen: dict[str, Any]) -> None:
         campos = self.campos_a_buscar(email)
+        self._alcances = self.alcances_guardados(email)
         ultimo: dict[str, Any] | None = estado.get("ultimo_correo")
         for message_id in self._candidatos(estado, activado):
             if self._parar.is_set():
@@ -401,7 +426,7 @@ class ExtractorAutomatico:
             return self._fallo(email, clave, intentos + 1, str(error) or error.__class__.__name__, resumen)
 
         try:
-            solicitud = borrador_desde_extraccion(resultado, campos, filename=nombre or filename, attachment_id=attachment_id or None, lote=uuid.uuid4().hex[:8])
+            solicitud = borrador_desde_extraccion(resultado, campos, filename=nombre or filename, attachment_id=attachment_id or None, lote=uuid.uuid4().hex[:8], alcances=self._alcances)
             documento = self.almacen.guardar(email, message_id, part_id, solicitud)
         except (ConflictoVersion, EnvioEnCurso):
             # El usuario guardó este documento mientras Gemini extraía: lo suyo se conserva.

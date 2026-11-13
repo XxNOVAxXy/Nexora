@@ -16,7 +16,7 @@ const COLOR: Record<EstadoVerificacion, string> = {
 const ZOOM_MIN = 0.4
 const ZOOM_MAX = 3
 
-const descripcionMarca = (marca: MarcaVerificacion) => `${marca.etiqueta}: documento «${marca.textoDocumento}», capturado «${marca.valorCapturado || 'vacío'}». ${ETIQUETA_ESTADO[marca.estado]}`
+const descripcionMarca = (marca: MarcaVerificacion) => marca.grupo === 'texto' ? `Texto del documento «${marca.textoDocumento}». Haz clic para copiarlo` : `${marca.etiqueta}: documento «${marca.textoDocumento}», capturado «${marca.valorCapturado || 'vacío'}». ${ETIQUETA_ESTADO[marca.estado]}`
 const resaltada = (marca: MarcaVerificacion, resaltado: Resaltado | null) => Boolean(resaltado) && ((resaltado!.transaccionId !== null && marca.transaccionId === resaltado!.transaccionId) || (resaltado!.filaDocumento !== null && marca.filaDocumento === resaltado!.filaDocumento))
 
 type PropsVisor = {
@@ -141,14 +141,20 @@ export function VisorPdf({ datos, filename, urlExterna, pagina, onPagina, onText
             const r = marca.recuadro
             const activa = resaltada(marca, resaltado)
             return <button key={marca.id} type="button" data-marca={marca.id} aria-label={descripcionMarca(marca)} onClick={() => onClicMarca(marca)} onMouseEnter={() => setHover(marca)} onMouseLeave={() => setHover((actual) => (actual?.id === marca.id ? null : actual))} onFocus={() => setHover(marca)} onBlur={() => setHover(null)}
-              className={`absolute rounded-[2px] border transition ${COLOR[marca.estado]} ${activa ? 'z-10 ring-2 ring-blue-500 ring-offset-1' : ''}`}
+              className={`absolute rounded-[2px] border transition ${marca.grupo === 'texto' ? 'border-blue-400/60 bg-blue-400/10 hover:bg-blue-400/35' : COLOR[marca.estado]} ${activa ? 'z-10 ring-2 ring-blue-500 ring-offset-1' : ''}`}
               style={{ left: (r.x - 1.5) * escala, top: (r.y - 1) * escala, width: (r.ancho + 3) * escala, height: (r.alto + 2) * escala }} />
           })}
           {hover && hover.recuadro.pagina === datosPagina.numero && <div role="tooltip" className="pointer-events-none absolute z-30 w-60 rounded-lg border border-slate-200 bg-white p-2.5 text-[11px] leading-5 text-slate-600 shadow-xl" style={{ left: Math.min(hover.recuadro.x * escala, datosPagina.ancho * escala - 248), top: (hover.recuadro.y + hover.recuadro.alto + 3) * escala }}>
-            <div className="font-bold text-ink">{hover.etiqueta}{hover.grupo === 'movimientos' ? ' · movimiento' : ' · resumen'}</div>
-            <div>Documento: <span className="font-semibold text-ink">{hover.textoDocumento}</span></div>
-            <div>Capturado: <span className="font-semibold text-ink">{hover.valorCapturado || '(vacío)'}</span></div>
-            <div className="mt-0.5 font-semibold">{ETIQUETA_ESTADO[hover.estado]}</div>
+            {hover.grupo === 'texto' ? <>
+              <div className="font-bold text-ink">Texto del documento</div>
+              <div><span className="font-semibold text-ink">{hover.textoDocumento}</span></div>
+              <div className="mt-0.5 font-semibold text-blue-700">Haz clic para copiarlo</div>
+            </> : <>
+              <div className="font-bold text-ink">{hover.etiqueta}{hover.grupo === 'movimientos' ? ' · movimiento' : ' · resumen'}</div>
+              <div>Documento: <span className="font-semibold text-ink">{hover.textoDocumento}</span></div>
+              <div>Capturado: <span className="font-semibold text-ink">{hover.valorCapturado || '(vacío)'}</span></div>
+              <div className="mt-0.5 font-semibold">{ETIQUETA_ESTADO[hover.estado]}</div>
+            </>}
           </div>}
         </div>
       </div>)}
