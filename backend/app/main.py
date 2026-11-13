@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Annotated, Any
@@ -10,6 +11,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .adjuntos import content_disposition
+from .automatico import ExtractorAutomatico, intervalo_desde_entorno
 from .config import settings
 from .preferencias import AlmacenClasificaciones, ClasificacionRequest, ConfiguracionCuenta, MigracionRequest, RemitentesRequest
 from .remitentes import CONSULTAS_CARPETA, ListaRemitentesInvalida, coincide, construir_query
@@ -22,7 +24,19 @@ from .gmail import GmailAttachmentError, GmailClient, GmailNotConfiguredError, G
 
 logger = logging.getLogger("nexora.gmail")
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
-app = FastAPI(title="Nexora API", version="0.1.0")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # El hilo arranca con el backend; si el proceso está pausado, cada ciclo termina sin consultar nada.
+    automatico.iniciar()
+    try:
+        yield
+    finally:
+        automatico.detener()
+
+
+app = FastAPI(title="Nexora API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list({settings.frontend_url, "http://localhost:5173", "http://127.0.0.1:5173"}),
@@ -39,6 +53,7 @@ configuracion = ConfiguracionCuenta(settings.configuracion_path)
 clasificaciones = AlmacenClasificaciones(settings.clasificaciones_path)
 # La URL se lee en cada envío para que las pruebas puedan sustituirla.
 envios = ServicioEnvio(almacen, lambda: settings.savedata_url)
+automatico = ExtractorAutomatico(settings.automatico_path, gmail, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos))
 oauth_states: dict[str, datetime] = {}
 
 
@@ -520,3 +535,34 @@ def migrar_clasificaciones(payload: MigracionRequest) -> dict[str, Any]:
         return clasificaciones.migrar(email, payload)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+# --- Extracción automática -----------------------------------------------------------------------
+
+class AutomaticoRequest(BaseModel):
+    activo: bool
+
+
+@app.get("/api/automatico/estado")
+def estado_automatico() -> dict[str, Any]:
+    return automatico.estado(_cuenta_actual())
+
+
+@app.put("/api/automatico")
+def configurar_automatico(payload: AutomaticoRequest) -> dict[str, Any]:
+    """Activa o pausa la extracción automática. La primera activación fija desde cuándo se procesan correos."""
+    email = _cuenta_actual()
+    try:
+        return automatico.configurar(email, payload.activo)
+    except OSError as error:
+        logger.exception("No se pudo guardar el estado de la extraccion automatica")
+        raise HTTPException(status_code=500, detail=f"No se pudo guardar la configuracion: {error}") from error
+
+
+@app.post("/api/automatico/revisar")
+def revisar_automatico() -> dict[str, Any]:
+    """"Revisar ahora": adelanta la siguiente revisión. Nunca envía nada a SaveData."""
+    email = _cuenta_actual()
+    if not automatico.revisar_ahora():
+        raise HTTPException(status_code=409, detail={"code": "revision_en_curso", "message": "Ya hay una revision en curso."})
+    return automatico.estado(email)

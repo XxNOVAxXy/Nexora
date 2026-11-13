@@ -241,6 +241,22 @@ class GmailClient:
             "nextPageToken": siguiente,
         }
 
+    def buscar_ids(self, query: str, max_results: int = 100) -> list[str]:
+        """Solo los ids de ``query`` (5 unidades por página), sin la consulta de no leídos de ``list_messages``."""
+        service = self.service()
+        ids: list[str] = []
+        token: str | None = None
+        while len(ids) < max_results:
+            parametros: dict[str, Any] = {"userId": "me", "q": query, "maxResults": min(50, max_results - len(ids))}
+            if token:
+                parametros["pageToken"] = token
+            listing = _execute(service.users().messages().list(**parametros))
+            ids += [item["id"] for item in listing.get("messages", [])]
+            token = listing.get("nextPageToken")
+            if not token:
+                break
+        return list(dict.fromkeys(ids))[:max_results]
+
     def get_message(self, message_id: str) -> dict[str, Any]:
         return self._message(self.service(), message_id)
 

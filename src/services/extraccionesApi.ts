@@ -107,7 +107,7 @@ function mensajeDeDetalle(detalle: DetalleError, status: number): string {
   return detalle?.message ?? `La API respondió con ${status}.`
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
     response = await fetch(`${API_URL}${path}`, { ...init, headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) } })

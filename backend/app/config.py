@@ -26,6 +26,9 @@ class Settings:
     savedata_settings_path: Path = PROJECT_ROOT / "backend" / "data" / "savedata_settings.json"
     configuracion_path: Path = PROJECT_ROOT / "backend" / "data" / "configuracion"
     clasificaciones_path: Path = PROJECT_ROOT / "backend" / "data" / "clasificaciones"
+    automatico_path: Path = PROJECT_ROOT / "backend" / "data" / "automatico"
+    # Opcional: minutos entre revisiones de la extracción automática (por defecto 20).
+    intervalo_minutos: str = os.getenv("NEXORA_INTERVALO_MINUTOS", "")
     # URL del servicio SaveData; el frontend nunca la llama directamente.
     savedata_url: str = os.getenv("SAVEDATA_URL", "")
 

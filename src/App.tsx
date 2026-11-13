@@ -9,6 +9,8 @@ import { gmailApi, type FiltroCorreo, type GmailAttachment, type GmailMessage, t
 import { geminiApi, type GeminiExtractionResponse, type GeminiStatus } from './services/geminiApi'
 import { ejecutarEnvio, savedataApi, type ConfigSaveData, type VistaPreviaEnvio } from './services/savedataApi'
 import { claveEstado, inboxStore, type EstadosExtraccion, type Listado, type MailFolder } from './services/inboxStore'
+import { automaticoApi, type EstadoAutomatico } from './services/automaticoApi'
+import { estadoDocumento, textoCamposAutomaticos, textoIndicador, type EstadoDocumento } from './services/estadoAutomatico'
 import { extraccionesApi, type EstadoExtraccion, type ExtraccionGuardada, type IntentoEnvio, type ProblemasRevision } from './services/extraccionesApi'
 import { crearColaExtraccion, type ColaExtraccion } from './services/colaExtraccion'
 import { estadoPestana, leerArchivos, urlExtraccionLote, type ArchivoExtraccion, type EstadoCola, type EstadoPestana } from './services/pestanasExtraccion'
@@ -141,6 +143,7 @@ function FilteredGmailInboxPage() {
   const [cargandoMas, setCargandoMas] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [avisoLimite, setAvisoLimite] = useState(false)
+  const [automatico, setAutomatico] = useState<EstadoAutomatico | null>(null)
   const latestRequest = useRef(0)
   const messages = listado?.messages ?? []
   // Adjuntos marcados para extraer: la selección vive fuera del componente y abarca varios correos.
@@ -205,7 +208,38 @@ function FilteredGmailInboxPage() {
 
   useEffect(() => { void loadEmails() }, [folder])
 
-  const estadoAdjunto = (message: GmailMessage, attachment: GmailAttachment): EstadoDocumento => (attachment.partId && estadosExtraccion[claveEstado(message.id, attachment.partId)]?.estado) || 'sin_extraer'
+  // Extracción automática: estado del proceso cada minuto. Cuando guarda extracciones nuevas, se refresca la bandeja.
+  const extraidosAuto = useRef<number | null>(null)
+  const recargarBandeja = useRef(loadEmails)
+  recargarBandeja.current = loadEmails
+  useEffect(() => {
+    let vivo = true
+    const consultar = async () => {
+      try {
+        const estado = await automaticoApi.estado()
+        if (!vivo) return
+        setAutomatico(estado)
+        const extraidos = Object.values(estado.adjuntos).filter((adjunto) => adjunto.estado === 'extraido' || adjunto.estado === 'error').length
+        if (extraidosAuto.current !== null && extraidos !== extraidosAuto.current) void recargarBandeja.current(true)
+        extraidosAuto.current = extraidos
+      } catch {
+        if (vivo) setAutomatico(null) // Sin Gmail conectado o sin backend: el indicador simplemente no se muestra.
+      }
+    }
+    void consultar()
+    const temporizador = window.setInterval(() => void consultar(), 60_000)
+    return () => { vivo = false; window.clearInterval(temporizador) }
+  }, [])
+
+  const estadoAdjunto = (message: GmailMessage, attachment: GmailAttachment): EstadoDocumento => {
+    if (!attachment.partId) return 'sin_extraer'
+    const clave = claveEstado(message.id, attachment.partId)
+    return estadoDocumento(estadosExtraccion[clave], automatico?.adjuntos[clave])
+  }
+  const abrirEnExtraccion = (message: GmailMessage, attachment: GmailAttachment) => {
+    if (attachment.partId) navigate(urlExtraccionLote([{ messageId: message.id, attachmentId: attachment.id, partId: attachment.partId, filename: attachment.filename, mimeType: attachment.mimeType }]))
+  }
+  const indicador = conectadoGmail(status) ? textoIndicador(automatico) : null
   const estadoCorreo = (message: GmailMessage) => resumirEstados(message.attachments.filter(esAdjuntoDocumental).map((attachment) => estadoAdjunto(message, attachment)))
   const visibleSelected = selected && messages.some((message) => message.id === selected.id) ? selected : messages[0] ?? null
   const conectado = Boolean(status?.connected)
@@ -219,6 +253,7 @@ function FilteredGmailInboxPage() {
         <div className="text-xs text-slate-500" role="status">
           {totalMarcados > 0 ? <><strong className="text-ink">{totalMarcados}</strong> archivo{totalMarcados === 1 ? '' : 's'} marcado{totalMarcados === 1 ? '' : 's'} para extraer.</> : 'Marca los PDF o imágenes que quieras extraer, de uno o varios correos.'}
           {avisoLimite && <span className="ml-1 font-semibold text-red-700">Máximo {LIMITE_LOTE} archivos por lote.</span>}
+          {indicador && <div className="mt-1 flex items-center gap-1.5 text-[11px] text-slate-400" title={automatico?.ultimo_error ?? undefined}><span className={`inline-block h-1.5 w-1.5 rounded-full ${automatico?.activo ? (automatico.en_curso ? 'animate-pulse bg-blue-500' : 'bg-emerald-500') : 'bg-slate-300'}`} />{indicador}</div>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {totalMarcados > 0 && <button type="button" onClick={limpiarSeleccion} className="btn-soft px-3 py-2"><X size={14} />Limpiar selección</button>}
@@ -229,7 +264,7 @@ function FilteredGmailInboxPage() {
       <div className="panel grid min-h-[580px] grid-cols-1 overflow-hidden lg:grid-cols-[255px_minmax(350px,1fr)_minmax(390px,1.1fr)]">
         <GmailFoldersReadOnly folder={folder} setFolder={setFolder} status={status} />
         <EmailMessageList messages={messages} selected={visibleSelected} loading={loading} folder={folder} estadoCorreo={estadoCorreo} marcadosEn={(message) => seleccionAdjuntos.contarEnCorreo(message.id)} onSelect={setSelected} puedeCargarMas={Boolean(listado?.nextPageToken)} cargandoMas={cargandoMas} onCargarMas={() => void cargarMas()} />
-        {visibleSelected ? <GmailMessageDetail mail={visibleSelected} resumen={estadoCorreo(visibleSelected)} estadoAdjunto={(attachment) => estadoAdjunto(visibleSelected, attachment)} estaMarcado={(attachment) => seleccionAdjuntos.estaMarcado(visibleSelected.id, attachment.partId)} onAlternar={(attachment) => alternarMarcado(visibleSelected, attachment)} /> : <EmptyMailDetail />}
+        {visibleSelected ? <GmailMessageDetail mail={visibleSelected} resumen={estadoCorreo(visibleSelected)} estadoAdjunto={(attachment) => estadoAdjunto(visibleSelected, attachment)} estaMarcado={(attachment) => seleccionAdjuntos.estaMarcado(visibleSelected.id, attachment.partId)} onAlternar={(attachment) => alternarMarcado(visibleSelected, attachment)} onAbrir={(attachment) => abrirEnExtraccion(visibleSelected, attachment)} /> : <EmptyMailDetail />}
       </div>
     </>
   )
@@ -239,13 +274,14 @@ function EmailMessageList({ messages, selected, loading, folder, estadoCorreo, m
   return <div className="border-t border-slate-200 lg:border-l lg:border-t-0"><div className="border-b border-slate-200 px-4 py-4"><div className="font-semibold text-ink">{folderLabel(folder)}</div><div className="mt-0.5 text-[11px] text-slate-400">{loading ? 'Consultando Gmail...' : `${messages.length} estado${messages.length === 1 ? '' : 's'} de cuenta${puedeCargarMas ? ' · hay más' : ''}`}</div></div><div className="p-2">{loading && <div className="flex items-center justify-center gap-2 py-14 text-xs text-slate-400"><RefreshCw size={16} className="animate-spin" />Consultando Gmail</div>}{!loading && messages.length === 0 && <div className="px-5 py-14 text-center text-xs leading-5 text-slate-400">No hay estados de cuenta en esta carpeta.<br />Se muestran los correos con PDF o imagen cuyo asunto dice “estado de cuenta” o similar.</div>}{!loading && messages.map((mail) => <button key={mail.id} onClick={() => onSelect(mail)} className={`w-full rounded-xl border-b border-slate-100 p-3 text-left transition last:border-b-0 hover:bg-slate-50 ${selected?.id === mail.id ? 'bg-slate-50 ring-1 ring-slate-200' : ''}`}><div className="flex gap-3"><div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><span className={`truncate text-xs ${mail.unread ? 'font-bold text-ink' : 'font-semibold text-slate-600'}`}>{mail.sender}</span><span className="shrink-0 text-[10px] text-slate-400">{timeLabel(mail.receivedAt)}</span></div><div className={`mt-1 truncate text-xs ${mail.unread ? 'font-semibold text-slate-700' : 'text-slate-500'}`}>{mail.subject || '(Sin asunto)'}</div><div className="mt-1 flex items-center gap-2 truncate text-[11px] text-slate-400"><span className="truncate">{mail.snippet || 'Sin vista previa'}</span>{mail.attachments.length > 0 && <Paperclip size={12} className="shrink-0" />}</div><div className="mt-2 flex flex-wrap items-center gap-1.5"><EstadoCorreoBadge resumen={estadoCorreo(mail)} /><MarcadosBadge cantidad={marcadosEn(mail)} /></div></div>{mail.unread && <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-coral" />}</div></button>)}{!loading && puedeCargarMas && <button type="button" onClick={onCargarMas} disabled={cargandoMas} className="btn-soft mt-2 w-full justify-center text-xs"><RefreshCw size={13} className={cargandoMas ? 'animate-spin' : ''} />{cargandoMas ? 'Cargando…' : 'Cargar más'}</button>}</div></div>
 }
 
-type EstadoDocumento = EstadoExtraccion | 'sin_extraer'
 type ResumenEstados = { estado: EstadoDocumento; revisados: number; total: number }
 const estiloEstadoDocumento: Record<EstadoDocumento, { etiqueta: string; clase: string }> = {
   sin_extraer: { etiqueta: 'Sin extraer', clase: 'bg-slate-100 text-slate-500' },
   borrador: { etiqueta: 'Borrador', clase: 'bg-blue-50 text-blue-700' },
   revisado: { etiqueta: 'Revisado', clase: 'bg-emerald-50 text-emerald-700' },
   enviado: { etiqueta: 'Enviado', clase: 'bg-violet-50 text-violet-700' },
+  automatico: { etiqueta: 'Extraído automáticamente', clase: 'bg-blue-50 text-blue-700' },
+  error_auto: { etiqueta: 'Error al extraer', clase: 'bg-red-50 text-red-700' },
 }
 const esAdjuntoDocumental = (attachment: GmailAttachment) => attachmentMime(attachment) === 'application/pdf' || attachmentMime(attachment).startsWith('image/')
 
@@ -253,9 +289,13 @@ const esAdjuntoDocumental = (attachment: GmailAttachment) => attachmentMime(atta
 function resumirEstados(estados: EstadoDocumento[]): ResumenEstados | null {
   if (estados.length === 0) return null
   const revisados = estados.filter((estado) => estado === 'revisado' || estado === 'enviado').length
-  const estado: EstadoDocumento = estados.includes('borrador') ? 'borrador' : revisados === estados.length ? (estados.every((e) => e === 'enviado') ? 'enviado' : 'revisado') : revisados > 0 ? 'borrador' : 'sin_extraer'
+  const estado: EstadoDocumento = estados.includes('borrador') ? 'borrador' : estados.includes('automatico') ? 'automatico' : estados.includes('error_auto') ? 'error_auto' : revisados === estados.length ? (estados.every((e) => e === 'enviado') ? 'enviado' : 'revisado') : revisados > 0 ? 'borrador' : 'sin_extraer'
   return { estado, revisados, total: estados.length }
 }
+
+/** El adjunto ya tiene una extracción guardada (automática o del usuario) que se puede abrir sin volver a extraer. */
+const estadoTieneExtraccion = (estado: EstadoDocumento) => estado !== 'sin_extraer' && estado !== 'error_auto'
+const conectadoGmail = (status: GmailStatus | null) => Boolean(status?.connected)
 
 function EstadoDocumentoBadge({ estado }: { estado: EstadoDocumento }) {
   return <span className={`inline-flex rounded-full px-2 py-1 text-[9px] font-bold ${estiloEstadoDocumento[estado].clase}`}>{estiloEstadoDocumento[estado].etiqueta}</span>
@@ -272,19 +312,19 @@ function MarcadosBadge({ cantidad }: { cantidad: number }) {
   return <span title="Adjuntos de este correo marcados para extraer" className="inline-flex items-center gap-1 rounded-full bg-orange-50 px-2 py-1 text-[9px] font-bold text-coral"><Check size={10} />{cantidad} marcado{cantidad === 1 ? '' : 's'}</span>
 }
 
-function GmailMessageDetail({ mail, resumen, estadoAdjunto, estaMarcado, onAlternar }: { mail: GmailMessage; resumen: ResumenEstados | null; estadoAdjunto: (attachment: GmailAttachment) => EstadoDocumento; estaMarcado: (attachment: GmailAttachment) => boolean; onAlternar: (attachment: GmailAttachment) => void }) {
+function GmailMessageDetail({ mail, resumen, estadoAdjunto, estaMarcado, onAlternar, onAbrir }: { mail: GmailMessage; resumen: ResumenEstados | null; estadoAdjunto: (attachment: GmailAttachment) => EstadoDocumento; estaMarcado: (attachment: GmailAttachment) => boolean; onAlternar: (attachment: GmailAttachment) => void; onAbrir: (attachment: GmailAttachment) => void }) {
   const [preview, setPreview] = useState<GmailAttachment | null>(null)
-  return <div className="border-t border-slate-200 bg-slate-50/30 lg:border-l lg:border-t-0"><div className="flex items-center justify-between border-b border-slate-200 px-5 py-4"><span className="text-xs text-slate-500">Estado de cuenta</span><EstadoCorreoBadge resumen={resumen} /></div><div className="p-5 sm:p-7"><div className="mb-6 flex items-start gap-3"><div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xs font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0"><h3 className="font-display text-base font-bold text-ink">{mail.subject || '(Sin asunto)'}</h3><div className="mt-1 text-xs text-slate-500"><span className="font-semibold text-slate-700">{mail.sender}</span> &lt;{mail.senderEmail}&gt;</div><div className="mt-1 text-[11px] text-slate-400">Para: {mail.to || 'Tu cuenta de Gmail'} · {timeLabel(mail.receivedAt)}</div></div></div><div className="whitespace-pre-line text-sm leading-6 text-slate-600">{mail.body || mail.snippet || 'Este mensaje no contiene texto visible.'}</div>{mail.attachments.length > 0 && <div className="mt-8"><div className="mb-3 text-[10px] font-bold uppercase tracking-wider text-slate-400">{mail.attachments.length} archivo{mail.attachments.length === 1 ? '' : 's'} adjunto{mail.attachments.length === 1 ? '' : 's'}</div><div className="space-y-2">{mail.attachments.map((attachment) => <GmailAttachmentCard key={attachment.id} attachment={attachment} estado={esAdjuntoDocumental(attachment) ? estadoAdjunto(attachment) : null} onPreview={() => setPreview(attachment)} marcado={estaMarcado(attachment)} onAlternar={esSeleccionable(attachment) ? () => onAlternar(attachment) : null} />)}</div></div>}</div>{preview && <AttachmentPreview messageId={mail.id} attachment={preview} onClose={() => setPreview(null)} />}</div>
+  return <div className="border-t border-slate-200 bg-slate-50/30 lg:border-l lg:border-t-0"><div className="flex items-center justify-between border-b border-slate-200 px-5 py-4"><span className="text-xs text-slate-500">Estado de cuenta</span><EstadoCorreoBadge resumen={resumen} /></div><div className="p-5 sm:p-7"><div className="mb-6 flex items-start gap-3"><div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xs font-bold ${avatarTone(mail.senderEmail)}`}>{mail.sender.slice(0, 2).toUpperCase()}</div><div className="min-w-0"><h3 className="font-display text-base font-bold text-ink">{mail.subject || '(Sin asunto)'}</h3><div className="mt-1 text-xs text-slate-500"><span className="font-semibold text-slate-700">{mail.sender}</span> &lt;{mail.senderEmail}&gt;</div><div className="mt-1 text-[11px] text-slate-400">Para: {mail.to || 'Tu cuenta de Gmail'} · {timeLabel(mail.receivedAt)}</div></div></div><div className="whitespace-pre-line text-sm leading-6 text-slate-600">{mail.body || mail.snippet || 'Este mensaje no contiene texto visible.'}</div>{mail.attachments.length > 0 && <div className="mt-8"><div className="mb-3 text-[10px] font-bold uppercase tracking-wider text-slate-400">{mail.attachments.length} archivo{mail.attachments.length === 1 ? '' : 's'} adjunto{mail.attachments.length === 1 ? '' : 's'}</div><div className="space-y-2">{mail.attachments.map((attachment) => <GmailAttachmentCard key={attachment.id} attachment={attachment} estado={esAdjuntoDocumental(attachment) ? estadoAdjunto(attachment) : null} onPreview={() => setPreview(attachment)} marcado={estaMarcado(attachment)} onAlternar={esSeleccionable(attachment) ? () => onAlternar(attachment) : null} onAbrir={esSeleccionable(attachment) && estadoTieneExtraccion(estadoAdjunto(attachment)) ? () => onAbrir(attachment) : null} />)}</div></div>}</div>{preview && <AttachmentPreview messageId={mail.id} attachment={preview} onClose={() => setPreview(null)} />}</div>
 }
 
 function GmailFoldersReadOnly({ folder, setFolder, status }: { folder: MailFolder; setFolder: (value: MailFolder) => void; status: GmailStatus | null }) {
   return <div className="p-4"><div className="mb-4 px-2"><span className="eyebrow">Cuenta conectada</span><div className="mt-3 flex items-center gap-2.5 rounded-lg bg-slate-100 px-3 py-2.5 text-xs font-semibold text-ink"><span className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-100 text-blue-600"><Globe2 size={13} /></span><span className="min-w-0 truncate">{status?.email ?? 'Gmail no conectado'}</span><span className={`ml-auto h-1.5 w-1.5 rounded-full ${status?.connected ? 'bg-emerald-500' : 'bg-amber-400'}`} /></div></div><div className="mb-2 px-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">Carpetas Gmail</div><div className="space-y-1">{carpetasCorreo.map(({ value, label, icon: FolderIcon }) => <button key={value} onClick={() => setFolder(value)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-xs font-medium transition ${folder === value ? 'bg-slate-100 font-semibold text-ink' : 'text-slate-500 hover:bg-slate-50'}`}><FolderIcon size={16} />{label}</button>)}</div></div>
 }
 
-function GmailAttachmentCard({ attachment, estado, onPreview, marcado, onAlternar }: { attachment: GmailAttachment; estado: EstadoDocumento | null; onPreview: () => void; marcado: boolean; onAlternar: (() => void) | null }) {
+function GmailAttachmentCard({ attachment, estado, onPreview, marcado, onAlternar, onAbrir = null }: { attachment: GmailAttachment; estado: EstadoDocumento | null; onPreview: () => void; marcado: boolean; onAlternar: (() => void) | null; onAbrir?: (() => void) | null }) {
   const previewable = attachmentMime(attachment) === 'application/pdf' || attachmentMime(attachment).startsWith('image/')
   // Solo PDF e imágenes se pueden marcar para extraer; los ya extraídos también (al abrirlos se carga lo guardado).
-  return <div className={`flex max-w-md flex-wrap items-center gap-3 rounded-xl border bg-white p-3 ${marcado ? 'border-coral ring-1 ring-coral/30' : 'border-slate-200'}`}>{onAlternar ? <input type="checkbox" checked={marcado} onChange={onAlternar} aria-label={`Marcar ${attachment.filename} para extraer`} className="h-4 w-4 shrink-0 cursor-pointer rounded border-slate-300 text-coral focus:ring-coral" /> : <span className="h-4 w-4 shrink-0" aria-hidden="true" />}<div className="flex h-10 w-10 items-center justify-center rounded-lg bg-red-50 text-red-500">{attachmentMime(attachment).startsWith('image/') ? <FileImage size={20} /> : <FileText size={20} />}</div><div className="min-w-0 flex-1"><div className="truncate text-xs font-semibold text-ink">{attachment.filename}</div><div className="mt-0.5 text-[11px] text-slate-400">{attachmentMime(attachment)} · {formatBytes(attachment.size)}</div>{estado && <div className="mt-1.5"><EstadoDocumentoBadge estado={estado} /></div>}</div>{previewable && <button type="button" onClick={(event) => { event.preventDefault(); event.stopPropagation(); onPreview() }} className="btn-soft px-2.5 py-2 text-[11px]"><FileSearch size={13} />Visualizar</button>}</div>
+  return <div className={`flex max-w-md flex-wrap items-center gap-3 rounded-xl border bg-white p-3 ${marcado ? 'border-coral ring-1 ring-coral/30' : 'border-slate-200'}`}>{onAlternar ? <input type="checkbox" checked={marcado} onChange={onAlternar} aria-label={`Marcar ${attachment.filename} para extraer`} className="h-4 w-4 shrink-0 cursor-pointer rounded border-slate-300 text-coral focus:ring-coral" /> : <span className="h-4 w-4 shrink-0" aria-hidden="true" />}<div className="flex h-10 w-10 items-center justify-center rounded-lg bg-red-50 text-red-500">{attachmentMime(attachment).startsWith('image/') ? <FileImage size={20} /> : <FileText size={20} />}</div><div className="min-w-0 flex-1"><div className="truncate text-xs font-semibold text-ink">{attachment.filename}</div><div className="mt-0.5 text-[11px] text-slate-400">{attachmentMime(attachment)} · {formatBytes(attachment.size)}</div>{estado && <div className="mt-1.5"><EstadoDocumentoBadge estado={estado} /></div>}</div>{previewable && <button type="button" onClick={(event) => { event.preventDefault(); event.stopPropagation(); onPreview() }} className="btn-soft px-2.5 py-2 text-[11px]"><FileSearch size={13} />Visualizar</button>}{onAbrir && <button type="button" onClick={(event) => { event.preventDefault(); event.stopPropagation(); onAbrir() }} className="btn-soft px-2.5 py-2 text-[11px]"><Sparkles size={13} />Abrir en Extracción</button>}</div>
 }
 
 function AttachmentPreview({ messageId, attachment, onClose }: { messageId: string; attachment: GmailAttachment; onClose: () => void }) {
@@ -554,6 +594,8 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const [recargas, setRecargas] = useState(0)
   const [cuentaId, setCuentaId] = useState<string | null>(() => inboxStore.cachedStatus()?.cuentaId ?? null)
   const [ofertaBorrador, setOfertaBorrador] = useState<OfertaBorrador | null>(null)
+  const [abrirMenuCampo, setAbrirMenuCampo] = useState(0)
+  const [sugerenciasCerradas, setSugerenciasCerradas] = useState<string | null>(null)
   const [guardando, setGuardando] = useState(false)
   const [resultadoGuardado, setResultadoGuardado] = useState<{ documentKey: string; tipo: 'exito' | 'error' | 'conflicto'; mensaje: string } | null>(null)
   const [confirmandoRevision, setConfirmandoRevision] = useState<ProblemasRevision | null>(null)
@@ -582,6 +624,8 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const deEsteDocumento = lista.documentKey === documentKey
   const documento = deEsteDocumento ? lista.documento : documentoVacio()
   const transactions = documento.transacciones
+  // Sugerencias de la IA que aún no son columna (p. ej. de una extracción automática): el aviso abre el menú "+ Campo".
+  const sugerenciasPendientes = sugerenciasDisponibles(documento.sugerencias_campos, documento.campos_extra).length
   const aviso = deEsteDocumento ? lista.aviso : null
   const versionGuardada = guardado?.documentKey === documentKey ? guardado : null
   const cargaLista = carga.documentKey === documentKey && carga.estado === 'listo'
@@ -981,6 +1025,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
       {confirmandoReextraccion && <div role="alertdialog" aria-labelledby="confirmar-reextraccion" className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-amber-900"><div id="confirmar-reextraccion" className="font-bold">Este documento tiene {correcciones} corrección{correcciones === 1 ? '' : 'es'} manual{correcciones === 1 ? '' : 'es'}.</div><div className="mt-1 leading-5">Volver a extraer reemplaza solo las filas de la IA sin editar. Las filas manuales y las editadas se conservan; si una fila editada ya no aparece en la nueva extracción, se conserva marcada para revisión. El resultado queda como borrador hasta que lo guardes.</div><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={() => void extraerConGemini()} className="btn-primary px-3 py-1.5 text-xs"><Sparkles size={13} />Re-extraer conservando correcciones</button><button type="button" onClick={() => setConfirmandoReextraccion(false)} className="btn-soft px-3 py-1.5 text-xs">Cancelar</button></div></div>}
       {confirmandoRevision && <div role="alertdialog" aria-labelledby="confirmar-revision" className="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-3 text-xs text-amber-900"><div id="confirmar-revision" className="font-bold">Quedan {confirmandoRevision.total} problema{confirmandoRevision.total === 1 ? '' : 's'} sin resolver.</div><ul className="mt-1.5 list-disc space-y-0.5 pl-5">{confirmandoRevision.diferencias > 0 && <li>{confirmandoRevision.diferencias} comprobación{confirmandoRevision.diferencias === 1 ? '' : 'es'} contable{confirmandoRevision.diferencias === 1 ? '' : 's'} con diferencia.</li>}{confirmandoRevision.dudosos > 0 && <li>{confirmandoRevision.dudosos} importe{confirmandoRevision.dudosos === 1 ? '' : 's'} dudoso{confirmandoRevision.dudosos === 1 ? '' : 's'}.</li>}{confirmandoRevision.invalidos > 0 && <li>{confirmandoRevision.invalidos} importe{confirmandoRevision.invalidos === 1 ? '' : 's'} inválido{confirmandoRevision.invalidos === 1 ? '' : 's'}.</li>}{confirmandoRevision.en_revision > 0 && <li>{confirmandoRevision.en_revision} fila{confirmandoRevision.en_revision === 1 ? '' : 's'} marcada{confirmandoRevision.en_revision === 1 ? '' : 's'} para revisión.</li>}{confirmandoRevision.validacion_incompleta && <li>La validación contable no pudo completarse.</li>}</ul><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={() => void guardar('revisado', true)} className="btn-primary px-3 py-1.5 text-xs">Marcar como revisado de todos modos</button><button type="button" onClick={() => setConfirmandoRevision(null)} className="btn-soft px-3 py-1.5 text-xs">Seguir revisando</button></div></div>}
       {aviso && <div className="mt-3"><AvisoReextraccion aviso={aviso} onClose={() => setLista((prev) => ({ ...prev, aviso: null }))} /></div>}
+      {sugerenciasPendientes > 0 && transactions.length > 0 && sugerenciasCerradas !== documentKey && <div role="status" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-violet-200 bg-violet-50 px-3 py-2.5 text-xs text-violet-800"><span className="flex items-center gap-1.5"><Sparkles size={13} />La IA detectó {sugerenciasPendientes} campo{sugerenciasPendientes === 1 ? '' : 's'} que no está{sugerenciasPendientes === 1 ? '' : 'n'} en la tabla. Revisa las sugerencias y decide si agregarlos.</span><span className="flex gap-2"><button type="button" onClick={() => setAbrirMenuCampo((valor) => valor + 1)} className="btn-soft px-3 py-1.5 text-xs"><Plus size={13} />Ver sugerencias</button><button type="button" aria-label="Cerrar aviso de sugerencias" onClick={() => setSugerenciasCerradas(documentKey)} className="px-1 text-violet-500 hover:text-violet-800"><X size={14} /></button></span></div>}
       {avisoGuardado?.tipo === 'exito' && <div className="mt-3"><Notice text={avisoGuardado.mensaje} onClose={() => setResultadoGuardado(null)} /></div>}
       {avisoGuardado && avisoGuardado.tipo !== 'exito' && <div role="alert" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"><span>{avisoGuardado.mensaje}{avisoGuardado.tipo === 'conflicto' && ' Tus cambios se conservan como borrador local en este navegador.'}</span><span className="flex gap-2">{avisoGuardado.tipo === 'conflicto' && <button type="button" onClick={recargarGuardado} className="btn-soft px-3 py-1.5 text-xs"><RefreshCw size={13} />Cargar la versión guardada</button>}<button type="button" onClick={() => setResultadoGuardado(null)} aria-label="Cerrar error"><X size={16} /></button></span></div>}
     </section>
@@ -1010,7 +1055,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
           motivoNoLlenar: geminiStatus?.enabled !== true ? 'Gemini no está conectado o habilitado.' : null,
           avisos: deEsteDocumento ? lista.avisosCampos : {},
           onCerrarAviso: cerrarAvisoCampo,
-          menu: <MenuCampo campos={documento.campos_extra} sugerencias={documento.sugerencias_campos} huboExtraccionIa={huboExtraccion} onAplicar={elegirSugerencia} onAgregar={agregarCampo} />,
+          menu: <MenuCampo campos={documento.campos_extra} sugerencias={documento.sugerencias_campos} huboExtraccionIa={huboExtraccion} onAplicar={elegirSugerencia} onAgregar={agregarCampo} solicitudAbrir={abrirMenuCampo} />,
         }} alertas={alertas} onCambiar={cambiarCampo} onEliminar={eliminarTransaccion} sinRespaldo={sinRespaldo} resaltado={resaltado} destino={verificando && destino?.tipo === 'movimiento' ? destino : null} onEnfocar={enfocarCeldaMovimiento} /></div>}
         <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-4 py-2.5 text-[11px] text-slate-400"><div className="flex flex-wrap items-center gap-1.5"><CircleHelp size={13} />{`${transactions.length} movimiento${transactions.length === 1 ? '' : 's'}.`}{dudososCount > 0 && <span className="font-semibold text-amber-700">{dudososCount} importe{dudososCount === 1 ? '' : 's'} dudoso{dudososCount === 1 ? '' : 's'}: revísalo{dudososCount === 1 ? '' : 's'} contra el documento.</span>}</div></div>
       </section>
@@ -1239,7 +1284,7 @@ function EncabezadoCampo({ campo, campos, onRenombrar, onEliminar, onLlenar, lle
 }
 
 /** Botón "+ Campo": agrega una columna desde las sugerencias de la IA o con un nombre escrito a mano. */
-function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar }: { campos: CampoExtra[]; sugerencias: SugerenciaCampo[]; huboExtraccionIa: boolean; onAplicar: (sugerencia: SugerenciaCampo) => void; onAgregar: (nombre: string) => void }) {
+function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar, solicitudAbrir = 0 }: { campos: CampoExtra[]; sugerencias: SugerenciaCampo[]; huboExtraccionIa: boolean; onAplicar: (sugerencia: SugerenciaCampo) => void; onAgregar: (nombre: string) => void; solicitudAbrir?: number }) {
   const [abierto, setAbierto] = useState(false)
   const [posicion, setPosicion] = useState<{ top: number; right: number } | null>(null)
   const [nombre, setNombre] = useState('')
@@ -1264,12 +1309,20 @@ function MenuCampo({ campos, sugerencias, huboExtraccionIa, onAplicar, onAgregar
     document.addEventListener('keydown', tecla)
     return () => { document.removeEventListener('mousedown', fuera); document.removeEventListener('scroll', fuera, true); document.removeEventListener('keydown', tecla) }
   }, [abierto])
-  const alternar = () => {
-    if (abierto) return cerrar()
+  const abrir = () => {
     const caja = boton.current?.getBoundingClientRect()
     setPosicion(caja ? { top: caja.bottom + 4, right: Math.max(8, window.innerWidth - caja.right) } : null)
     setAbierto(true)
   }
+  const alternar = () => (abierto ? cerrar() : abrir())
+  // El aviso de sugerencias pendientes pide abrir el menú: primero se lleva el botón a la vista (el menú se cierra al
+  // desplazar, así que se abre cuando el desplazamiento ya terminó).
+  useEffect(() => {
+    if (solicitudAbrir === 0) return
+    boton.current?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })
+    const temporizador = window.setTimeout(abrir, 80)
+    return () => window.clearTimeout(temporizador)
+  }, [solicitudAbrir])
   const agregarManual = () => {
     setIntentado(true)
     if (error || lleno) return
@@ -1382,9 +1435,35 @@ function SettingsPageV3() {
   const disableGemini = async () => {
     try { setGeminiStatus(await geminiApi.disable()); setNotice('Gemini quedó desactivado.'); setError(null) } catch (requestError) { setError(requestError instanceof Error ? requestError.message : 'No se pudo desactivar Gemini.') }
   }
-  return <><PageHeading eyebrow="Integraciones y preferencias" title="Configuración" description="Administra Gmail y Gemini desde Nexora sin editar el archivo .env."><span className="flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700"><ShieldCheck size={14} />Configuración en backend</span></PageHeading>{error && <ErrorNotice text={error} onClose={() => setError(null)} />}{notice && <Notice text={notice} onClose={() => setNotice(null)} />}<div className="mb-7 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500"><div className="flex items-center gap-2"><ShieldCheck size={16} className="text-emerald-600" /><span>Las claves se guardan en FastAPI y nunca se muestran completas ni se almacenan en el navegador.</span></div></div><div className="space-y-5"><IntegrationCard icon={Globe2} iconClass="bg-blue-50 text-blue-600" title="Gmail" description="Conexión real mediante OAuth 2.0." connected={Boolean(gmailStatus?.connected)} onToggle={() => void handleGmail()}><div className="grid gap-4 sm:grid-cols-2"><SettingField label="Cuenta asociada" value={gmailStatus?.email ?? 'No conectada'} /><SettingField label="Estado" value={gmailStatus?.connected ? 'OAuth activo · Gmail API' : 'Esperando autorización'} /></div></IntegrationCard><IntegrationCard icon={Gem} iconClass="bg-violet-50 text-violet-600" title="Gemini" description="Guarda tu API key y activa la extracción desde esta pantalla." connected={Boolean(geminiStatus?.enabled)} onToggle={() => void (geminiStatus?.enabled ? disableGemini() : saveGemini())}><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">API key de Gemini</span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} className="input" placeholder={geminiStatus?.maskedKey ?? 'Pega aquí tu API key'} autoComplete="new-password" /></label><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Modelo</span><select value={model} onChange={(event) => setModel(event.target.value)} className="input"><option value="gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option><option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite · respaldo</option><option value="gemini-3.8-flash">Gemini 3.8 Flash · documentos complejos</option></select></label></div><div className="mt-4 flex flex-wrap items-center gap-2"><button onClick={() => void saveGemini()} className="btn-primary"><Check size={14} />Guardar y activar</button><button onClick={() => void disableGemini()} className="btn-soft" disabled={!geminiStatus?.configured}><X size={14} />Desactivar</button>{geminiStatus?.configured && <span className="text-xs text-slate-500">Key guardada: {geminiStatus.maskedKey}</span>}</div></IntegrationCard><section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-savedata"><div className="mb-5 flex items-start gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600"><Send size={19} /></div><div><h3 id="titulo-config-savedata" className="font-display text-base font-bold text-ink">SaveData</h3><p className="mt-1 text-xs text-slate-500">Envío de extracciones revisadas. La URL se define en el backend con SAVEDATA_URL; el navegador nunca la llama directamente.</p></div></div><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Sucursal predeterminada</span><input type="text" inputMode="numeric" value={sucursalPredeterminada} onChange={(event) => setSucursalPredeterminada(event.target.value)} className="input" placeholder="Ej. 3102" /></label><SettingField label="URL de SaveData" value={savedata ? savedata.url ?? 'Sin configurar (SAVEDATA_URL)' : 'Consultando…'} /></div><div className="mt-4"><button type="button" onClick={() => void guardarSucursal()} className="btn-primary"><Check size={14} />Guardar sucursal</button></div></section></div><div className="mt-8 grid gap-4 md:grid-cols-3"><SmallSetting icon={ShieldCheck} title="Privacidad" description="Key protegida en el servidor" /><SmallSetting icon={Sparkles} title="Modelo activo" description={geminiStatus?.model ?? model} /><SmallSetting icon={Code2} title="API FastAPI" description="Configuración persistente" /></div></>
+  return <><PageHeading eyebrow="Integraciones y preferencias" title="Configuración" description="Administra Gmail y Gemini desde Nexora sin editar el archivo .env."><span className="flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700"><ShieldCheck size={14} />Configuración en backend</span></PageHeading>{error && <ErrorNotice text={error} onClose={() => setError(null)} />}{notice && <Notice text={notice} onClose={() => setNotice(null)} />}<div className="mb-7 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500"><div className="flex items-center gap-2"><ShieldCheck size={16} className="text-emerald-600" /><span>Las claves se guardan en FastAPI y nunca se muestran completas ni se almacenan en el navegador.</span></div></div><div className="space-y-5"><IntegrationCard icon={Globe2} iconClass="bg-blue-50 text-blue-600" title="Gmail" description="Conexión real mediante OAuth 2.0." connected={Boolean(gmailStatus?.connected)} onToggle={() => void handleGmail()}><div className="grid gap-4 sm:grid-cols-2"><SettingField label="Cuenta asociada" value={gmailStatus?.email ?? 'No conectada'} /><SettingField label="Estado" value={gmailStatus?.connected ? 'OAuth activo · Gmail API' : 'Esperando autorización'} /></div></IntegrationCard><IntegrationCard icon={Gem} iconClass="bg-violet-50 text-violet-600" title="Gemini" description="Guarda tu API key y activa la extracción desde esta pantalla." connected={Boolean(geminiStatus?.enabled)} onToggle={() => void (geminiStatus?.enabled ? disableGemini() : saveGemini())}><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">API key de Gemini</span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} className="input" placeholder={geminiStatus?.maskedKey ?? 'Pega aquí tu API key'} autoComplete="new-password" /></label><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Modelo</span><select value={model} onChange={(event) => setModel(event.target.value)} className="input"><option value="gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option><option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite · respaldo</option><option value="gemini-3.8-flash">Gemini 3.8 Flash · documentos complejos</option></select></label></div><div className="mt-4 flex flex-wrap items-center gap-2"><button onClick={() => void saveGemini()} className="btn-primary"><Check size={14} />Guardar y activar</button><button onClick={() => void disableGemini()} className="btn-soft" disabled={!geminiStatus?.configured}><X size={14} />Desactivar</button>{geminiStatus?.configured && <span className="text-xs text-slate-500">Key guardada: {geminiStatus.maskedKey}</span>}</div></IntegrationCard><section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-savedata"><div className="mb-5 flex items-start gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600"><Send size={19} /></div><div><h3 id="titulo-config-savedata" className="font-display text-base font-bold text-ink">SaveData</h3><p className="mt-1 text-xs text-slate-500">Envío de extracciones revisadas. La URL se define en el backend con SAVEDATA_URL; el navegador nunca la llama directamente.</p></div></div><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Sucursal predeterminada</span><input type="text" inputMode="numeric" value={sucursalPredeterminada} onChange={(event) => setSucursalPredeterminada(event.target.value)} className="input" placeholder="Ej. 3102" /></label><SettingField label="URL de SaveData" value={savedata ? savedata.url ?? 'Sin configurar (SAVEDATA_URL)' : 'Consultando…'} /></div><div className="mt-4"><button type="button" onClick={() => void guardarSucursal()} className="btn-primary"><Check size={14} />Guardar sucursal</button></div></section>{gmailStatus?.connected && <TarjetaExtraccionAutomatica onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} />}</div><div className="mt-8 grid gap-4 md:grid-cols-3"><SmallSetting icon={ShieldCheck} title="Privacidad" description="Key protegida en el servidor" /><SmallSetting icon={Sparkles} title="Modelo activo" description={geminiStatus?.model ?? model} /><SmallSetting icon={Code2} title="API FastAPI" description="Configuración persistente" /></div></>
 }
 
+/** Configuración de la extracción automática: interruptor (activar o pausar), "Revisar ahora" y los campos que se pedirán. */
+export function TarjetaExtraccionAutomatica({ onNotice, onError }: { onNotice: (texto: string) => void; onError: (texto: string) => void }) {
+  const [estado, setEstado] = useState<EstadoAutomatico | null>(null)
+  const [ocupado, setOcupado] = useState(false)
+  const mensaje = (requestError: unknown, defecto: string) => (requestError instanceof Error ? requestError.message : defecto)
+  useEffect(() => {
+    let vivo = true
+    void automaticoApi.estado().then((valor) => { if (vivo) setEstado(valor) }).catch((requestError: unknown) => { if (vivo) onError(mensaje(requestError, 'No se pudo consultar la extracción automática.')) })
+    return () => { vivo = false }
+  }, [])
+  const alternar = async () => {
+    if (!estado || ocupado) return
+    setOcupado(true)
+    try {
+      const valor = await automaticoApi.configurar(!estado.activo)
+      setEstado(valor)
+      onNotice(valor.activo ? 'Extracción automática activada: solo se procesarán los correos que lleguen a partir de su activación.' : 'Extracción automática en pausa.')
+    } catch (requestError) { onError(mensaje(requestError, 'No se pudo cambiar la extracción automática.')) } finally { setOcupado(false) }
+  }
+  const revisar = async () => {
+    setOcupado(true)
+    try { setEstado(await automaticoApi.revisarAhora()); onNotice('Revisión iniciada. Los estados de cuenta nuevos aparecerán en Correos ya extraídos.') } catch (requestError) { onError(mensaje(requestError, 'No se pudo iniciar la revisión.')) } finally { setOcupado(false) }
+  }
+  const activo = Boolean(estado?.activo)
+  return <section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-automatico"><div className="mb-5 flex items-start justify-between gap-4"><div className="flex gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-50 text-violet-600"><Sparkles size={19} /></div><div><h3 id="titulo-config-automatico" className="font-display text-base font-bold text-ink">Extracción automática</h3><p className="mt-1 text-xs text-slate-500">Cada {estado?.intervalo_minutos ?? 20} minutos revisa Gmail y extrae los estados de cuenta nuevos como borrador. El envío a SaveData sigue siendo manual.</p></div></div><button type="button" role="switch" aria-checked={activo} aria-label="Extracción automática" onClick={() => void alternar()} disabled={!estado || ocupado} className="flex items-center gap-2 text-xs font-semibold text-slate-500"><span className={`relative h-5 w-9 rounded-full transition ${activo ? 'bg-emerald-500' : 'bg-slate-200'}`}><span className={`absolute top-1 h-3 w-3 rounded-full bg-white shadow transition ${activo ? 'left-5' : 'left-1'}`} /></span>{activo ? 'Activa' : 'En pausa'}</button></div><div className="grid gap-4 sm:grid-cols-2"><SettingField label="Estado" value={textoIndicador(estado) ?? 'Consultando…'} /><SettingField label="Activa desde" value={estado?.activado_en ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(estado.activado_en)) : 'Nunca activada'} /></div>{estado?.ultimo_error && <p className="mt-3 text-[11px] text-red-700">Última revisión con problemas: {estado.ultimo_error}</p>}<p className="mt-4 text-xs text-slate-500">{textoCamposAutomaticos(estado?.campos ?? [])}</p><div className="mt-4"><button type="button" onClick={() => void revisar()} disabled={!activo || ocupado || Boolean(estado?.en_curso)} className="btn-primary"><RefreshCw size={14} className={estado?.en_curso ? 'animate-spin' : ''} />Revisar ahora</button></div></section>
+}
 function IntegrationCard({ icon: CardIcon, iconClass, title, description, connected, onToggle, children }: { icon: Icon; iconClass: string; title: string; description: string; connected: boolean; onToggle: () => void; children: React.ReactNode }) { return <section className="panel p-5 sm:p-6"><div className="mb-6 flex items-start justify-between gap-4"><div className="flex gap-3"><div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${iconClass}`}><CardIcon size={19} /></div><div><h3 className="font-display text-base font-bold text-ink">{title}</h3><p className="mt-1 text-xs text-slate-500">{description}</p></div></div>{title === 'Gmail' ? <button onClick={onToggle} className={connected ? 'btn-soft' : 'btn-primary'}>{connected ? 'Desconectar Gmail' : 'Conectar Gmail'}</button> : <button onClick={onToggle} className="flex items-center gap-2 text-xs font-semibold text-slate-500"><span className={`relative h-5 w-9 rounded-full transition ${connected ? 'bg-emerald-500' : 'bg-slate-200'}`}><span className={`absolute top-1 h-3 w-3 rounded-full bg-white shadow transition ${connected ? 'left-5' : 'left-1'}`} /></span>{connected ? 'Conectado' : 'Desconectado'}</button>}</div>{children}</section> }
 function SettingField({ label, value, placeholder = false }: { label: string; value: string; placeholder?: boolean }) { return <label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">{label}</span><div className={`input flex items-center justify-between ${placeholder ? 'text-slate-400' : ''}`}>{value}{placeholder && <span className="text-[10px] text-slate-400">No guardar</span>}</div></label> }
 function SmallSetting({ icon: SmallIcon, title, description }: { icon: Icon; title: string; description: string }) { return <div className="panel flex items-center gap-3 p-4"><div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-100 text-slate-500"><SmallIcon size={16} /></div><div><div className="text-xs font-bold text-ink">{title}</div><div className="mt-0.5 text-[11px] text-slate-400">{description}</div></div><ChevronRight size={15} className="ml-auto text-slate-300" /></div> }
