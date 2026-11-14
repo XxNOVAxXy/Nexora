@@ -104,7 +104,7 @@ class EnvioTests(unittest.TestCase):
         self.assertEqual(list(externo), ["data"])
         self.assertIsInstance(externo["data"], str)
         interno = json.loads(externo["data"])
-        self.assertEqual(list(interno), ["Archivo", "Resumen", "Datos", "Transacciones", "Validacion"])
+        self.assertEqual(list(interno), ["Id", "Actualizacion", "Archivo", "Resumen", "Datos", "Transacciones", "Validacion"])
         self.assertEqual(interno["Datos"], {})
         self.assertEqual(interno["Archivo"], "estado.pdf")
         self.assertEqual(interno["Resumen"]["saldo_final"], RESUMEN["saldo_final"])
@@ -237,6 +237,128 @@ class EnvioTests(unittest.TestCase):
         reenvio = self.enviar(version, confirmar_reenvio=True)
         self.assertEqual(reenvio.status_code, 200)
         self.assertEqual([i["reenvio"] for i in self.documento()["envios"]], [False, True])
+        # Mismo Id en los dos envíos: SaveData actualiza ese registro en vez de crear otro.
+        internos = [json.loads(json.loads(r["cuerpo"])["data"]) for r in self.servidor.recibidos]
+        self.assertEqual([(i["Id"], i["Actualizacion"]) for i in internos], [("m1__1", False), ("m1__1", True)])
+
+    def internos(self) -> list[dict[str, Any]]:
+        return [json.loads(json.loads(r["cuerpo"])["data"]) for r in self.servidor.recibidos]
+
+    def test_actualizar_un_registro_borrado_en_savedata_pregunta_y_permite_agregarlo_de_nuevo(self) -> None:
+        version = self.guardar()["version"]
+        self.assertEqual(self.enviar(version).status_code, 200)
+        # Alguien borró el registro en SaveData: la actualización regresa code 404.
+        self.servidor.cuerpo = json.dumps({"code": 404, "message": "No existe el registro"}).encode()
+        borrado = self.enviar(version, confirmar_reenvio=True)
+        self.assertEqual(borrado.status_code, 409)
+        self.assertEqual(borrado.json()["detail"]["code"], "savedata_no_existe")
+        self.assertEqual(borrado.json()["detail"]["intento"]["resultado"], "no_existe")
+        self.assertEqual(self.documento()["estado"], "revisado")
+
+        # Sin confirmar no se vuelve a contactar SaveData; la vista previa ya lo marca como alta nueva.
+        self.assertEqual(self.enviar(version, confirmar_reenvio=True).json()["detail"]["code"], "savedata_no_existe")
+        self.assertEqual(len(self.servidor.recibidos), 2)
+        vista = self.api.post("/api/extracciones/m1/1/enviar/vista-previa", json={"sucursal": 3102, "articulo": "10000453"}).json()
+        self.assertTrue(vista["borrado_en_savedata"])
+        self.assertFalse(vista["interno"]["Actualizacion"])
+
+        # Agregar de nuevo: mismo Id, como alta nueva.
+        self.servidor.cuerpo = json.dumps(RESPUESTA_EXITO).encode()
+        agregado = self.enviar(self.documento()["version"], agregar_de_nuevo=True)
+        self.assertEqual(agregado.status_code, 200, agregado.text)
+        self.assertTrue(agregado.json()["intento"]["agregado_de_nuevo"])
+        self.assertEqual(self.documento()["estado"], "enviado")
+        self.assertEqual([(i["Id"], i["Actualizacion"]) for i in self.internos()], [("m1__1", False), ("m1__1", True), ("m1__1", False)])
+        self.assertEqual([i["resultado"] for i in self.documento()["envios"]], ["exito", "no_existe", "exito"])
+
+    def test_historial_de_envios_muestra_lo_que_falto_y_si_se_completo(self) -> None:
+        self.assertEqual(self.api.get("/api/envios").json(), {"documentos": []})
+        rfc = {"id": "rfc", "nombre": "RFC", "origen": "manual", "alcance": "documento", "valor": ""}
+        version = self.guardar(campos_extra=[rfc])["version"]
+        self.enviar(version)
+        documento = self.api.get("/api/envios").json()["documentos"][0]
+        self.assertEqual((documento["id"], documento["messageId"], documento["partId"], documento["filename"]), ("m1__1", "m1", "1", "estado.pdf"))
+        self.assertEqual(documento["ultimo"]["resultado"], "exito")
+        self.assertEqual(documento["ultimo"]["faltantes"], ["RFC"])
+        self.assertFalse(documento["modificado_tras_envio"])
+
+        # Se completa el RFC: queda pendiente de actualizar; al actualizar ya no falta nada.
+        version = self.guardar(version_base=version, campos_extra=[{**rfc, "valor": "XAXX010101000"}])["version"]
+        self.assertTrue(self.api.get("/api/envios").json()["documentos"][0]["modificado_tras_envio"])
+        self.enviar(version, confirmar_reenvio=True)
+        documento = self.api.get("/api/envios").json()["documentos"][0]
+        self.assertEqual([i["faltantes"] for i in documento["intentos"]], [["RFC"], []])
+        self.assertFalse(documento["modificado_tras_envio"])
+
+    def eliminar(self, confirmar: bool = True):
+        return self.api.post("/api/extracciones/m1/1/eliminar", json={"confirmar": confirmar})
+
+    def test_eliminar_de_savedata_manda_el_id_y_deja_el_documento_para_enviarlo_de_nuevo(self) -> None:
+        version = self.guardar()["version"]
+        self.enviar(version)
+        self.assertEqual(self.eliminar(confirmar=False).status_code, 400)
+        self.assertEqual(len(self.servidor.recibidos), 1)
+
+        eliminado = self.eliminar()
+        self.assertEqual(eliminado.status_code, 200, eliminado.text)
+        self.assertEqual(eliminado.json()["resultado"], "eliminado")
+        self.assertEqual(self.internos()[-1], {"Id": "m1__1", "Eliminar": True})
+        documento = self.documento()
+        self.assertEqual((documento["estado"], documento["envios"][-1]["accion"], documento["envios"][-1]["resultado"]), ("revisado", "eliminar", "exito"))
+        self.assertIsNotNone(documento["eliminado_en"])
+
+        # Ya no hay nada que eliminar; el historial lo muestra eliminado.
+        self.assertEqual(self.eliminar().json()["detail"]["code"], "nada_que_eliminar")
+        historial = self.api.get("/api/envios").json()["documentos"][0]
+        self.assertEqual((historial["en_savedata"], historial["ultimo"]["accion"]), ("eliminado", "eliminar"))
+        vista = self.api.post("/api/extracciones/m1/1/enviar/vista-previa", json={"sucursal": 3102, "articulo": "10000453"}).json()
+        self.assertEqual((vista["eliminado_de_savedata"], vista["puede_eliminar"], vista["requiere_confirmar_reenvio"]), (True, False, False))
+
+        # Enviarlo de nuevo: alta nueva con el mismo Id, sin pedir confirmación de reenvío.
+        reenviado = self.enviar(self.documento()["version"])
+        self.assertEqual(reenviado.status_code, 200, reenviado.text)
+        self.assertEqual((self.internos()[-1]["Id"], self.internos()[-1]["Actualizacion"]), ("m1__1", False))
+        self.assertEqual(self.api.get("/api/envios").json()["documentos"][0]["en_savedata"], "presente")
+
+    def test_eliminar_cuando_savedata_ya_no_lo_tiene_cuenta_como_eliminado(self) -> None:
+        self.enviar(self.guardar()["version"])
+        self.servidor.cuerpo = json.dumps({"code": 404, "message": "No existe"}).encode()
+        self.assertEqual(self.eliminar().json()["resultado"], "eliminado")
+        self.assertEqual(self.api.get("/api/envios").json()["documentos"][0]["en_savedata"], "eliminado")
+
+    def test_eliminar_con_error_de_savedata_no_cambia_nada(self) -> None:
+        self.enviar(self.guardar()["version"])
+        self.servidor.cuerpo = json.dumps({"code": 500, "message": "Fallo"}).encode()
+        respuesta = self.eliminar()
+        self.assertEqual((respuesta.status_code, respuesta.json()["detail"]["code"]), (502, "savedata_error"))
+        self.assertEqual(self.documento()["estado"], "enviado")
+        self.assertEqual(self.api.get("/api/envios").json()["documentos"][0]["en_savedata"], "presente")
+
+    def test_no_se_elimina_lo_que_nunca_se_envio(self) -> None:
+        self.guardar()
+        self.assertEqual(self.eliminar().json()["detail"]["code"], "nada_que_eliminar")
+        self.assertEqual(self.servidor.recibidos, [])
+
+    def test_agregar_de_nuevo_solo_si_savedata_lo_reporto_borrado(self) -> None:
+        version = self.guardar()["version"]
+        self.enviar(version)
+        respuesta = self.enviar(self.documento()["version"], agregar_de_nuevo=True)
+        self.assertEqual(respuesta.json()["detail"]["code"], "agregar_no_permitido")
+        self.assertEqual(len(self.servidor.recibidos), 1)
+
+    def test_http_404_con_code_404_tambien_es_registro_borrado(self) -> None:
+        version = self.guardar()["version"]
+        self.enviar(version)
+        self.servidor.status = 404
+        self.servidor.cuerpo = json.dumps({"code": 404, "message": "No existe"}).encode()
+        self.assertEqual(self.enviar(version, confirmar_reenvio=True).json()["detail"]["code"], "savedata_no_existe")
+
+    def test_404_en_un_alta_nueva_es_error_no_registro_borrado(self) -> None:
+        version = self.guardar()["version"]
+        self.servidor.cuerpo = json.dumps({"code": 404, "message": "No existe"}).encode()
+        respuesta = self.enviar(version)
+        self.assertEqual((respuesta.status_code, respuesta.json()["detail"]["code"]), (502, "savedata_error"))
+        self.assertEqual(self.documento()["envios"][-1]["resultado"], "error")
 
     def test_editar_despues_de_enviar_vuelve_a_borrador_y_conserva_historial(self) -> None:
         version = self.guardar()["version"]

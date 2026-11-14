@@ -43,11 +43,14 @@ export type ExtraccionGuardada = {
   problemas: ProblemasRevision
 }
 
-export type ResultadoIntento = 'exito' | 'error' | 'incierto' | 'en_curso'
+/** no_existe: se actualizó un registro que alguien borró en SaveData. */
+export type ResultadoIntento = 'exito' | 'error' | 'incierto' | 'en_curso' | 'no_existe'
 
 /** Un intento de envío a SaveData, tal como queda auditado en el backend. */
 export type IntentoEnvio = {
   id: string
+  /** enviar (por defecto en intentos viejos) o eliminar de SaveData. */
+  accion?: 'enviar' | 'eliminar'
   iniciado_en: string
   terminado_en: string | null
   resultado: ResultadoIntento
@@ -57,12 +60,17 @@ export type IntentoEnvio = {
   http_status: number | null
   respuesta: string | null
   error: string | null
-  sucursal: number
-  articulo: string
-  carga_inicial: boolean
-  totales: { abonos: string; cargos: string }
+  /** null en una eliminación. */
+  sucursal: number | null
+  articulo: string | null
+  carga_inicial: boolean | null
+  totales: { abonos: string; cargos: string } | null
   version_extraccion: number
   reenvio: boolean
+  /** Se envió como actualización del mismo Id. */
+  actualizacion?: boolean
+  /** Se volvió a agregar después de que SaveData lo reportó borrado. */
+  agregado_de_nuevo?: boolean
 }
 
 export type EntradaListado = {

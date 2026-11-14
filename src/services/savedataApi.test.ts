@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ejecutarEnvio, savedataApi } from './savedataApi'
+import { ejecutarEliminacion, ejecutarEnvio, savedataApi } from './savedataApi'
 
 const respuesta = (status: number, cuerpo: unknown) => new Response(JSON.stringify(cuerpo), { status, headers: { 'Content-Type': 'application/json' } })
 const datos = { version_base: 2, sucursal: 3102, articulo: '10000453', carga_inicial: false, confirmar_reenvio: false }
@@ -34,6 +34,32 @@ describe('envío a SaveData desde el navegador', () => {
   it('reenvío sin confirmar: pide confirmación', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(respuesta(409, { detail: { code: 'requiere_confirmar_reenvio', message: 'Confirma', envio_previo: intento } })))
     expect(await enviar()).toMatchObject({ ok: false, tipo: 'requiere_confirmar_reenvio' })
+  })
+
+  it('registro borrado en SaveData: pide confirmar si se agrega de nuevo, con la extracción auditada', async () => {
+    const borrado = { ...intento, resultado: 'no_existe' }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(respuesta(409, { detail: { code: 'savedata_no_existe', message: 'SaveData indica que el registro ya no existe (lo borraron).', intento: borrado, extraccion } })))
+    const resultado = await enviar()
+    expect(resultado).toMatchObject({ ok: false, tipo: 'no_existe', intento: borrado, extraccion })
+  })
+
+  it('agregar de nuevo manda agregar_de_nuevo al backend', async () => {
+    const fetch = vi.fn().mockResolvedValue(respuesta(200, { resultado: 'exito', mensaje: 'ok', intento: { ...intento, resultado: 'exito' }, extraccion }))
+    vi.stubGlobal('fetch', fetch)
+    await ejecutarEnvio(() => savedataApi.enviar('m1', '1', { ...datos, confirmar_reenvio: true, agregar_de_nuevo: true }))
+    expect(JSON.parse(fetch.mock.calls[0][1].body as string)).toMatchObject({ agregar_de_nuevo: true })
+  })
+
+  it('eliminar de SaveData: llama al backend con confirmación y distingue éxito, error e incierto', async () => {
+    const fetch = vi.fn().mockResolvedValue(respuesta(200, { resultado: 'eliminado', mensaje: 'SaveData elimino el registro.', intento, extraccion }))
+    vi.stubGlobal('fetch', fetch)
+    expect(await ejecutarEliminacion('m1', '1')).toEqual({ ok: true, mensaje: 'SaveData elimino el registro.', extraccion })
+    expect(fetch.mock.calls[0][0]).toBe('/api/extracciones/m1/1/eliminar')
+    expect(JSON.parse(fetch.mock.calls[0][1].body as string)).toEqual({ confirmar: true })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(respuesta(502, { detail: { code: 'savedata_error', message: 'Fallo', intento, extraccion } })))
+    expect(await ejecutarEliminacion('m1', '1')).toEqual({ ok: false, mensaje: 'Fallo', incierto: false, extraccion })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(respuesta(502, { detail: { code: 'savedata_incierto', message: 'Sin respuesta', intento, extraccion } })))
+    expect(await ejecutarEliminacion('m1', '1')).toMatchObject({ ok: false, incierto: true })
   })
 
   it('error de red con el backend o respuesta sin confirmar: no es éxito', async () => {

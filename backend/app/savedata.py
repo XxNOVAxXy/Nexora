@@ -6,6 +6,11 @@
 - Cada intento queda auditado en el documento (cuerpo exacto enviado, respuesta, error). Antes de enviar se
   registra como ``en_curso``; si el proceso cae a mitad, el intento queda así y exige confirmar el reenvío.
 - Un timeout es "incierto": SaveData pudo haber recibido el envío, así que reenviar también exige confirmación.
+- Cada documento va con un "Id" fijo. Una actualización ("Actualizacion": true) de un registro que alguien
+  borró en SaveData regresa ``code == 404``: queda como ``no_existe`` y el usuario decide si agregarlo de nuevo
+  (se reenvía con el mismo Id y "Actualizacion": false).
+- "Eliminar de SaveData" manda {"Id": ..., "Eliminar": true}. code 200 (borrado) o 404 (ya no existía) dejan el
+  documento como eliminado; el documento sigue en Nexora y puede enviarse de nuevo como alta nueva.
 """
 
 from __future__ import annotations
@@ -31,7 +36,10 @@ logger = logging.getLogger("nexora.savedata")
 
 SAVEDATA_TIMEOUT_SECONDS = 30
 MAX_RESPUESTA_GUARDADA = 10_000
-ResultadoIntento = Literal["exito", "error", "incierto", "en_curso"]
+ResultadoIntento = Literal["exito", "error", "incierto", "en_curso", "no_existe"]
+# code que SaveData responde cuando se actualiza un Id que ya no existe (lo borraron).
+CODE_NO_EXISTE = 404
+MENSAJE_NO_EXISTE = "SaveData indica que el registro ya no existe (lo borraron)."
 
 
 # --- Conversión (reglas provisionales) ---------------------------------------------------------
@@ -85,7 +93,7 @@ def totales_de(documento: dict[str, Any]) -> TotalesEnvio:
 
 @dataclass(frozen=True)
 class RespuestaSaveData:
-    resultado: Literal["exito", "error", "incierto"]
+    resultado: Literal["exito", "error", "incierto", "no_existe"]
     http_status: int | None
     respuesta: str
     mensaje: str
@@ -105,6 +113,25 @@ def _leer_cuerpo(origen: Any) -> str:
         return ""
 
 
+def _code_de(texto: str) -> tuple[Any, Any]:
+    """(code, message) del JSON de SaveData; (None, None) si no es JSON con esa forma."""
+    try:
+        datos = json.loads(texto)
+    except ValueError:
+        return None, None
+    if not isinstance(datos, dict):
+        return None, None
+    return datos.get("code"), datos.get("message")
+
+
+def _es_no_existe(code: Any) -> bool:
+    return code == CODE_NO_EXISTE and not isinstance(code, bool)
+
+
+def _no_existe(status: int | None, texto: str, mensaje: Any) -> RespuestaSaveData:
+    return RespuestaSaveData("no_existe", status, texto, f"{MENSAJE_NO_EXISTE} {mensaje}" if mensaje else MENSAJE_NO_EXISTE)
+
+
 def enviar_a_savedata(url: str, cuerpo: str, timeout: float = SAVEDATA_TIMEOUT_SECONDS) -> RespuestaSaveData:
     # Sin proxies del entorno (SaveData es un servidor interno) y sin seguir redirecciones.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SinRedirecciones())
@@ -118,7 +145,11 @@ def enviar_a_savedata(url: str, cuerpo: str, timeout: float = SAVEDATA_TIMEOUT_S
             texto = _leer_cuerpo(error)
         finally:
             error.close()
-        return RespuestaSaveData("error", error.code, texto[:MAX_RESPUESTA_GUARDADA], f"SaveData respondio HTTP {error.code}.")
+        texto = texto[:MAX_RESPUESTA_GUARDADA]
+        code, mensaje = _code_de(texto)
+        if _es_no_existe(code):
+            return _no_existe(error.code, texto, mensaje)
+        return RespuestaSaveData("error", error.code, texto, f"SaveData respondio HTTP {error.code}.")
     except TimeoutError:
         return RespuestaSaveData("incierto", None, "", f"SaveData no respondio en {timeout:g} s; no se sabe si recibio el envio.")
     except urllib.error.URLError as error:
@@ -138,6 +169,8 @@ def enviar_a_savedata(url: str, cuerpo: str, timeout: float = SAVEDATA_TIMEOUT_S
         return RespuestaSaveData("error", status, texto, "SaveData respondio HTTP 200, pero la respuesta no es JSON.")
     code = datos.get("code") if isinstance(datos, dict) else None
     mensaje = datos.get("message") if isinstance(datos, dict) else None
+    if _es_no_existe(code):
+        return _no_existe(status, texto, mensaje)
     if code != 200 or isinstance(code, bool):
         return RespuestaSaveData("error", status, texto, f"SaveData respondio HTTP 200 con code={code!r}: {mensaje or 'sin mensaje'}.")
     return RespuestaSaveData("exito", status, texto, f"SaveData confirmo el envio: {mensaje or 'Exito'}.")
@@ -180,6 +213,8 @@ class EnvioRequest(BaseModel):
     articulo: str = Field(min_length=1, max_length=50)
     carga_inicial: bool = False
     confirmar_reenvio: bool = False
+    # Solo después de que SaveData respondió que el registro ya no existe: se envía como alta nueva.
+    agregar_de_nuevo: bool = False
 
     @field_validator("articulo")
     @classmethod
@@ -193,10 +228,51 @@ def _ahora() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+EstadoEnSaveData = Literal["nunca", "presente", "borrado", "eliminado"]
+
+
+def estado_en_savedata(documento: dict[str, Any]) -> EstadoEnSaveData:
+    """Lo que SaveData tiene de este documento según el historial (los errores no cambian nada).
+
+    - presente: algún envío pudo llegar (éxito, incierto o interrumpido) y no se ha eliminado.
+    - borrado: alguien lo borró en SaveData (una actualización respondió code 404).
+    - eliminado: lo eliminamos nosotros desde Nexora ("Eliminar de SaveData").
+    """
+    estado: EstadoEnSaveData = "nunca"
+    for intento in documento.get("envios") or []:
+        resultado = intento.get("resultado")
+        if intento.get("accion", "enviar") == "eliminar":
+            if resultado in {"exito", "no_existe"}:
+                estado = "eliminado"
+        elif resultado in {"exito", "incierto", "en_curso"}:
+            estado = "presente"
+        elif resultado == "no_existe":
+            estado = "borrado"
+    return estado
+
+
 def _requiere_confirmar_reenvio(documento: dict[str, Any]) -> dict[str, Any] | None:
-    """Último intento que pudo llegar a SaveData (exitoso, incierto o interrumpido), si existe."""
-    previos = [intento for intento in documento.get("envios", []) if intento.get("resultado") in {"exito", "incierto", "en_curso"}]
+    """Último envío que pudo llegar a SaveData (exitoso, incierto o interrumpido), si existe y no se eliminó."""
+    if estado_en_savedata(documento) == "eliminado":
+        return None
+    previos = [intento for intento in documento.get("envios", []) if intento.get("accion", "enviar") == "enviar" and intento.get("resultado") in {"exito", "incierto", "en_curso"}]
     return previos[-1] if previos else None
+
+
+def borrado_en_savedata(documento: dict[str, Any]) -> bool:
+    """True si SaveData respondió que el registro ya no existe (alguien lo borró allá)."""
+    return estado_en_savedata(documento) == "borrado"
+
+
+def eliminado_de_savedata(documento: dict[str, Any]) -> bool:
+    """True si lo eliminamos de SaveData desde Nexora."""
+    return estado_en_savedata(documento) == "eliminado"
+
+
+def documento_id(documento: dict[str, Any]) -> str | None:
+    """Id fijo del documento: no cambia aunque se edite o se reenvíe."""
+    message_id, part_id = documento.get("messageId"), documento.get("partId")
+    return f"{message_id}__{part_id}" if message_id and part_id else None
 
 
 CAMPOS_RESUMEN = ("banco", "titular", "cuenta", "periodo", "moneda", "saldo_inicial", "total_cargos", "total_abonos", "saldo_final")
@@ -208,7 +284,7 @@ def _texto_o_nulo(valor: Any) -> str | None:
     return texto or None
 
 
-def datos_documento(documento: dict[str, Any], totales: TotalesEnvio, configurados: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+def datos_documento(documento: dict[str, Any], totales: TotalesEnvio, configurados: Sequence[dict[str, Any]] = (), actualizacion: bool | None = None) -> dict[str, Any]:
     """ÚNICA función que arma el JSON interno de SaveData (formato provisional hasta que se confirme).
 
     - "Resumen" y "Transacciones" como siempre: solo datos del estado de cuenta, sin campos internos de Nexora
@@ -217,7 +293,14 @@ def datos_documento(documento: dict[str, Any], totales: TotalesEnvio, configurad
     - Campos "En cada movimiento": dentro de cada movimiento, con su nombre, después de los campos fijos.
     - Un campo vacío o no encontrado va como null. Los campos de la configuración (``configurados``) que el
       documento no tiene también van, como null.
+    - "Id": identificador fijo del documento (``messageId__partId``); es el mismo en cada reenvío, para que
+      SaveData actualice ese registro en lugar de crear otro.
+    - "Actualizacion": true si el documento ya se había enviado antes (éxito, incierto o interrumpido);
+      ``actualizacion`` lo fuerza (False al agregarlo de nuevo después de que lo borraron en SaveData).
     """
+    identificador = documento_id(documento)
+    if actualizacion is None:
+        actualizacion = _requiere_confirmar_reenvio(documento) is not None
     # Lo mismo que ve el usuario al abrir el documento: columnas únicas migradas y campos vinculados a la
     # configuración (con su nombre actual); los configurados que faltan se agregan vacíos y salen como null.
     documento = aplicar_plantilla(migrar_columnas_unicas(documento), list(configurados))
@@ -235,6 +318,8 @@ def datos_documento(documento: dict[str, Any], totales: TotalesEnvio, configurad
         transacciones.append({**fijos, **{str(campo["nombre"]): _texto_o_nulo(extras.get(campo["id"])) for campo in por_movimiento}})
     validacion = documento.get("validacion") or {}
     return {
+        "Id": identificador,
+        "Actualizacion": actualizacion,
         "Archivo": documento.get("filename"),
         "Resumen": {campo: resumen.get(campo, "") for campo in CAMPOS_RESUMEN},
         "Datos": {str(campo["nombre"]): _texto_o_nulo(campo.get("valor")) for campo in del_documento},
@@ -243,10 +328,10 @@ def datos_documento(documento: dict[str, Any], totales: TotalesEnvio, configurad
     }
 
 
-def preparar_envio(documento: dict[str, Any], *, sucursal: int, articulo: str, carga_inicial: bool, configurados: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+def preparar_envio(documento: dict[str, Any], *, sucursal: int, articulo: str, carga_inicial: bool, configurados: Sequence[dict[str, Any]] = (), actualizacion: bool | None = None) -> dict[str, Any]:
     # Se envía solo nuestra extracción. construir_saldos() (formato H/S de SaveData) queda disponible pero no se usa.
     totales = totales_de(documento)
-    interno = datos_documento(documento, totales, configurados)
+    interno = datos_documento(documento, totales, configurados, actualizacion)
     return {"interno": interno, "cuerpo": serializar_cuerpo(interno), "totales": {"abonos": formatear_decimal(totales.abonos), "cargos": formatear_decimal(totales.cargos)}}
 
 
@@ -272,7 +357,8 @@ class ServicioEnvio:
         documento = self.almacen.leer_completo(email, message_id, part_id)
         if documento is None:
             raise NoSePuedeEnviar("sin_extraccion", "Guarda la extraccion antes de prepararla para SaveData.", 404)
-        preparado = preparar_envio(documento, sucursal=sucursal, articulo=articulo, carga_inicial=carga_inicial, configurados=self.configurados(email))
+        borrado = borrado_en_savedata(documento)
+        preparado = preparar_envio(documento, sucursal=sucursal, articulo=articulo, carga_inicial=carga_inicial, configurados=self.configurados(email), actualizacion=False if borrado else None)
         motivos = motivos_para_no_enviar(documento, not self.url())
         previo = _requiere_confirmar_reenvio(documento)
         return {
@@ -284,6 +370,11 @@ class ServicioEnvio:
             "motivos": motivos,
             "requiere_confirmar_reenvio": previo is not None,
             "envio_previo": previo,
+            # El último envío regresó que SaveData ya no tiene el registro: el siguiente sería "agregar de nuevo".
+            "borrado_en_savedata": borrado,
+            "eliminado_de_savedata": eliminado_de_savedata(documento),
+            # Hay algo en SaveData que se puede eliminar.
+            "puede_eliminar": estado_en_savedata(documento) == "presente",
         }
 
     def enviar(self, email: str, message_id: str, part_id: str, solicitud: EnvioRequest) -> tuple[RespuestaSaveData, dict[str, Any], dict[str, Any]]:
@@ -307,11 +398,18 @@ class ServicioEnvio:
                 if documento.get("estado") not in {"revisado", "enviado"}:
                     raise NoSePuedeEnviar("no_revisado", "Solo se pueden enviar extracciones en estado revisado.")
                 previo = _requiere_confirmar_reenvio(documento)
-                if previo is not None and not solicitud.confirmar_reenvio:
+                agregar = solicitud.agregar_de_nuevo
+                borrado = borrado_en_savedata(documento)
+                if agregar and not borrado:
+                    raise NoSePuedeEnviar("agregar_no_permitido", "Solo se puede agregar de nuevo un documento que SaveData reporto como borrado.")
+                if borrado and not agregar:
+                    raise NoSePuedeEnviar("savedata_no_existe", "SaveData ya no tiene este documento (lo borraron). Confirma si quieres agregarlo de nuevo.", 409, {"envio_previo": documento["envios"][-1]})
+                if previo is not None and not solicitud.confirmar_reenvio and not agregar:
                     raise NoSePuedeEnviar("requiere_confirmar_reenvio", "Este documento ya se envio (o su resultado es incierto). Confirma explicitamente para reenviarlo.", 409, {"envio_previo": previo})
-                preparado.update(preparar_envio(documento, sucursal=solicitud.sucursal, articulo=solicitud.articulo, carga_inicial=solicitud.carga_inicial, configurados=self.configurados(email)))
+                preparado.update(preparar_envio(documento, sucursal=solicitud.sucursal, articulo=solicitud.articulo, carga_inicial=solicitud.carga_inicial, configurados=self.configurados(email), actualizacion=False if agregar else None))
                 intento = {
                     "id": intento_id,
+                    "accion": "enviar",
                     "iniciado_en": _ahora(),
                     "terminado_en": None,
                     "resultado": "en_curso",
@@ -326,6 +424,8 @@ class ServicioEnvio:
                     "totales": preparado["totales"],
                     "version_extraccion": documento.get("version"),
                     "reenvio": previo is not None,
+                    "actualizacion": preparado["interno"]["Actualizacion"],
+                    "agregado_de_nuevo": agregar,
                 }
                 return {**documento, "envios": [*documento.get("envios", []), intento]}
 
@@ -333,6 +433,9 @@ class ServicioEnvio:
             self.almacen.actualizar(email, message_id, part_id, registrar_inicio)
             # 2) Envío.
             respuesta = self.cliente(url, preparado["cuerpo"], self.timeout)
+            if respuesta.resultado == "no_existe" and not preparado["interno"]["Actualizacion"]:
+                # Un alta nueva no puede "no existir": es un error de SaveData, no un registro borrado.
+                respuesta = RespuestaSaveData("error", respuesta.http_status, respuesta.respuesta, f"SaveData respondio code=404 a un alta nueva: {respuesta.mensaje}")
             logger.info("SaveData message_id=%s part_id=%s resultado=%s http=%s", message_id, part_id, respuesta.resultado, respuesta.http_status)
 
             # 3) Resultado auditado; solo un éxito cambia el estado a "enviado".
@@ -349,6 +452,9 @@ class ServicioEnvio:
                 if respuesta.resultado == "exito":
                     actualizado["estado"] = "enviado"
                     actualizado["enviado_en"] = terminado
+                elif respuesta.resultado == "no_existe" and actualizado.get("estado") == "enviado":
+                    # Ya no está en SaveData: vuelve a revisado hasta que se agregue de nuevo.
+                    actualizado["estado"] = "revisado"
                 return actualizado
 
             documento = self.almacen.actualizar(email, message_id, part_id, registrar_fin)
@@ -356,3 +462,154 @@ class ServicioEnvio:
             return respuesta, intento, documento
         finally:
             self.almacen.liberar_envio(reserva)
+
+
+# --- Eliminar de SaveData --------------------------------------------------------------------------
+
+def cuerpo_eliminar(documento: dict[str, Any]) -> str:
+    """{"data": "{\"Id\": ..., \"Eliminar\": true}"}: mismo formato de siempre, solo el Id y la orden."""
+    return serializar_cuerpo({"Id": documento_id(documento), "Eliminar": True})
+
+
+def eliminar_de_savedata(servicio: "ServicioEnvio", email: str, message_id: str, part_id: str) -> tuple[RespuestaSaveData, dict[str, Any], dict[str, Any]]:
+    """Pide a SaveData borrar el registro con el Id del documento. Devuelve (respuesta, intento, documento).
+
+    code 200 (lo borró) o 404 (ya no existía) cuentan como eliminado; cualquier otro resultado queda auditado y no
+    cambia nada. El documento sigue en Nexora: vuelve a "revisado" y el siguiente envío es un alta nueva.
+    """
+    url = servicio.url().strip()
+    if not url:
+        raise NoSePuedeEnviar("savedata_sin_configurar", "SAVEDATA_URL no esta configurada en el backend.", 503)
+    if not url.lower().startswith(("http://", "https://")):
+        raise NoSePuedeEnviar("savedata_url_invalida", "SAVEDATA_URL debe empezar con http:// o https://.", 503)
+
+    reserva = servicio.almacen.reservar_envio(email, message_id, part_id)
+    try:
+        intento_id = uuid.uuid4().hex
+        cuerpo: dict[str, str] = {}
+
+        def registrar_inicio(documento: dict[str, Any] | None) -> dict[str, Any]:
+            if documento is None:
+                raise NoSePuedeEnviar("sin_extraccion", "Este documento no tiene una extraccion guardada.", 404)
+            if estado_en_savedata(documento) != "presente":
+                raise NoSePuedeEnviar("nada_que_eliminar", "SaveData no tiene este documento: no se ha enviado, ya se elimino o lo borraron alla.")
+            if not documento_id(documento):
+                raise NoSePuedeEnviar("sin_id", "El documento no tiene Id; no se puede eliminar de SaveData.", 422)
+            cuerpo["valor"] = cuerpo_eliminar(documento)
+            intento = {
+                "id": intento_id,
+                "accion": "eliminar",
+                "iniciado_en": _ahora(),
+                "terminado_en": None,
+                "resultado": "en_curso",
+                "url": url,
+                "cuerpo": cuerpo["valor"],
+                "http_status": None,
+                "respuesta": None,
+                "error": None,
+                "sucursal": None,
+                "articulo": None,
+                "carga_inicial": None,
+                "totales": None,
+                "version_extraccion": documento.get("version"),
+                "reenvio": False,
+            }
+            return {**documento, "envios": [*documento.get("envios", []), intento]}
+
+        servicio.almacen.actualizar(email, message_id, part_id, registrar_inicio)
+        respuesta = servicio.cliente(url, cuerpo["valor"], servicio.timeout)
+        logger.info("SaveData eliminar message_id=%s part_id=%s resultado=%s http=%s", message_id, part_id, respuesta.resultado, respuesta.http_status)
+
+        def registrar_fin(documento: dict[str, Any] | None) -> dict[str, Any]:
+            assert documento is not None
+            terminado = _ahora()
+            envios = []
+            for intento in documento.get("envios", []):
+                if intento.get("id") == intento_id:
+                    intento = {**intento, "terminado_en": terminado, "resultado": respuesta.resultado, "http_status": respuesta.http_status,
+                               "respuesta": respuesta.respuesta, "error": None if respuesta.resultado in {"exito", "no_existe"} else respuesta.mensaje}
+                envios.append(intento)
+            actualizado = {**documento, "envios": envios}
+            if respuesta.resultado in {"exito", "no_existe"}:
+                actualizado["eliminado_en"] = terminado
+                if actualizado.get("estado") == "enviado":
+                    actualizado["estado"] = "revisado"
+            return actualizado
+
+        documento = servicio.almacen.actualizar(email, message_id, part_id, registrar_fin)
+        intento = next(item for item in documento["envios"] if item["id"] == intento_id)
+        return respuesta, intento, documento
+    finally:
+        servicio.almacen.liberar_envio(reserva)
+
+
+# --- Historial de envíos (todas las extracciones enviadas) ----------------------------------------
+
+def faltantes_de_cuerpo(cuerpo: str | None) -> list[str]:
+    """Campos que se enviaron vacíos (null) en un intento: los "Datos" y los campos por movimiento."""
+    try:
+        interno = json.loads(json.loads(cuerpo or "")["data"])
+    except (ValueError, KeyError, TypeError):
+        return []
+    if not isinstance(interno, dict):
+        return []
+    faltantes = [str(nombre) for nombre, valor in (interno.get("Datos") or {}).items() if valor is None]
+    vacios: dict[str, int] = {}
+    for fila in interno.get("Transacciones") or []:
+        if not isinstance(fila, dict):
+            continue
+        for nombre, valor in fila.items():
+            if nombre not in CAMPOS_TRANSACCION and valor is None:
+                vacios[nombre] = vacios.get(nombre, 0) + 1
+    faltantes.extend(f"{nombre} ({cantidad} mov.)" for nombre, cantidad in vacios.items())
+    return faltantes
+
+
+def _resumen_intento(intento: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": intento.get("id"),
+        "iniciado_en": intento.get("iniciado_en"),
+        "terminado_en": intento.get("terminado_en"),
+        "resultado": intento.get("resultado"),
+        "sucursal": intento.get("sucursal"),
+        "articulo": intento.get("articulo"),
+        "error": intento.get("error"),
+        "accion": intento.get("accion", "enviar"),
+        "reenvio": bool(intento.get("reenvio")),
+        "agregado_de_nuevo": bool(intento.get("agregado_de_nuevo")),
+        "version_extraccion": intento.get("version_extraccion"),
+        "faltantes": faltantes_de_cuerpo(intento.get("cuerpo")),
+    }
+
+
+def historial_envios(almacen: AlmacenExtracciones, email: str) -> list[dict[str, Any]]:
+    """Documentos con al menos un intento de envío, el más reciente primero, con lo que faltó en cada intento."""
+    resultado = []
+    for entrada in almacen.listar(email):
+        try:
+            documento = almacen.leer_completo(email, entrada["messageId"], entrada["partId"])
+        except Exception:
+            logger.warning("No se pudo leer el historial de %s/%s", entrada.get("messageId"), entrada.get("partId"))
+            continue
+        envios = (documento or {}).get("envios") or []
+        if not documento or not envios:
+            continue
+        intentos = [_resumen_intento(intento) for intento in envios]
+        ultimo = intentos[-1]
+        resultado.append({
+            "id": documento_id(documento),
+            "messageId": documento.get("messageId"),
+            "partId": documento.get("partId"),
+            "filename": documento.get("filename", ""),
+            "estado": documento.get("estado"),
+            "version": documento.get("version"),
+            "enviado_en": documento.get("enviado_en"),
+            # Se editó después del último intento: hay cambios que SaveData aún no tiene.
+            "modificado_tras_envio": (documento.get("version") or 0) > (ultimo.get("version_extraccion") or 0),
+            # presente | borrado (lo borraron en SaveData) | eliminado (lo eliminamos desde Nexora) | nunca
+            "en_savedata": estado_en_savedata(documento),
+            "ultimo": ultimo,
+            "intentos": intentos,
+        })
+    resultado.sort(key=lambda item: item["ultimo"].get("terminado_en") or item["ultimo"].get("iniciado_en") or "", reverse=True)
+    return resultado

@@ -18,7 +18,7 @@ from .config import settings
 from .preferencias import AlmacenClasificaciones, ClasificacionRequest, ConfiguracionCuenta, MigracionRequest, RemitentesRequest
 from .remitentes import CONSULTAS_CARPETA, ListaRemitentesInvalida, coincide, construir_query
 from . import filtro_estados
-from .savedata import EnvioRequest, NoSePuedeEnviar, SaveDataConfig, SaveDataConfigRequest, ServicioEnvio
+from .savedata import EnvioRequest, NoSePuedeEnviar, SaveDataConfig, SaveDataConfigRequest, ServicioEnvio, eliminar_de_savedata, historial_envios
 from .extracciones import ID_DOCUMENTO_SEGURO, AlmacenExtracciones, ConflictoVersion, EnvioEnCurso, ExtraccionDanada, GuardarExtraccionRequest, RevisionConProblemas, cuenta_id
 from .gemini import GeminiRequestError, GeminiSettings, GeminiUnavailableError
 from .gmail import GmailAttachmentError, GmailClient, GmailNotConfiguredError, GmailNotConnectedError, GmailRateLimitError
@@ -444,6 +444,46 @@ def guardar_config_savedata(payload: SaveDataConfigRequest) -> dict[str, Any]:
     return obtener_config_savedata()
 
 
+class EliminarRequest(BaseModel):
+    # Confirmación explícita del usuario: borra el registro en la base de datos de SaveData.
+    confirmar: bool = False
+
+
+@app.post("/api/extracciones/{message_id}/{part_id}/eliminar")
+def eliminar_envio(message_id: str, part_id: str, payload: EliminarRequest) -> dict[str, Any]:
+    """Pide a SaveData borrar el registro de este documento (mismo Id). El documento y su historial siguen en Nexora."""
+    _ids_validos(message_id, part_id)
+    if not payload.confirmar:
+        raise HTTPException(status_code=400, detail={"code": "requiere_confirmar", "message": "Confirma que quieres eliminar el registro de SaveData."})
+    email = _cuenta_actual()
+    try:
+        respuesta, intento, documento = eliminar_de_savedata(envios, email, message_id, part_id)
+    except NoSePuedeEnviar as error:
+        raise _error_envio(error) from error
+    except EnvioEnCurso as error:
+        raise HTTPException(status_code=409, detail={"code": "envio_en_curso", "message": "Ya hay un envio a SaveData en curso para este documento."}) from error
+    except ExtraccionDanada as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+    except OSError as error:
+        logger.exception("No se pudo registrar la eliminacion en SaveData")
+        raise HTTPException(status_code=500, detail=f"No se pudo registrar la eliminacion en disco: {error}") from error
+    if respuesta.resultado not in {"exito", "no_existe"}:
+        raise HTTPException(status_code=502, detail={
+            "code": "savedata_incierto" if respuesta.resultado == "incierto" else "savedata_error",
+            "message": respuesta.mensaje,
+            "intento": intento,
+            "extraccion": documento,
+        })
+    mensaje = "SaveData elimino el registro." if respuesta.resultado == "exito" else "SaveData ya no tenia el registro; queda como eliminado."
+    return {"resultado": "eliminado", "mensaje": mensaje, "intento": intento, "extraccion": documento}
+
+
+@app.get("/api/envios")
+def listar_envios() -> dict[str, Any]:
+    """Historial de todos los documentos enviados a SaveData, con lo que faltó en cada intento."""
+    return {"documentos": historial_envios(almacen, _cuenta_actual())}
+
+
 @app.post("/api/extracciones/{message_id}/{part_id}/enviar/vista-previa")
 def vista_previa_envio(message_id: str, part_id: str, payload: VistaPreviaEnvioRequest) -> dict[str, Any]:
     """Cuerpo exacto que se enviaría a SaveData. No contacta SaveData."""
@@ -480,6 +520,9 @@ def enviar_extraccion(message_id: str, part_id: str, payload: EnvioRequest) -> d
     except OSError as error:
         logger.exception("No se pudo registrar el envio a SaveData")
         raise HTTPException(status_code=500, detail=f"No se pudo registrar el envio en disco: {error}") from error
+    if respuesta.resultado == "no_existe":
+        # 409: alguien borró el registro en SaveData. El usuario decide si agregarlo de nuevo (agregar_de_nuevo=true).
+        raise HTTPException(status_code=409, detail={"code": "savedata_no_existe", "message": respuesta.mensaje, "intento": intento, "extraccion": documento})
     if respuesta.resultado != "exito":
         # 502: SaveData no confirmó el envío. El intento queda auditado y el documento sigue revisado.
         raise HTTPException(status_code=502, detail={

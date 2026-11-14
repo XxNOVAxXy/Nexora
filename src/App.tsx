@@ -7,7 +7,7 @@ import { validarContabilidad, type ValidacionContable } from './services/contabi
 import { crearControladorExtraccion, ejecutarExtraccion } from './services/extraccion'
 import { gmailApi, type FiltroCorreo, type GmailAttachment, type GmailMessage, type GmailStatus } from './services/gmailApi'
 import { geminiApi, type GeminiExtractionResponse, type GeminiStatus } from './services/geminiApi'
-import { ejecutarEnvio, savedataApi, type ConfigSaveData, type VistaPreviaEnvio } from './services/savedataApi'
+import { ejecutarEliminacion, ejecutarEnvio, savedataApi, type ConfigSaveData, type VistaPreviaEnvio } from './services/savedataApi'
 import { claveEstado, inboxStore, type EstadosExtraccion, type Listado, type MailFolder } from './services/inboxStore'
 import { automaticoApi, type EstadoAutomatico } from './services/automaticoApi'
 import { plantillaCamposApi, plantillaVigente } from './services/plantillaCamposApi'
@@ -22,6 +22,7 @@ import { detectarDatos } from './services/deteccionDocumento'
 import { tieneCapaDeTexto, type PaginaTexto } from './services/textoPdf'
 import { compatibles, ETIQUETA_CAMPO, movimientoDesdeFila, posicionParaInsertar, valorParaCaptura, verificar, type MarcaVerificacion } from './services/verificacion'
 import { PanelVerificacion, VisorPdf, type EstadoTextoDocumento, type Resaltado } from './VisorPdf'
+import { HistorialEnviosPage } from './HistorialEnvios'
 import {
   ArrowDownToLine,
   ArrowLeft,
@@ -64,7 +65,7 @@ type Icon = typeof Inbox
 type ExtractionMode = 'manual' | 'gemini'
 
 const navSections: { label: string; items: { to: string; label: string; icon: Icon }[] }[] = [
-  { label: 'Operación', items: [{ to: '/emails', label: 'Correos', icon: Mail }, { to: '/extraction', label: 'Extracción', icon: FileSearch }] },
+  { label: 'Operación', items: [{ to: '/emails', label: 'Correos', icon: Mail }, { to: '/extraction', label: 'Extracción', icon: FileSearch }, { to: '/envios', label: 'Envíos', icon: Send }] },
   { label: 'Sistema', items: [{ to: '/settings', label: 'Configuración', icon: SettingsIcon }] },
 ]
 
@@ -81,6 +82,7 @@ function App() {
             <Route path="/" element={<FilteredGmailInboxPage />} />
             <Route path="/emails" element={<FilteredGmailInboxPage />} />
             <Route path="/extraction" element={<ExtractionWorkspace />} />
+            <Route path="/envios" element={<HistorialEnviosPage />} />
             <Route path="/settings" element={<SettingsPageV3 />} />
           </Routes>
         </main>
@@ -1091,7 +1093,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const puedeGuardar = Boolean(partId) && cargaLista && !guardando
   const puedeExtraer = cargaLista && !extracting && !colaActiva && !confirmandoReextraccion && geminiStatus?.enabled === true
   const estadoVisible = versionGuardada ? etiquetaEstado[versionGuardada.estado] : 'Sin guardar'
-  const ultimoEnvioExitoso = versionGuardada?.envios.filter((intento) => intento.resultado === 'exito').slice(-1)[0]
+  const ultimoEnvioExitoso = versionGuardada?.envios.filter((intento) => intento.accion !== 'eliminar' && intento.resultado === 'exito').slice(-1)[0]
   const modificadoTrasEnvio = Boolean(ultimoEnvioExitoso) && (sinGuardar || (versionGuardada?.version ?? 0) > (ultimoEnvioExitoso?.version_extraccion ?? 0))
 
   return <div className="space-y-4">
@@ -1206,6 +1208,7 @@ const etiquetaResultadoEnvio: Record<IntentoEnvio['resultado'], { texto: string;
   error: { texto: 'Error', clase: 'bg-red-50 text-red-700' },
   incierto: { texto: 'Resultado incierto', clase: 'bg-amber-100 text-amber-800' },
   en_curso: { texto: 'Interrumpido / desconocido', clase: 'bg-amber-100 text-amber-800' },
+  no_existe: { texto: 'Borrado en SaveData', clase: 'bg-red-50 text-red-700' },
 }
 const fechaHora = (valor: string | null) => (valor ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'medium' }).format(new Date(valor)) : '—')
 
@@ -1219,6 +1222,10 @@ function PanelEnvioSaveData({ messageId, partId, guardado, sinGuardar, modificad
   const [errorVista, setErrorVista] = useState<string | null>(null)
   const [enviando, setEnviando] = useState(false)
   const [confirmandoReenvio, setConfirmandoReenvio] = useState(false)
+  // SaveData respondió que el registro ya no existe: se pregunta si agregarlo de nuevo.
+  const [confirmandoAgregar, setConfirmandoAgregar] = useState(false)
+  const [confirmandoEliminar, setConfirmandoEliminar] = useState(false)
+  const [eliminando, setEliminando] = useState(false)
   const [resultado, setResultado] = useState<{ tipo: 'exito' | 'error' | 'incierto'; mensaje: string; intento?: IntentoEnvio } | null>(null)
   const vivo = useRef(true)
   useEffect(() => { vivo.current = true; return () => { vivo.current = false } }, [])
@@ -1262,26 +1269,40 @@ function PanelEnvioSaveData({ messageId, partId, guardado, sinGuardar, modificad
   const motivos = [...motivosLocales, ...(vista?.motivos ?? []).filter((motivo) => !motivo.startsWith('Solo se pueden enviar'))]
   const puedeEnviar = motivos.length === 0 && vista !== null && vista.version === version && !enviando
 
-  const enviar = async (confirmarReenvio: boolean) => {
+  const enviar = async (confirmarReenvio: boolean, agregarDeNuevo = false) => {
     if (!partId || version === null || sucursalNumero === null) return
     setConfirmandoReenvio(false)
+    setConfirmandoAgregar(false)
     setEnviando(true)
     setResultado(null)
-    const respuesta = await ejecutarEnvio(() => savedataApi.enviar(messageId, partId, { version_base: version, sucursal: sucursalNumero, articulo: articuloLimpio, carga_inicial: cargaInicial, confirmar_reenvio: confirmarReenvio }))
+    const respuesta = await ejecutarEnvio(() => savedataApi.enviar(messageId, partId, { version_base: version, sucursal: sucursalNumero, articulo: articuloLimpio, carga_inicial: cargaInicial, confirmar_reenvio: confirmarReenvio, agregar_de_nuevo: agregarDeNuevo }))
     if (!vivo.current) return
     setEnviando(false)
     if (respuesta.extraccion) onActualizado(respuesta.extraccion)
     if (respuesta.ok) setResultado({ tipo: 'exito', mensaje: respuesta.mensaje, intento: respuesta.intento })
     else if (respuesta.tipo === 'requiere_confirmar_reenvio') setConfirmandoReenvio(true)
+    else if (respuesta.tipo === 'no_existe') setConfirmandoAgregar(true)
     else setResultado({ tipo: respuesta.tipo === 'incierto' ? 'incierto' : 'error', mensaje: respuesta.mensaje, intento: respuesta.intento })
   }
+  const eliminar = async () => {
+    if (!partId) return
+    setConfirmandoEliminar(false)
+    setEliminando(true)
+    setResultado(null)
+    const respuesta = await ejecutarEliminacion(messageId, partId)
+    if (!vivo.current) return
+    setEliminando(false)
+    if (respuesta.extraccion) onActualizado(respuesta.extraccion)
+    setResultado(respuesta.ok ? { tipo: 'exito', mensaje: respuesta.mensaje } : { tipo: respuesta.incierto ? 'incierto' : 'error', mensaje: respuesta.mensaje })
+  }
   const solicitarEnvio = () => {
-    if (vista?.requiere_confirmar_reenvio) setConfirmandoReenvio(true)
+    if (vista?.borrado_en_savedata) setConfirmandoAgregar(true)
+    else if (vista?.requiere_confirmar_reenvio) setConfirmandoReenvio(true)
     else void enviar(false)
   }
 
   const envios = [...(guardado?.envios ?? [])].reverse()
-  const previo = vista?.envio_previo ?? envios.find((intento) => intento.resultado !== 'error') ?? null
+  const previo = vista?.envio_previo ?? envios.find((intento) => intento.accion !== 'eliminar' && intento.resultado !== 'error') ?? null
 
   return <section className="panel overflow-hidden" aria-labelledby="titulo-envio-savedata">
     <div className="flex flex-col justify-between gap-3 border-b border-slate-200 bg-slate-50/60 p-5 sm:flex-row sm:items-start sm:p-6">
@@ -1298,16 +1319,20 @@ function PanelEnvioSaveData({ messageId, partId, guardado, sinGuardar, modificad
         {vista && <dl className="mt-4 grid grid-cols-2 gap-3"><div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3"><dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">H · Total de abonos</dt><dd className="mt-1 text-sm font-semibold tabular-nums text-ink">{vista.totales.abonos}</dd></div><div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3"><dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">S · Total de cargos</dt><dd className="mt-1 text-sm font-semibold tabular-nums text-ink">{vista.totales.cargos}</dd></div></dl>}
         {motivos.length > 0 && <ul className="mt-4 space-y-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-900">{motivos.map((motivo) => <li key={motivo}>{motivo}</li>)}</ul>}
         {errorVista && <div role="alert" className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700">{errorVista}</div>}
-        {confirmandoReenvio && <div role="alertdialog" aria-labelledby="confirmar-reenvio" className="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-3 text-xs text-amber-900"><div id="confirmar-reenvio" className="font-bold">Este documento ya se envió a SaveData.</div><div className="mt-1 leading-5">{previo ? <>Último intento: {etiquetaResultadoEnvio[previo.resultado].texto.toLowerCase()} el {fechaHora(previo.terminado_en ?? previo.iniciado_en)} (sucursal {previo.sucursal}, artículo {previo.articulo}).</> : 'Hay un envío previo registrado.'} {previo && previo.resultado !== 'exito' && 'No se sabe si SaveData lo recibió: verifícalo antes de reenviar para no duplicar los saldos.'} Reenviarlo puede duplicar los registros.</div><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={() => void enviar(true)} className="btn-primary px-3 py-1.5 text-xs"><Send size={13} />Reenviar de todos modos</button><button type="button" onClick={() => setConfirmandoReenvio(false)} className="btn-soft px-3 py-1.5 text-xs">Cancelar</button></div></div>}
-        {resultado?.tipo === 'exito' && <div role="status" className="mt-4"><Notice text={`${resultado.mensaje} (HTTP ${resultado.intento?.http_status ?? 200}).`} onClose={() => setResultado(null)} /></div>}
+        {confirmandoReenvio && <div role="alertdialog" aria-labelledby="confirmar-reenvio" className="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-3 text-xs text-amber-900"><div id="confirmar-reenvio" className="font-bold">Este documento ya se envió a SaveData.</div><div className="mt-1 leading-5">{previo ? <>Último intento: {etiquetaResultadoEnvio[previo.resultado].texto.toLowerCase()} el {fechaHora(previo.terminado_en ?? previo.iniciado_en)} (sucursal {previo.sucursal}, artículo {previo.articulo}).</> : 'Hay un envío previo registrado.'} {previo && previo.resultado !== 'exito' && 'No se sabe si SaveData lo recibió: verifícalo antes de reenviar para no duplicar los saldos.'} Se reenvía con el mismo Id ({vista?.interno.Id ?? 'sin Id'}) como actualización: SaveData debe reemplazar ese registro en lugar de crear otro.</div><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={() => void enviar(true)} className="btn-primary px-3 py-1.5 text-xs"><Send size={13} />Actualizar en SaveData</button><button type="button" onClick={() => setConfirmandoReenvio(false)} className="btn-soft px-3 py-1.5 text-xs">Cancelar</button></div></div>}
+        {confirmandoAgregar && <div role="alertdialog" aria-labelledby="confirmar-agregar" className="mt-4 rounded-lg border border-red-300 bg-red-50 px-3 py-3 text-xs text-red-900"><div id="confirmar-agregar" className="font-bold">Este documento fue borrado en SaveData.</div><div className="mt-1 leading-5">SaveData respondió que el registro {vista?.interno.Id ?? ''} ya no existe. ¿Quieres agregarlo de nuevo? Se enviará con el mismo Id como alta nueva, con los datos que tienes ahora.</div><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={() => void enviar(true, true)} className="btn-primary px-3 py-1.5 text-xs"><Send size={13} />Agregar de nuevo</button><button type="button" onClick={() => setConfirmandoAgregar(false)} className="btn-soft px-3 py-1.5 text-xs">Cancelar</button></div></div>}
+        {resultado?.tipo === 'exito' && <div role="status" className="mt-4"><Notice text={resultado.intento ? `${resultado.mensaje} (HTTP ${resultado.intento.http_status ?? 200}).` : resultado.mensaje} onClose={() => setResultado(null)} /></div>}
         {resultado && resultado.tipo !== 'exito' && <div role="alert" className={`mt-4 rounded-xl border px-4 py-3 text-sm ${resultado.tipo === 'incierto' ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-red-200 bg-red-50 text-red-700'}`}><div className="flex items-start justify-between gap-3"><div><div className="font-semibold">{resultado.tipo === 'incierto' ? 'Resultado incierto: no se sabe si SaveData recibió el envío.' : 'El envío no se completó.'}</div><div className="mt-0.5 text-xs">{resultado.mensaje}{resultado.intento?.http_status ? ` · HTTP ${resultado.intento.http_status}` : ''}</div>{resultado.intento?.respuesta && <pre className="mt-2 max-h-24 overflow-auto whitespace-pre-wrap rounded bg-white/70 p-2 text-[10px]">{resultado.intento.respuesta}</pre>}</div><button type="button" onClick={() => setResultado(null)} aria-label="Cerrar resultado"><X size={16} /></button></div></div>}
-        <button type="button" onClick={solicitarEnvio} disabled={!puedeEnviar} className="btn-primary mt-4 w-full justify-center"><Send size={15} />{enviando ? 'Enviando a SaveData…' : vista?.requiere_confirmar_reenvio ? 'Reenviar a SaveData' : 'Enviar a SaveData'}</button>
+        <button type="button" onClick={solicitarEnvio} disabled={!puedeEnviar} className="btn-primary mt-4 w-full justify-center"><Send size={15} />{enviando ? 'Enviando a SaveData…' : vista?.eliminado_de_savedata ? 'Enviar de nuevo a SaveData' : vista?.borrado_en_savedata ? 'Agregar de nuevo a SaveData' : vista?.requiere_confirmar_reenvio ? 'Actualizar en SaveData' : 'Enviar a SaveData'}</button>
+        {vista?.eliminado_de_savedata && <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs text-slate-600">Este documento se eliminó de SaveData. Si lo envías otra vez, se agrega como nuevo con el mismo Id ({vista.interno.Id ?? '—'}).</div>}
+        {vista?.puede_eliminar && !confirmandoEliminar && <button type="button" onClick={() => setConfirmandoEliminar(true)} disabled={enviando || eliminando} className="mt-2 w-full rounded-lg border border-red-200 px-3 py-2 text-xs font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50">{eliminando ? 'Eliminando de SaveData…' : 'Eliminar de SaveData'}</button>}
+        {confirmandoEliminar && <div role="alertdialog" aria-labelledby="confirmar-eliminar" className="mt-3 rounded-lg border border-red-300 bg-red-50 px-3 py-3 text-xs text-red-900"><div id="confirmar-eliminar" className="font-bold">¿Eliminar este documento de SaveData?</div><div className="mt-1 leading-5">Se borrará de la base de datos de SaveData el registro con Id {vista?.interno.Id ?? '—'}. En Nexora el documento y su historial se quedan; puedes corregirlo y enviarlo de nuevo cuando quieras.</div><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={() => void eliminar()} className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700">Sí, eliminar de SaveData</button><button type="button" onClick={() => setConfirmandoEliminar(false)} className="btn-soft px-3 py-1.5 text-xs">Cancelar</button></div></div>}
       </div>
       <div className="min-w-0">
         <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-bold text-ink">Vista previa del cuerpo exacto</h3><Code2 size={17} className="text-slate-400" /></div>
         <pre aria-label="Cuerpo exacto que se enviará a SaveData" className="scrollbar-thin min-h-[120px] overflow-auto whitespace-pre-wrap break-all rounded-xl bg-ink p-4 text-[11px] leading-5 text-slate-200">{vista ? vista.cuerpo : datosCompletos ? (errorVista ? '—' : 'Generando vista previa…') : 'Completa sucursal y artículo para ver el cuerpo que se enviará.'}</pre>
         {vista && <details className="mt-2 text-xs text-slate-500"><summary className="cursor-pointer font-semibold">Ver el JSON interno con formato (solo lectura)</summary><pre className="scrollbar-thin mt-2 overflow-auto rounded-lg bg-slate-50 p-3 text-[11px] leading-5 text-slate-700">{JSON.stringify(vista.interno, null, 2)}</pre></details>}
-        <div className="mt-5"><h3 className="mb-2 text-sm font-bold text-ink">Historial de envíos</h3>{envios.length === 0 ? <div className="rounded-lg border border-dashed border-slate-200 p-4 text-center text-xs text-slate-400">Este documento aún no se ha enviado.</div> : <ul className="space-y-2">{envios.map((intento) => <li key={intento.id} className="rounded-lg border border-slate-100 p-3 text-xs"><div className="flex flex-wrap items-center justify-between gap-2"><span className="font-semibold text-slate-700">{fechaHora(intento.terminado_en ?? intento.iniciado_en)}{intento.reenvio && ' · reenvío'}</span><span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${etiquetaResultadoEnvio[intento.resultado].clase}`}>{etiquetaResultadoEnvio[intento.resultado].texto}</span></div><div className="mt-1 text-slate-500">Sucursal {intento.sucursal} · Artículo {intento.articulo} · H {intento.totales.abonos} · S {intento.totales.cargos}{intento.http_status ? ` · HTTP ${intento.http_status}` : ''}</div>{intento.error && <div className="mt-1 text-red-700">{intento.error}</div>}<details className="mt-1"><summary className="cursor-pointer text-slate-400">Cuerpo enviado y respuesta</summary><pre className="mt-1 overflow-auto whitespace-pre-wrap break-all rounded bg-slate-50 p-2 text-[10px]">{intento.cuerpo}</pre>{intento.respuesta && <pre className="mt-1 overflow-auto whitespace-pre-wrap break-all rounded bg-slate-50 p-2 text-[10px]">{intento.respuesta}</pre>}</details></li>)}</ul>}</div>
+        <div className="mt-5"><h3 className="mb-2 text-sm font-bold text-ink">Historial de envíos</h3>{envios.length === 0 ? <div className="rounded-lg border border-dashed border-slate-200 p-4 text-center text-xs text-slate-400">Este documento aún no se ha enviado.</div> : <ul className="space-y-2">{envios.map((intento) => <li key={intento.id} className="rounded-lg border border-slate-100 p-3 text-xs"><div className="flex flex-wrap items-center justify-between gap-2"><span className="font-semibold text-slate-700">{fechaHora(intento.terminado_en ?? intento.iniciado_en)}{intento.accion === 'eliminar' ? ' · eliminación' : intento.agregado_de_nuevo ? ' · agregado de nuevo' : intento.reenvio && ' · actualización'}</span><span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${etiquetaResultadoEnvio[intento.resultado].clase}`}>{etiquetaResultadoEnvio[intento.resultado].texto}</span></div><div className="mt-1 text-slate-500">{intento.accion === 'eliminar' ? 'Eliminación del registro en SaveData' : <>Sucursal {intento.sucursal} · Artículo {intento.articulo}{intento.totales && <> · H {intento.totales.abonos} · S {intento.totales.cargos}</>}</>}{intento.http_status ? ` · HTTP ${intento.http_status}` : ''}</div>{intento.error && <div className="mt-1 text-red-700">{intento.error}</div>}<details className="mt-1"><summary className="cursor-pointer text-slate-400">Cuerpo enviado y respuesta</summary><pre className="mt-1 overflow-auto whitespace-pre-wrap break-all rounded bg-slate-50 p-2 text-[10px]">{intento.cuerpo}</pre>{intento.respuesta && <pre className="mt-1 overflow-auto whitespace-pre-wrap break-all rounded bg-slate-50 p-2 text-[10px]">{intento.respuesta}</pre>}</details></li>)}</ul>}</div>
       </div>
     </div>
   </section>
