@@ -57,7 +57,7 @@ clasificaciones = AlmacenClasificaciones(settings.clasificaciones_path)
 plantillas = AlmacenPlantillas(settings.plantilla_campos_path, lambda email: deducir_campos(almacen, email))
 # La URL se lee en cada envío para que las pruebas puedan sustituirla.
 envios = ServicioEnvio(almacen, lambda: settings.savedata_url, configurados=lambda email: plantillas.efectiva(email))
-automatico = ExtractorAutomatico(settings.automatico_path, gmail, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos), plantillas=plantillas)
+automatico = ExtractorAutomatico(settings.automatico_path, gmail, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos), plantillas=plantillas, envios=envios)
 oauth_states: dict[str, datetime] = {}
 
 
@@ -605,6 +605,24 @@ def configurar_automatico(payload: AutomaticoRequest) -> dict[str, Any]:
         return automatico.configurar(email, payload.activo)
     except OSError as error:
         logger.exception("No se pudo guardar el estado de la extraccion automatica")
+        raise HTTPException(status_code=500, detail=f"No se pudo guardar la configuracion: {error}") from error
+
+
+class EnvioAutomaticoRequest(BaseModel):
+    envio_activo: bool
+    solo_si_cuadra: bool = True
+
+
+@app.put("/api/automatico/envio")
+def configurar_envio_automatico(payload: EnvioAutomaticoRequest) -> dict[str, Any]:
+    """Envío automático a SaveData de lo que extraiga el proceso automático. Encenderlo exige SAVEDATA_URL."""
+    email = _cuenta_actual()
+    try:
+        return automatico.configurar_envio(email, payload.envio_activo, payload.solo_si_cuadra)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail={"code": "savedata_sin_configurar", "message": str(error)}) from error
+    except OSError as error:
+        logger.exception("No se pudo guardar la configuracion del envio automatico")
         raise HTTPException(status_code=500, detail=f"No se pudo guardar la configuracion: {error}") from error
 
 

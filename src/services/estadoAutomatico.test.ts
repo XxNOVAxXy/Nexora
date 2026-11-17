@@ -44,3 +44,21 @@ describe('indicador del proceso automático', () => {
     expect(textoCamposAutomaticos([])).toContain('ninguno')
   })
 })
+
+describe('estado del envío automático en la bandeja', () => {
+  const envio = (estado: NonNullable<AdjuntoAutomatico['envio']>['estado'], version: number | null) => ({ estado, intentos: 1, error: null, motivos: null, problemas: null, version, actualizado: null })
+  it('distingue enviado, requiere revisión, error e incierto mientras nadie lo toque', () => {
+    expect(estadoDocumento(guardado({ estado: 'enviado', version: 2 }), auto({ envio: envio('enviado', 2) }))).toBe('enviado_auto')
+    expect(estadoDocumento(guardado(), auto({ envio: envio('requiere_revision', null) }))).toBe('requiere_revision')
+    expect(estadoDocumento(guardado({ estado: 'revisado', version: 2 }), auto({ envio: envio('error', 2) }))).toBe('error_envio')
+    expect(estadoDocumento(guardado({ estado: 'revisado', version: 2 }), auto({ envio: envio('incierto', 2) }))).toBe('incierto_envio')
+  })
+  it('si el usuario lo editó después, manda su estado normal', () => {
+    expect(estadoDocumento(guardado({ estado: 'enviado', version: 3 }), auto({ envio: envio('enviado', 2) }))).toBe('enviado')
+    expect(estadoDocumento(guardado({ version: 2 }), auto({ envio: envio('requiere_revision', null) }))).toBe('borrador')
+  })
+  it('pendiente, omitido o sin SaveData no tienen etiqueta propia', () => {
+    expect(estadoDocumento(guardado(), auto({ envio: envio('omitido', null) }))).toBe('automatico')
+    expect(estadoDocumento(guardado({ estado: 'revisado', version: 2 }), auto({ envio: envio('pendiente', 2) }))).toBe('revisado')
+  })
+})

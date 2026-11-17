@@ -579,6 +579,8 @@ def _resumen_intento(intento: dict[str, Any]) -> dict[str, Any]:
         "agregado_de_nuevo": bool(intento.get("agregado_de_nuevo")),
         "version_extraccion": intento.get("version_extraccion"),
         "faltantes": faltantes_de_cuerpo(intento.get("cuerpo")),
+        # Lo envió el proceso automático (lo marca automatico.py).
+        "automatico": bool(intento.get("automatico")),
     }
 
 
@@ -592,10 +594,12 @@ def historial_envios(almacen: AlmacenExtracciones, email: str) -> list[dict[str,
             logger.warning("No se pudo leer el historial de %s/%s", entrada.get("messageId"), entrada.get("partId"))
             continue
         envios = (documento or {}).get("envios") or []
-        if not documento or not envios:
+        # El envío automático también lista lo que no se envió ("Requiere revisión", "Sin SaveData").
+        automatico = (documento or {}).get("envio_automatico")
+        if not documento or (not envios and not automatico):
             continue
         intentos = [_resumen_intento(intento) for intento in envios]
-        ultimo = intentos[-1]
+        ultimo = intentos[-1] if intentos else None
         resultado.append({
             "id": documento_id(documento),
             "messageId": documento.get("messageId"),
@@ -605,11 +609,13 @@ def historial_envios(almacen: AlmacenExtracciones, email: str) -> list[dict[str,
             "version": documento.get("version"),
             "enviado_en": documento.get("enviado_en"),
             # Se editó después del último intento: hay cambios que SaveData aún no tiene.
-            "modificado_tras_envio": (documento.get("version") or 0) > (ultimo.get("version_extraccion") or 0),
+            "modificado_tras_envio": ultimo is not None and (documento.get("version") or 0) > (ultimo.get("version_extraccion") or 0),
             # presente | borrado (lo borraron en SaveData) | eliminado (lo eliminamos desde Nexora) | nunca
             "en_savedata": estado_en_savedata(documento),
             "ultimo": ultimo,
             "intentos": intentos,
+            # Estado del envío automático (enviado, requiere_revision, error, incierto, ...) o None.
+            "envio_automatico": automatico,
         })
-    resultado.sort(key=lambda item: item["ultimo"].get("terminado_en") or item["ultimo"].get("iniciado_en") or "", reverse=True)
+    resultado.sort(key=lambda item: (item["ultimo"] or {}).get("terminado_en") or (item["ultimo"] or {}).get("iniciado_en") or (item["envio_automatico"] or {}).get("actualizado") or "", reverse=True)
     return resultado

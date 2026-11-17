@@ -4,6 +4,7 @@ import { AlertTriangle, ChevronDown, ChevronRight, FileText, Loader2, RefreshCw,
 import { ejecutarEliminacion, savedataApi, type DocumentoEnviado, type IntentoHistorial } from './services/savedataApi'
 import { gmailApi } from './services/gmailApi'
 import type { ResultadoIntento } from './services/extraccionesApi'
+import type { EstadoEnvioAutomatico } from './services/automaticoApi'
 
 const etiquetaResultado: Record<ResultadoIntento, { texto: string; clase: string }> = {
   exito: { texto: 'Éxito', clase: 'bg-emerald-50 text-emerald-700' },
@@ -11,6 +12,15 @@ const etiquetaResultado: Record<ResultadoIntento, { texto: string; clase: string
   incierto: { texto: 'Resultado incierto', clase: 'bg-amber-100 text-amber-800' },
   en_curso: { texto: 'Interrumpido / desconocido', clase: 'bg-amber-100 text-amber-800' },
   no_existe: { texto: 'Borrado en SaveData', clase: 'bg-red-50 text-red-700' },
+}
+
+/** Estados del envío automático que se distinguen en el historial (el resto no lleva etiqueta propia). */
+export const etiquetaEnvioAutomatico: Partial<Record<EstadoEnvioAutomatico, { texto: string; clase: string }>> = {
+  enviado: { texto: 'Enviado automáticamente', clase: 'bg-violet-50 text-violet-700' },
+  requiere_revision: { texto: 'Requiere revisión', clase: 'bg-amber-100 text-amber-800' },
+  error: { texto: 'Error al enviar', clase: 'bg-red-50 text-red-700' },
+  incierto: { texto: 'Incierto, verificar', clase: 'bg-amber-100 text-amber-800' },
+  sin_savedata: { texto: 'Sin SaveData configurado', clase: 'bg-slate-200 text-slate-700' },
 }
 
 const fechaHora = (valor: string | null) => (valor ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
@@ -71,7 +81,7 @@ export function HistorialEnviosPage() {
   return <div className="space-y-5">
     <section className="panel p-5 sm:p-6">
       <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
-        <div><div className="eyebrow mb-2">Integración empresarial</div><h1 className="font-display text-2xl font-extrabold tracking-tight text-ink">Historial de envíos</h1><p className="mt-1.5 max-w-2xl text-sm text-slate-500">Todo lo que se envió a SaveData. Haz clic en un documento para abrir la extracción junto al documento original, completar lo que faltó y enviar la actualización con el mismo Id.</p></div>
+        <div><div className="eyebrow mb-2">Integración empresarial</div><h1 className="font-display text-2xl font-extrabold tracking-tight text-ink">Historial de envíos</h1><p className="mt-1.5 max-w-2xl text-sm text-slate-500">Todo lo que se envió a SaveData, a mano o automáticamente. Haz clic en un documento para abrir la extracción junto al documento original, completar lo que faltó y enviar la actualización con el mismo Id.</p></div>
         <button type="button" onClick={cargar} className="btn-soft shrink-0"><RefreshCw size={15} />Actualizar</button>
       </div>
     </section>
@@ -85,14 +95,19 @@ export function HistorialEnviosPage() {
       const expandido = abierto === clave
       const ultimo = documento.ultimo
       const eliminado = documento.en_savedata === 'eliminado'
-      const pendiente = !eliminado && (documento.modificado_tras_envio || ultimo.resultado !== 'exito' || ultimo.faltantes.length > 0)
+      const auto = documento.envio_automatico ?? null
+      const etiquetaAuto = auto ? etiquetaEnvioAutomatico[auto.estado] : undefined
+      const pendiente = !eliminado && (!ultimo || documento.modificado_tras_envio || ultimo.resultado !== 'exito' || ultimo.faltantes.length > 0)
+      const avisoAuto = auto?.estado === 'requiere_revision' ? auto.motivos : auto?.problemas
       return <li key={clave} className={`panel overflow-hidden ${eliminado ? 'opacity-70' : ''}`}>
         <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center">
           <button type="button" aria-label={expandido ? 'Ocultar intentos' : 'Ver intentos'} aria-expanded={expandido} onClick={() => setAbierto(expandido ? null : clave)} className="hidden rounded-md p-1 text-slate-400 hover:bg-slate-100 sm:block">{expandido ? <ChevronDown size={18} /> : <ChevronRight size={18} />}</button>
           <button type="button" onClick={() => void abrir(documento)} disabled={abriendo !== null} className="min-w-0 flex-1 text-left" title="Abrir la extracción y el documento">
-            <div className="flex flex-wrap items-center gap-2"><FileText size={16} className="shrink-0 text-slate-400" /><span className="truncate font-semibold text-ink hover:text-coral">{documento.filename || 'Documento'}</span><span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${etiquetaResultado[ultimo.resultado].clase}`}>{etiquetaResultado[ultimo.resultado].texto}</span>{eliminado && <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] font-bold text-slate-700">Eliminado de SaveData</span>}{documento.en_savedata === 'borrado' && <span className="rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-bold text-red-700">Lo borraron en SaveData</span>}{!eliminado && documento.modificado_tras_envio && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-800">Modificado, falta actualizar</span>}</div>
-            <div className="mt-1 text-xs text-slate-500">Id {documento.id ?? '—'} · Último intento {fechaHora(ultimo.terminado_en ?? ultimo.iniciado_en)} · Sucursal {ultimo.sucursal ?? '—'} · Artículo {ultimo.articulo ?? '—'} · {documento.intentos.length} {documento.intentos.length === 1 ? 'envío' : 'envíos'}</div>
-            {!eliminado && ultimo.faltantes.length > 0 && <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs text-amber-800"><AlertTriangle size={13} />Se envió sin: {ultimo.faltantes.map((campo) => <span key={campo} className="rounded bg-amber-50 px-1.5 py-0.5 font-semibold">{campo}</span>)}</div>}
+            <div className="flex flex-wrap items-center gap-2"><FileText size={16} className="shrink-0 text-slate-400" /><span className="truncate font-semibold text-ink hover:text-coral">{documento.filename || 'Documento'}</span>{etiquetaAuto && <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${etiquetaAuto.clase}`}>{etiquetaAuto.texto}</span>}{ultimo && !(auto?.estado === 'enviado' && ultimo.resultado === 'exito' && ultimo.automatico) && <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${etiquetaResultado[ultimo.resultado].clase}`}>{etiquetaResultado[ultimo.resultado].texto}</span>}{eliminado && <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] font-bold text-slate-700">Eliminado de SaveData</span>}{documento.en_savedata === 'borrado' && <span className="rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-bold text-red-700">Lo borraron en SaveData</span>}{!eliminado && documento.modificado_tras_envio && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-800">Modificado, falta actualizar</span>}</div>
+            <div className="mt-1 text-xs text-slate-500">Id {documento.id ?? '—'} · {ultimo ? <>Último intento {fechaHora(ultimo.terminado_en ?? ultimo.iniciado_en)} · Sucursal {ultimo.sucursal ?? '—'} · Artículo {ultimo.articulo ?? '—'} · {documento.intentos.length} {documento.intentos.length === 1 ? 'envío' : 'envíos'}</> : <>No se envió · revisado por el envío automático {fechaHora(auto?.actualizado ?? null)}</>}</div>
+            {avisoAuto && avisoAuto.length > 0 && <div className={`mt-1.5 flex flex-wrap items-center gap-1.5 text-xs ${auto?.estado === 'requiere_revision' ? 'text-amber-800' : 'text-slate-600'}`}><AlertTriangle size={13} />{auto?.estado === 'requiere_revision' ? 'No se envió:' : 'Problemas encontrados:'} {avisoAuto.map((motivo) => <span key={motivo} className="rounded bg-amber-50 px-1.5 py-0.5 font-semibold">{motivo}</span>)}</div>}
+            {auto?.error && (auto.estado === 'error' || auto.estado === 'incierto' || auto.estado === 'sin_savedata') && <div className="mt-1 text-xs text-red-700">{auto.error}</div>}
+            {!eliminado && ultimo && ultimo.faltantes.length > 0 && <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs text-amber-800"><AlertTriangle size={13} />Se envió sin: {ultimo.faltantes.map((campo) => <span key={campo} className="rounded bg-amber-50 px-1.5 py-0.5 font-semibold">{campo}</span>)}</div>}
           </button>
           <button type="button" onClick={() => void abrir(documento)} disabled={abriendo !== null} className={`${pendiente ? 'btn-primary' : 'btn-soft'} shrink-0 justify-center`}>{abriendo === clave ? <Loader2 size={15} className="animate-spin" /> : <FileText size={15} />}{pendiente ? 'Abrir y completar' : 'Abrir'}</button>
           {documento.en_savedata === 'presente' && <button type="button" onClick={() => setConfirmarEliminar(clave)} disabled={eliminando !== null} className="flex shrink-0 items-center justify-center gap-1.5 rounded-lg border border-red-200 px-3 py-2 text-xs font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50">{eliminando === clave ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}Eliminar de SaveData</button>}
@@ -108,7 +123,7 @@ export function HistorialEnviosPage() {
 
 function FilaIntento({ intento, onAbrir }: { intento: IntentoHistorial; onAbrir: () => void }) {
   return <li><button type="button" onClick={onAbrir} className="w-full rounded-lg border border-slate-100 bg-white p-3 text-left text-xs hover:border-coral/40" title="Abrir la extracción y el documento">
-    <div className="flex flex-wrap items-center justify-between gap-2"><span className="font-semibold text-slate-700">{fechaHora(intento.terminado_en ?? intento.iniciado_en)}{intento.accion === 'eliminar' ? ' · eliminación' : intento.agregado_de_nuevo ? ' · agregado de nuevo' : intento.reenvio ? ' · actualización' : ' · primer envío'}</span><span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${etiquetaResultado[intento.resultado].clase}`}>{intento.accion === 'eliminar' && (intento.resultado === 'exito' || intento.resultado === 'no_existe') ? 'Eliminado' : etiquetaResultado[intento.resultado].texto}</span></div>
+    <div className="flex flex-wrap items-center justify-between gap-2"><span className="font-semibold text-slate-700">{fechaHora(intento.terminado_en ?? intento.iniciado_en)}{intento.accion === 'eliminar' ? ' · eliminación' : intento.agregado_de_nuevo ? ' · agregado de nuevo' : intento.reenvio ? ' · actualización' : ' · primer envío'}{intento.automatico ? ' · envío automático' : ''}</span><span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${etiquetaResultado[intento.resultado].clase}`}>{intento.accion === 'eliminar' && (intento.resultado === 'exito' || intento.resultado === 'no_existe') ? 'Eliminado' : etiquetaResultado[intento.resultado].texto}</span></div>
     {intento.accion === 'eliminar' ? <div className="mt-1 text-slate-500">Se pidió a SaveData borrar el registro.</div> : <>
       <div className="mt-1 text-slate-500">Sucursal {intento.sucursal ?? '—'} · Artículo {intento.articulo ?? '—'} · Versión {intento.version_extraccion ?? '—'}</div>
       {intento.faltantes.length > 0 ? <div className="mt-1 text-amber-800">Sin: {intento.faltantes.join(', ')}</div> : <div className="mt-1 text-emerald-700">Todos los campos con valor.</div>}

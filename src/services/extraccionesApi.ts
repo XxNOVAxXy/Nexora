@@ -71,6 +71,8 @@ export type IntentoEnvio = {
   actualizacion?: boolean
   /** Se volvió a agregar después de que SaveData lo reportó borrado. */
   agregado_de_nuevo?: boolean
+  /** Lo envió el proceso automático. */
+  automatico?: boolean
 }
 
 export type EntradaListado = {

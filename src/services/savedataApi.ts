@@ -2,6 +2,7 @@
  * Envío a SaveData a través del backend. El navegador nunca contacta SaveData directamente:
  * el backend construye el cuerpo, lo envía y audita cada intento.
  */
+import type { EstadoEnvioAutomatico } from './automaticoApi'
 import { ErrorApi, type EstadoExtraccion, type ExtraccionGuardada, type IntentoEnvio, type ResultadoIntento } from './extraccionesApi'
 
 const API_URL = import.meta.env.DEV ? '/api' : (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
@@ -57,6 +58,18 @@ export type IntentoHistorial = {
   version_extraccion: number | null
   /** Campos que llegaron a SaveData como null ("RFC", "Folio (3 mov.)"). */
   faltantes: string[]
+  /** Lo envió el proceso automático. */
+  automatico?: boolean
+}
+
+/** Estado del envío automático de un documento, tal como lo deja el backend en el documento. */
+export type EnvioAutomaticoDocumento = {
+  estado: EstadoEnvioAutomatico
+  intentos: number | null
+  error: string | null
+  motivos: string[] | null
+  problemas: string[] | null
+  actualizado: string | null
 }
 
 /** Un documento enviado a SaveData (historial). */
@@ -72,8 +85,10 @@ export type DocumentoEnviado = {
   modificado_tras_envio: boolean
   /** presente | borrado (lo borraron en SaveData) | eliminado (lo eliminamos desde Nexora) | nunca */
   en_savedata: 'nunca' | 'presente' | 'borrado' | 'eliminado'
-  ultimo: IntentoHistorial
+  /** null si nunca se envió (p. ej. el envío automático lo dejó en "Requiere revisión"). */
+  ultimo: IntentoHistorial | null
   intentos: IntentoHistorial[]
+  envio_automatico?: EnvioAutomaticoDocumento | null
 }
 
 type RespuestaEnvio = { resultado: 'exito'; mensaje: string; intento: IntentoEnvio; extraccion: ExtraccionGuardada }

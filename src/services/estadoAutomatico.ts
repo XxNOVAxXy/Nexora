@@ -2,16 +2,29 @@ import type { AdjuntoAutomatico, EstadoAutomatico } from './automaticoApi'
 import type { EntradaListado, EstadoExtraccion } from './extraccionesApi'
 
 /** Estado que muestra la bandeja por adjunto: el de la extracción guardada más los de la extracción automática. */
-export type EstadoDocumento = EstadoExtraccion | 'sin_extraer' | 'automatico' | 'error_auto'
+export type EstadoDocumento = EstadoExtraccion | 'sin_extraer' | 'automatico' | 'error_auto' | 'enviado_auto' | 'requiere_revision' | 'error_envio' | 'incierto_envio'
+
+/** Estados del envío automático que se muestran en la bandeja y en Envíos. */
+const ESTADO_ENVIO_VISIBLE: Partial<Record<NonNullable<AdjuntoAutomatico['envio']>['estado'], EstadoDocumento>> = {
+  enviado: 'enviado_auto',
+  requiere_revision: 'requiere_revision',
+  error: 'error_envio',
+  incierto: 'incierto_envio',
+}
 
 /**
  * - "Extraído automáticamente" mientras la extracción siga siendo la versión que guardó el proceso automático;
  *   en cuanto el usuario la guarda o la edita, se muestra su estado normal (Borrador, Revisado, Enviado).
+ * - Envío automático: "Enviado automáticamente", "Requiere revisión", "Error al enviar" o "Incierto, verificar"
+ *   mientras el documento siga en la versión que dejó el proceso automático.
  * - "Error al extraer" si el proceso agotó los intentos y no hay nada guardado.
  * - Lo guardado por el usuario siempre manda.
  */
 export function estadoDocumento(guardado: EntradaListado | undefined, automatico: AdjuntoAutomatico | undefined): EstadoDocumento {
   if (guardado) {
+    const envio = automatico?.estado === 'extraido' ? automatico.envio : null
+    const visible = envio ? ESTADO_ENVIO_VISIBLE[envio.estado] : undefined
+    if (envio && visible && guardado.version === (envio.version ?? automatico?.version)) return visible
     const intacto = automatico?.estado === 'extraido' && guardado.estado === 'borrador' && automatico.version !== null && guardado.version === automatico.version
     return intacto ? 'automatico' : guardado.estado
   }

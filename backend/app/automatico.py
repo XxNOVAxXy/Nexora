@@ -2,7 +2,15 @@
 
 Cada ``intervalo`` minutos un hilo del backend revisa Gmail con el filtro de estados de cuenta y extrae con Gemini
 los adjuntos nuevos. El resultado se guarda como borrador en ``AlmacenExtracciones``, igual que si el usuario
-hubiera pulsado "Extraer" y guardado. Nunca envía nada a SaveData: ese paso sigue siendo manual.
+hubiera pulsado "Extraer" y guardado.
+
+Envío automático a SaveData (``envio_activo``, apagado por defecto): los adjuntos extraídos *con el interruptor
+encendido* (``enviar_auto``) se marcan como revisados y se envían con ``ServicioEnvio.enviar`` (mismo Id,
+Actualizacion y formato que el envío manual). Solo si el usuario no tocó el documento (misma versión, sin envíos
+ajenos). El intento se registra (``envio.estado = en_curso``) antes de contactar SaveData; un reinicio a mitad nunca
+reenvía a ciegas. Con ``solo_si_cuadra`` (encendido por defecto) un documento que no cuadra, con importes inválidos o
+dudosos queda en ``requiere_revision``. Errores claros: hasta ``MAX_INTENTOS`` envíos, uno por ciclo. Timeout
+(incierto): nunca se reintenta.
 
 Estado por cuenta en ``<raiz>/<cuenta_id>.json`` (escritura atómica):
 
@@ -58,6 +66,8 @@ BLOQUEO_CADUCA_SEGUNDOS = 30 * 60
 INTERVALO_PREDETERMINADO = 20
 
 TERMINALES = {"extraido", "omitido", "error"}
+# Estados finales del envío automático: nunca se vuelve a enviar solo.
+TERMINALES_ENVIO = {"enviado", "requiere_revision", "error", "incierto", "sin_savedata", "omitido"}
 
 
 def intervalo_desde_entorno(valor: str | None) -> float:
@@ -67,6 +77,12 @@ def intervalo_desde_entorno(valor: str | None) -> float:
     except ValueError:
         return INTERVALO_PREDETERMINADO
     return minutos if minutos >= 1 else INTERVALO_PREDETERMINADO
+
+
+def _envio_publico(envio: Any) -> dict[str, Any] | None:
+    if not isinstance(envio, dict):
+        return None
+    return {k: envio.get(k) for k in ("estado", "intentos", "error", "motivos", "problemas", "version", "actualizado")}
 
 
 def _iso(momento: datetime | None) -> str | None:
@@ -87,6 +103,32 @@ def _comparable(nombre: str) -> str:
     """Igual que ``nombreComparable`` del frontend: sin acentos, minúsculas y espacios simples."""
     sin_acentos = "".join(c for c in unicodedata.normalize("NFKD", nombre) if not unicodedata.combining(c))
     return re.sub(r"\s+", " ", sin_acentos).strip().lower()
+
+
+class _DocumentoTocado(Exception):
+    """El usuario guardó, editó o envió el documento: el envío automático ya no lo toca."""
+
+
+def motivos_sin_cuadrar(problemas: dict[str, Any]) -> list[str]:
+    """Por qué un documento no pasa la protección "Enviar solo si cuadra"."""
+    motivos = []
+    if problemas.get("cuadra") is not True:
+        motivos.append("La validacion contable no cuadra." if problemas.get("cuadra") is False else "La validacion contable esta incompleta.")
+    if problemas.get("invalidos"):
+        motivos.append(f"{problemas['invalidos']} importe(s) invalido(s).")
+    if problemas.get("dudosos"):
+        motivos.append(f"{problemas['dudosos']} importe(s) dudoso(s).")
+    return motivos
+
+
+def problemas_encontrados(problemas: dict[str, Any]) -> list[str]:
+    """Todo lo que la revisión exigiría confirmar; se anota cuando se envía con la protección apagada."""
+    motivos = motivos_sin_cuadrar(problemas)
+    if problemas.get("diferencias"):
+        motivos.append(f"{problemas['diferencias']} diferencia(s) en la validacion.")
+    if problemas.get("en_revision"):
+        motivos.append(f"{problemas['en_revision']} movimiento(s) marcados para revision.")
+    return motivos
 
 
 class _CortarCiclo(Exception):
@@ -174,8 +216,11 @@ class ExtractorAutomatico:
         intervalo_minutos: float = INTERVALO_PREDETERMINADO,
         reloj: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         plantillas: AlmacenPlantillas | None = None,
+        envios: Any = None,
     ) -> None:
         self.raiz = raiz
+        # ServicioEnvio de savedata.py: el envío automático reutiliza exactamente el envío manual.
+        self.envios = envios
         # Configuración de campos; sin ella, la lista efectiva es la deducida de las extracciones guardadas.
         self.plantillas = plantillas or AlmacenPlantillas(raiz / "_sin_configuracion", lambda email: deducir_campos(almacen, email))
         self.gmail = gmail
@@ -197,7 +242,8 @@ class ExtractorAutomatico:
 
     def _leer(self, email: str) -> dict[str, Any]:
         ruta = self._ruta(email)
-        base: dict[str, Any] = {"activo": False, "activado_en": None, "ultimo_correo": None, "ultima_revision": None, "ultimo_resultado": None, "ultimo_error": None, "adjuntos": {}}
+        base: dict[str, Any] = {"activo": False, "activado_en": None, "ultimo_correo": None, "ultima_revision": None, "ultimo_resultado": None, "ultimo_error": None,
+                                "envio_activo": False, "solo_si_cuadra": True, "envio_activado_en": None, "adjuntos": {}}
         if not ruta.exists():
             return base
         try:
@@ -233,6 +279,22 @@ class ExtractorAutomatico:
             self.revisar_ahora()
         return self.estado(email)
 
+    def savedata_configurada(self) -> bool:
+        return self.envios is not None and bool(self.envios.url().strip())
+
+    def configurar_envio(self, email: str, envio_activo: bool, solo_si_cuadra: bool) -> dict[str, Any]:
+        """Interruptores del envío automático. Encenderlo exige SAVEDATA_URL; solo aplica a lo que se extraiga después."""
+        if envio_activo and not self.savedata_configurada():
+            raise ValueError("SAVEDATA_URL no esta configurada en el backend.")
+
+        def cambio(estado: dict[str, Any]) -> None:
+            if envio_activo and not estado.get("envio_activo"):
+                estado["envio_activado_en"] = _iso(self.reloj())
+            estado["envio_activo"] = envio_activo
+            estado["solo_si_cuadra"] = solo_si_cuadra
+        self._mutar(email, cambio)
+        return self.estado(email)
+
     def campos_configurados(self, email: str) -> list[dict[str, Any]]:
         """Campos de la configuración (o, si nunca se guardó, los deducidos de las extracciones guardadas)."""
         return self.plantillas.efectiva(email)
@@ -258,8 +320,16 @@ class ExtractorAutomatico:
             "ultimo_error": estado["ultimo_error"],
             "gemini_configurado": gemini_listo,
             "campos": self.campos_a_buscar(email),
+            "envio_activo": bool(estado.get("envio_activo")),
+            "solo_si_cuadra": estado.get("solo_si_cuadra") is not False,
+            "envio_activado_en": estado.get("envio_activado_en"),
+            "savedata_configurada": self.savedata_configurada(),
             "adjuntos": {
-                clave: {k: entrada.get(k) for k in ("estado", "intentos", "error", "version", "actualizado")}
+                clave: {
+                    **{k: entrada.get(k) for k in ("estado", "intentos", "error", "version", "actualizado")},
+                    "enviar_auto": bool(entrada.get("enviar_auto")),
+                    "envio": _envio_publico(entrada.get("envio")),
+                }
                 for clave, entrada in estado["adjuntos"].items()
             },
         }
@@ -318,11 +388,13 @@ class ExtractorAutomatico:
         activado = _fecha(estado.get("activado_en"))
         if not estado["activo"] or activado is None:
             return {"resultado": "pausado"}
+        # Reintentos de envío pendientes: no dependen de Gmail ni de Gemini.
+        envios_previos = self._procesar_envios(email)
         if not self.gemini.status().get("enabled"):
             self._cerrar_ciclo(email, "sin_gemini", None)
             return {"resultado": "sin_gemini"}
 
-        resumen = {"resultado": "ok", "extraidos": 0, "errores": 0, "omitidos": 0}
+        resumen = {"resultado": "ok", "extraidos": 0, "errores": 0, "omitidos": 0, "enviados": envios_previos}
         try:
             self._procesar(email, estado, activado, resumen)
         except _CortarCiclo as corte:
@@ -430,9 +502,13 @@ class ExtractorAutomatico:
         except Exception as error:
             logger.exception("Extraccion automatica: no se pudo guardar %s", clave)
             return self._fallo(email, clave, intentos + 1, str(error) or error.__class__.__name__, resumen)
-        self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"))
+        # Solo lo extraído con el envío automático encendido se envía solo.
+        enviar_auto = bool(self._leer(email).get("envio_activo"))
+        self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"), enviar_auto=enviar_auto)
         resumen["extraidos"] += 1
         logger.info("Extraccion automatica guardada %s transacciones=%d", clave, len(documento.get("transacciones", [])))
+        if enviar_auto and self._enviar_auto(email, message_id, part_id) == "enviado":
+            resumen["enviados"] = resumen.get("enviados", 0) + 1
         return "extraido"
 
     def _fallo(self, email: str, clave: str, intentos: int, mensaje: str, resumen: dict[str, Any]) -> str:
@@ -441,6 +517,158 @@ class ExtractorAutomatico:
         if estado == "error":
             resumen["errores"] += 1
         return estado
+
+    # --- Envío automático a SaveData -----------------------------------------------------------
+
+    def _procesar_envios(self, email: str) -> int:
+        """Reintenta los envíos automáticos que quedaron pendientes (o interrumpidos) en ciclos anteriores."""
+        estado = self._leer(email)
+        if not estado.get("envio_activo"):
+            return 0
+        enviados = 0
+        for clave, entrada in estado["adjuntos"].items():
+            if entrada.get("estado") != "extraido" or not entrada.get("enviar_auto"):
+                continue
+            if (entrada.get("envio") or {}).get("estado") in TERMINALES_ENVIO:
+                continue
+            message_id, _, part_id = clave.partition("__")
+            if self._enviar_auto(email, message_id, part_id) == "enviado":
+                enviados += 1
+        return enviados
+
+    def _anotar_envio(self, email: str, clave: str, **valores: Any) -> dict[str, Any]:
+        def cambio(estado: dict[str, Any]) -> None:
+            entrada = dict(estado["adjuntos"].get(clave) or {"intentos": 0})
+            envio = dict(entrada.get("envio") or {"intentos": 0, "intentos_ids": []})
+            envio.update(valores, actualizado=_iso(self.reloj()))
+            entrada["envio"] = envio
+            estado["adjuntos"][clave] = entrada
+        return self._mutar(email, cambio)["adjuntos"][clave]["envio"]
+
+    def _reflejar_en_documento(self, email: str, message_id: str, part_id: str, envio: dict[str, Any], intento_id: str | None = None) -> None:
+        """Copia el estado del envío automático al documento (lo muestra la página Envíos) y marca su intento."""
+        def cambio(documento: dict[str, Any] | None) -> dict[str, Any]:
+            if documento is None:
+                raise _DocumentoTocado()
+            envios = [{**item, "automatico": True} if intento_id and item.get("id") == intento_id else item for item in documento.get("envios", [])]
+            return {**documento, "envios": envios, "envio_automatico": {k: envio.get(k) for k in ("estado", "intentos", "error", "motivos", "problemas", "actualizado")}}
+        try:
+            self.almacen.actualizar(email, message_id, part_id, cambio)
+        except _DocumentoTocado:
+            pass
+        except Exception:
+            logger.exception("Envio automatico: no se pudo anotar el estado en el documento %s__%s", message_id, part_id)
+
+    def _terminar_envio(self, email: str, message_id: str, part_id: str, estado: str, **valores: Any) -> str:
+        clave = f"{message_id}__{part_id}"
+        intento_id = valores.pop("intento_id", None)
+        envio = self._anotar_envio(email, clave, estado=estado, **valores)
+        if estado != "omitido":
+            self._reflejar_en_documento(email, message_id, part_id, envio, intento_id)
+        return estado
+
+    def _enviar_auto(self, email: str, message_id: str, part_id: str) -> str | None:
+        """Marca como revisado y envía a SaveData un documento extraído automáticamente que nadie tocó.
+
+        Devuelve el estado del envío automático, o None si no aplica.
+        """
+        clave = f"{message_id}__{part_id}"
+        cuenta = self._leer(email)
+        entrada = cuenta["adjuntos"].get(clave) or {}
+        if self.envios is None or not cuenta.get("envio_activo") or not entrada.get("enviar_auto") or entrada.get("estado") != "extraido":
+            return None
+        envio = dict(entrada.get("envio") or {})
+        if envio.get("estado") in TERMINALES_ENVIO:
+            return envio["estado"]
+        intentos = int(envio.get("intentos") or 0)
+        propios = list(envio.get("intentos_ids") or [])
+
+        documento = self.almacen.leer_completo(email, message_id, part_id)
+        if documento is None:
+            return self._terminar_envio(email, message_id, part_id, "omitido", error="El documento ya no existe.")
+        ajenos = [item for item in documento.get("envios") or [] if item.get("id") not in propios]
+
+        if envio.get("estado") == "en_curso":
+            # El backend se detuvo a mitad del envío. Si ServicioEnvio llegó a registrar el intento, SaveData pudo
+            # haberlo recibido: nunca se reenvía a ciegas.
+            if ajenos:
+                ultimo = ajenos[-1]
+                ids = [*propios, ultimo.get("id")]
+                if ultimo.get("resultado") == "exito":
+                    return self._terminar_envio(email, message_id, part_id, "enviado", error=None, intentos_ids=ids, intento_id=ultimo.get("id"))
+                if ultimo.get("resultado") == "error":
+                    return self._terminar_envio(email, message_id, part_id, "error" if intentos >= MAX_INTENTOS else "pendiente", error=ultimo.get("error"), intentos_ids=ids, intento_id=ultimo.get("id"))
+                return self._terminar_envio(email, message_id, part_id, "incierto", error="El backend se detuvo durante el envio; verifica en SaveData si llego.", intentos_ids=ids, intento_id=ultimo.get("id"))
+            # SaveData nunca se contactó: se puede intentar de nuevo (el intento ya quedó contado).
+
+        if intentos >= MAX_INTENTOS:
+            return self._terminar_envio(email, message_id, part_id, "error", error=envio.get("error") or "Se agotaron los intentos de envio.")
+        if not self.savedata_configurada():
+            return self._terminar_envio(email, message_id, part_id, "sin_savedata", error="SAVEDATA_URL no esta configurada: se extrajo pero no se envio.")
+        if ajenos:
+            return self._terminar_envio(email, message_id, part_id, "omitido", error="El documento ya se envio manualmente.")
+
+        version_revisada = envio.get("version")
+        if version_revisada is None:
+            # Primera vez: el documento debe seguir siendo el borrador que guardó el proceso automático.
+            if documento.get("estado") != "borrador" or documento.get("version") != entrada.get("version"):
+                return self._terminar_envio(email, message_id, part_id, "omitido", error="El usuario edito el documento.")
+            problemas = documento.get("problemas") or {}
+            motivos = motivos_sin_cuadrar(problemas)
+            if motivos and cuenta.get("solo_si_cuadra") is not False:
+                return self._terminar_envio(email, message_id, part_id, "requiere_revision", error=None, motivos=motivos, problemas=problemas_encontrados(problemas))
+            try:
+                revisado = self.almacen.actualizar(email, message_id, part_id, self._marcar_revisado(documento.get("version")))
+            except _DocumentoTocado:
+                return self._terminar_envio(email, message_id, part_id, "omitido", error="El usuario edito el documento.")
+            version_revisada = revisado.get("version")
+            self._anotar_envio(email, clave, version=version_revisada, problemas=problemas_encontrados(problemas), motivos=[])
+        elif documento.get("estado") != "revisado" or documento.get("version") != version_revisada:
+            return self._terminar_envio(email, message_id, part_id, "omitido", error="El usuario edito el documento.")
+
+        # El intento queda contado en disco antes de contactar SaveData.
+        self._anotar_envio(email, clave, estado="en_curso", intentos=intentos + 1, error=None)
+        return self._enviar_y_registrar(email, message_id, part_id, version_revisada, intentos + 1, propios)
+
+    def _marcar_revisado(self, version: Any) -> Callable[[dict[str, Any] | None], dict[str, Any]]:
+        def cambio(documento: dict[str, Any] | None) -> dict[str, Any]:
+            if documento is None or documento.get("version") != version or documento.get("estado") != "borrador" or documento.get("envios"):
+                raise _DocumentoTocado()
+            ahora = _iso(self.reloj())
+            return {**documento, "estado": "revisado", "version": int(version) + 1, "actualizado": ahora, "revisado_en": ahora,
+                    "revisado_con_problemas": bool((documento.get("problemas") or {}).get("total")), "revisado_automaticamente": True}
+        return cambio
+
+    def _enviar_y_registrar(self, email: str, message_id: str, part_id: str, version: int, intentos: int, propios: list[str]) -> str:
+        # Sucursal, artículo y carga inicial no forman parte del cuerpo (ver datos_documento): aquí no se exigen.
+        from .savedata import EnvioRequest, NoSePuedeEnviar
+
+        solicitud = EnvioRequest.model_construct(version_base=version, sucursal=None, articulo=None, carga_inicial=False, confirmar_reenvio=False, agregar_de_nuevo=False)
+        try:
+            respuesta, intento, _documento = self.envios.enviar(email, message_id, part_id, solicitud)
+        except (ConflictoVersion, EnvioEnCurso):
+            return self._terminar_envio(email, message_id, part_id, "omitido", error="El usuario edito o esta enviando el documento.")
+        except NoSePuedeEnviar as error:
+            if error.code == "savedata_sin_configurar":
+                return self._terminar_envio(email, message_id, part_id, "sin_savedata", error=str(error))
+            if error.code == "savedata_url_invalida":
+                return self._terminar_envio(email, message_id, part_id, "error", error=str(error))
+            return self._terminar_envio(email, message_id, part_id, "omitido", error=str(error))
+        except Exception as error:
+            # ServicioEnvio no registró el intento: SaveData no se contactó.
+            logger.exception("Envio automatico fallo para %s__%s", message_id, part_id)
+            estado = "error" if intentos >= MAX_INTENTOS else "pendiente"
+            return self._terminar_envio(email, message_id, part_id, estado, error=(str(error) or error.__class__.__name__)[:500])
+
+        ids = [*propios, intento["id"]]
+        logger.info("Envio automatico %s__%s resultado=%s", message_id, part_id, respuesta.resultado)
+        if respuesta.resultado == "exito":
+            return self._terminar_envio(email, message_id, part_id, "enviado", error=None, intentos_ids=ids, intento_id=intento["id"])
+        if respuesta.resultado == "incierto":
+            # Pudo haber llegado: nunca se reintenta solo.
+            return self._terminar_envio(email, message_id, part_id, "incierto", error=respuesta.mensaje, intentos_ids=ids, intento_id=intento["id"])
+        estado = "error" if intentos >= MAX_INTENTOS else "pendiente"
+        return self._terminar_envio(email, message_id, part_id, estado, error=respuesta.mensaje, intentos_ids=ids, intento_id=intento["id"])
 
     # --- Hilo programado ----------------------------------------------------------------------
 
