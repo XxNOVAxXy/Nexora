@@ -10,9 +10,11 @@ import { geminiApi, type GeminiExtractionResponse, type GeminiStatus } from './s
 import { ejecutarEliminacion, ejecutarEnvio, savedataApi, type ConfigSaveData, type VistaPreviaEnvio } from './services/savedataApi'
 import { claveEstado, inboxStore, type EstadosExtraccion, type Listado, type MailFolder } from './services/inboxStore'
 import { automaticoApi, type EstadoAutomatico } from './services/automaticoApi'
+import { publicarEstadoAutomatico } from './services/eventosAutomatico'
+import { AvisosAutomatico, CampanaAvisos, ListaDescartes, ResumenUltimoCiclo } from './DiagnosticoAutomatico'
 import { plantillaCamposApi, plantillaVigente } from './services/plantillaCamposApi'
 import { agregarAPlantilla, aplicarPlantilla, CAMPOS_FIJOS, cambiarTipoEnPlantilla, errorNombrePlantilla, etiquetaAlcance, nuevoIdPlantilla, quitarDePlantilla, renombrarEnPlantilla, sugerenciasNuevas, type CampoPlantilla, type SugerenciaPlantilla } from './services/plantillaCampos'
-import { estadoDocumento, textoCamposAutomaticos, textoIndicador, type EstadoDocumento } from './services/estadoAutomatico'
+import { estadoDocumento, intervaloConsulta, textoCamposAutomaticos, textoIndicador, type EstadoDocumento } from './services/estadoAutomatico'
 import { extraccionesApi, type EstadoExtraccion, type ExtraccionGuardada, type IntentoEnvio, type ProblemasRevision } from './services/extraccionesApi'
 import { crearColaExtraccion, type ColaExtraccion } from './services/colaExtraccion'
 import { estadoPestana, leerArchivos, urlExtraccionLote, type ArchivoExtraccion, type EstadoCola, type EstadoPestana } from './services/pestanasExtraccion'
@@ -27,7 +29,6 @@ import {
   ArrowDownToLine,
   ArrowLeft,
   ArrowRightLeft,
-  Bell,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -125,7 +126,7 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
 function Topbar({ onMenu }: { onMenu: () => void }) {
   const location = useLocation()
   const titles: Record<string, string> = { '/': 'Correos', '/emails': 'Correos', '/extraction': 'Extracción', '/settings': 'Configuración' }
-  return <header className="flex h-[76px] items-center justify-between border-b border-slate-200/70 bg-paper px-5 sm:px-8 lg:px-10"><div className="flex items-center gap-3"><button onClick={onMenu} className="rounded-lg p-2 text-slate-500 hover:bg-white lg:hidden"><Menu size={21} /></button><div><div className="eyebrow">Workspace / {titles[location.pathname] ?? 'Nexora'}</div><h1 className="font-display text-xl font-extrabold tracking-tight text-ink sm:text-[22px]">{titles[location.pathname] ?? 'Nexora'}</h1></div></div><div className="flex items-center gap-2 sm:gap-4"><div className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-400 md:flex"><Search size={15} /><span>Buscar en Nexora</span><kbd className="ml-8 rounded border border-slate-200 px-1.5 py-0.5 text-[10px] text-slate-400">⌘ K</kbd></div><button className="relative rounded-lg p-2 text-slate-500 hover:bg-white"><Bell size={19} /><span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-coral" /></button><div className="hidden h-7 w-px bg-slate-200 sm:block" /><button className="flex items-center gap-2 text-sm font-semibold text-slate-600"><span className="flex h-8 w-8 items-center justify-center rounded-full bg-coral/10 text-xs font-bold text-coral">JD</span><ChevronDown size={14} className="hidden sm:block" /></button></div></header>
+  return <header className="flex h-[76px] items-center justify-between border-b border-slate-200/70 bg-paper px-5 sm:px-8 lg:px-10"><div className="flex items-center gap-3"><button onClick={onMenu} className="rounded-lg p-2 text-slate-500 hover:bg-white lg:hidden"><Menu size={21} /></button><div><div className="eyebrow">Workspace / {titles[location.pathname] ?? 'Nexora'}</div><h1 className="font-display text-xl font-extrabold tracking-tight text-ink sm:text-[22px]">{titles[location.pathname] ?? 'Nexora'}</h1></div></div><div className="flex items-center gap-2 sm:gap-4"><div className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-400 md:flex"><Search size={15} /><span>Buscar en Nexora</span><kbd className="ml-8 rounded border border-slate-200 px-1.5 py-0.5 text-[10px] text-slate-400">⌘ K</kbd></div><CampanaAvisos /><div className="hidden h-7 w-px bg-slate-200 sm:block" /><button className="flex items-center gap-2 text-sm font-semibold text-slate-600"><span className="flex h-8 w-8 items-center justify-center rounded-full bg-coral/10 text-xs font-bold text-coral">JD</span><ChevronDown size={14} className="hidden sm:block" /></button></div></header>
 }
 
 function PageHeading({ eyebrow, title, description, children }: { eyebrow: string; title: string; description: string; children?: React.ReactNode }) {
@@ -221,7 +222,7 @@ function FilteredGmailInboxPage() {
     let vivo = true
     const consultar = async () => {
       try {
-        const estado = await automaticoApi.estado()
+        const estado = publicarEstadoAutomatico(await automaticoApi.estado())
         if (!vivo) return
         setAutomatico(estado)
         const extraidos = Object.values(estado.adjuntos).filter((adjunto) => adjunto.estado === 'extraido' || adjunto.estado === 'error').length
@@ -1752,9 +1753,18 @@ export function TarjetaExtraccionAutomatica({ onNotice, onError }: { onNotice: (
   const mensaje = (requestError: unknown, defecto: string) => (requestError instanceof Error ? requestError.message : defecto)
   useEffect(() => {
     let vivo = true
-    void automaticoApi.estado().then((valor) => { if (vivo) setEstado(valor) }).catch((requestError: unknown) => { if (vivo) onError(mensaje(requestError, 'No se pudo consultar la extracción automática.')) })
+    void automaticoApi.estado().then((valor) => { if (vivo) setEstado(publicarEstadoAutomatico(valor)) }).catch((requestError: unknown) => { if (vivo) onError(mensaje(requestError, 'No se pudo consultar la extracción automática.')) })
     return () => { vivo = false }
   }, [])
+  // Estado real: se vuelve a consultar cada minuto, y cada 3 s mientras hay un ciclo en curso o una revisión pedida.
+  const intervalo = intervaloConsulta(estado)
+  useEffect(() => {
+    let vivo = true
+    const temporizador = window.setInterval(() => {
+      automaticoApi.estado().then((valor) => { if (vivo) setEstado(publicarEstadoAutomatico(valor)) }).catch(() => undefined)
+    }, intervalo)
+    return () => { vivo = false; window.clearInterval(temporizador) }
+  }, [intervalo])
   const alternar = async () => {
     if (!estado || ocupado) return
     setOcupado(true)
@@ -1766,7 +1776,7 @@ export function TarjetaExtraccionAutomatica({ onNotice, onError }: { onNotice: (
   }
   const revisar = async () => {
     setOcupado(true)
-    try { setEstado(await automaticoApi.revisarAhora()); onNotice('Revisión iniciada. Los estados de cuenta nuevos aparecerán en Correos ya extraídos.') } catch (requestError) { onError(mensaje(requestError, 'No se pudo iniciar la revisión.')) } finally { setOcupado(false) }
+    try { setEstado(publicarEstadoAutomatico(await automaticoApi.revisarAhora())); onNotice('Revisión solicitada. Al terminar, la tarjeta mostrará el resumen del ciclo.') } catch (requestError) { onError(mensaje(requestError, 'No se pudo iniciar la revisión.')) } finally { setOcupado(false) }
   }
   const envioActivo = Boolean(estado?.envio_activo)
   const soloSiCuadra = estado?.solo_si_cuadra !== false
@@ -1781,7 +1791,7 @@ export function TarjetaExtraccionAutomatica({ onNotice, onError }: { onNotice: (
     } catch (requestError) { onError(mensaje(requestError, 'No se pudo cambiar el envío automático.')) } finally { setOcupado(false) }
   }
   const activo = Boolean(estado?.activo)
-  return <section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-automatico"><div className="mb-5 flex items-start justify-between gap-4"><div className="flex gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-50 text-violet-600"><Sparkles size={19} /></div><div><h3 id="titulo-config-automatico" className="font-display text-base font-bold text-ink">Extracción automática</h3><p className="mt-1 text-xs text-slate-500">Cada {estado?.intervalo_minutos ?? 20} minutos revisa Gmail y extrae los estados de cuenta nuevos como borrador.{envioActivo ? ' Después los envía solos a SaveData.' : ' El envío a SaveData es manual.'}</p></div></div><button type="button" role="switch" aria-checked={activo} aria-label="Extracción automática" onClick={() => void alternar()} disabled={!estado || ocupado} className="flex items-center gap-2 text-xs font-semibold text-slate-500"><span className={`relative h-5 w-9 rounded-full transition ${activo ? 'bg-emerald-500' : 'bg-slate-200'}`}><span className={`absolute top-1 h-3 w-3 rounded-full bg-white shadow transition ${activo ? 'left-5' : 'left-1'}`} /></span>{activo ? 'Activa' : 'En pausa'}</button></div><div className="grid gap-4 sm:grid-cols-2"><SettingField label="Estado" value={textoIndicador(estado) ?? 'Consultando…'} /><SettingField label="Activa desde" value={estado?.activado_en ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(estado.activado_en)) : 'Nunca activada'} /></div>{estado?.ultimo_error && <p className="mt-3 text-[11px] text-red-700">Última revisión con problemas: {estado.ultimo_error}</p>}<p className="mt-4 text-xs text-slate-500">{textoCamposAutomaticos(estado?.campos ?? [])}</p><div className="mt-4"><button type="button" onClick={() => void revisar()} disabled={!activo || ocupado || Boolean(estado?.en_curso)} className="btn-primary"><RefreshCw size={14} className={estado?.en_curso ? 'animate-spin' : ''} />Revisar ahora</button></div>
+  return <section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-automatico"><div className="mb-5 flex items-start justify-between gap-4"><div className="flex gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-50 text-violet-600"><Sparkles size={19} /></div><div><h3 id="titulo-config-automatico" className="font-display text-base font-bold text-ink">Extracción automática</h3><p className="mt-1 text-xs text-slate-500">Cada {estado?.intervalo_minutos ?? 20} minutos revisa Gmail y extrae los estados de cuenta nuevos como borrador.{envioActivo ? ' Después los envía solos a SaveData.' : ' El envío a SaveData es manual.'}</p></div></div><button type="button" role="switch" aria-checked={activo} aria-label="Extracción automática" onClick={() => void alternar()} disabled={!estado || ocupado} className="flex items-center gap-2 text-xs font-semibold text-slate-500"><span className={`relative h-5 w-9 rounded-full transition ${activo ? 'bg-emerald-500' : 'bg-slate-200'}`}><span className={`absolute top-1 h-3 w-3 rounded-full bg-white shadow transition ${activo ? 'left-5' : 'left-1'}`} /></span>{activo ? 'Activa' : 'En pausa'}</button></div><div className="grid gap-4 sm:grid-cols-2"><SettingField label="Estado" value={textoIndicador(estado) ?? 'Consultando…'} /><SettingField label="Activa desde" value={estado?.activado_en ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(estado.activado_en)) : 'Nunca activada'} /></div>{estado && <ResumenUltimoCiclo estado={estado} />}{estado?.ultimo_error && !estado.ultimo_ciclo && <p className="mt-3 text-[11px] text-red-700">Última revisión con problemas: {estado.ultimo_error}</p>}{estado && <AvisosAutomatico estado={estado} onActualizado={setEstado} />}<ListaDescartes descartados={estado?.descartados ?? []} /><p className="mt-4 text-xs text-slate-500">{textoCamposAutomaticos(estado?.campos ?? [])}</p><div className="mt-4"><button type="button" onClick={() => void revisar()} disabled={!activo || ocupado || Boolean(estado?.en_curso)} className="btn-primary"><RefreshCw size={14} className={estado?.en_curso ? 'animate-spin' : ''} />Revisar ahora</button></div>
     <div className="mt-5 space-y-3 border-t border-slate-100 pt-4">
       <Interruptor etiqueta="Envío automático a SaveData" descripcion="Al terminar de extraer, marca el documento como revisado y lo envía con el mismo formato e Id que el envío manual. Solo aplica a lo que se extraiga después de encenderlo y a documentos que no hayas editado." activo={envioActivo} disabled={!estado || ocupado || (!envioActivo && !savedataLista)} onCambiar={() => void configurarEnvio(!envioActivo, soloSiCuadra)} />
       {estado && !savedataLista && <p className="text-[11px] text-amber-800">SAVEDATA_URL no está configurada en el backend: se extrae, pero no se envía nada.</p>}

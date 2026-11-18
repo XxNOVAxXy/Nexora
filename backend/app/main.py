@@ -630,9 +630,25 @@ def configurar_envio_automatico(payload: EnvioAutomaticoRequest) -> dict[str, An
 def revisar_automatico() -> dict[str, Any]:
     """"Revisar ahora": adelanta la siguiente revisión. Nunca envía nada a SaveData."""
     email = _cuenta_actual()
-    if not automatico.revisar_ahora():
+    if not automatico.revisar_ahora(email):
         raise HTTPException(status_code=409, detail={"code": "revision_en_curso", "message": "Ya hay una revision en curso."})
     return automatico.estado(email)
+
+
+class AvisosLeidosRequest(BaseModel):
+    # Sin ids se marcan todos.
+    ids: list[str] | None = None
+
+
+@app.post("/api/automatico/avisos/leidos")
+def marcar_avisos_leidos(payload: AvisosLeidosRequest) -> dict[str, Any]:
+    """Marca como leídos los avisos de la extracción automática (campanita)."""
+    email = _cuenta_actual()
+    try:
+        return automatico.marcar_avisos_leidos(email, payload.ids)
+    except OSError as error:
+        logger.exception("No se pudieron marcar los avisos")
+        raise HTTPException(status_code=500, detail=f"No se pudieron marcar los avisos: {error}") from error
 
 
 # --- Configuración de campos (se define una vez por cuenta) --------------------------------------

@@ -31,6 +31,62 @@ export type AdjuntoAutomatico = {
   envio?: EnvioAutomatico | null
 }
 
+/** Motivo por el que el proceso automático descartó un correo o adjunto. */
+export type MotivoDescarte =
+  | 'id_invalido' | 'sin_fecha' | 'anterior_a_activacion' | 'asunto_no_coincide' | 'sin_adjunto_valido' | 'adjunto_no_extraible'
+  | 'ya_tenia_extraccion' | 'guardado_por_usuario' | 'envio_omitido' | 'sin_savedata'
+
+export type DescarteCiclo = {
+  clave: string
+  message_id: string
+  part_id: string | null
+  motivo: MotivoDescarte | string
+  detalle: string | null
+  asunto: string | null
+}
+
+/** Registro persistente de descartes (máximo 200, los más recientes primero). */
+export type Descartado = DescarteCiclo & {
+  recibido: string | null
+  primera_vez: string | null
+  ultima_vez: string | null
+  veces: number | null
+}
+
+export type ResultadoCiclo = 'ok' | 'sin_gmail' | 'limite_gmail' | 'sin_gemini' | 'pausado' | 'interrumpido' | 'interrumpido_reinicio' | 'error'
+
+/** Resumen del último ciclo; también se registran los que terminan antes de revisar Gmail. */
+export type UltimoCiclo = {
+  inicio: string | null
+  /** null si el ciclo se cortó por un reinicio del backend. */
+  fin: string | null
+  detectado_en?: string | null
+  origen: 'programado' | 'manual'
+  resultado: ResultadoCiclo | string
+  error: string | null
+  correos_encontrados: number
+  extraidos: number
+  enviados: number
+  requieren_revision: number
+  inciertos: number
+  omitidos: number
+  errores: number
+  ya_revisados: number
+  descartes: DescarteCiclo[]
+  descartes_total: number
+}
+
+export type TipoAviso = 'enviado' | 'requiere_revision' | 'error' | 'incierto' | 'error_ciclo'
+
+export type AvisoAutomatico = {
+  id: string
+  fecha: string | null
+  tipo: TipoAviso | string
+  texto: string
+  claves: string[]
+  leido: boolean
+}
+
 export type EstadoAutomatico = {
   activo: boolean
   activado_en: string | null
@@ -52,7 +108,18 @@ export type EstadoAutomatico = {
   savedata_configurada?: boolean
   /** Por `messageId__partId`. */
   adjuntos: Record<string, AdjuntoAutomatico>
+  /** Inicio del ciclo en curso (null si no hay ninguno). */
+  ciclo_en_curso_desde?: string | null
+  revision_solicitada_en?: string | null
+  /** "Revisar ahora" se pidió y todavía no empieza un ciclo posterior. */
+  revision_pendiente?: boolean
+  ultimo_ciclo?: UltimoCiclo | null
+  descartados?: Descartado[]
+  /** Más recientes primero. */
+  avisos?: AvisoAutomatico[]
+  avisos_sin_leer?: number
 }
+
 
 export const automaticoApi = {
   estado: () => request<EstadoAutomatico>('/automatico/estado'),
@@ -62,4 +129,6 @@ export const automaticoApi = {
     request<EstadoAutomatico>('/automatico/envio', { method: 'PUT', body: JSON.stringify({ envio_activo: envioActivo, solo_si_cuadra: soloSiCuadra }) }),
   /** "Revisar ahora". El backend responde 409 si ya hay una revisión en curso. */
   revisarAhora: () => request<EstadoAutomatico>('/automatico/revisar', { method: 'POST' }),
+  /** Marca como leídos los avisos indicados (o todos). */
+  marcarAvisosLeidos: (ids?: string[]) => request<EstadoAutomatico>('/automatico/avisos/leidos', { method: 'POST', body: JSON.stringify({ ids: ids ?? null }) }),
 }

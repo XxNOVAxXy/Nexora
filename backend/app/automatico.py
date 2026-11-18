@@ -19,9 +19,17 @@ Estado por cuenta en ``<raiz>/<cuenta_id>.json`` (escritura atómica):
 - ``adjuntos``: registro por ``messageId__partId`` (``pendiente``, ``en_curso``, ``extraido``, ``omitido``,
   ``error``). Se escribe ``en_curso`` con el intento ya contado *antes* de llamar a Gemini, así un reinicio a mitad
   de la llamada cuenta como intento fallido y nunca produce una segunda extracción guardada.
-- ``ultimo_correo``: último correo procesado por completo; acota la búsqueda en Gmail.
+- ``ultimo_correo``: último correo con al menos un adjunto válido procesado por completo.
+- ``revisado_hasta``: fecha del correo más reciente ya evaluado (extraído o descartado); acota la búsqueda en Gmail.
+- ``descartados``: por qué se descartó cada correo o adjunto (``MOTIVOS``), con tope de ``MAX_DESCARTES``.
+- ``ultimo_ciclo``: resumen del último ciclo, también de los que terminan antes de revisar Gmail.
+- ``ciclo_en_curso``: marca escrita al empezar un ciclo y borrada al cerrarlo. Si el backend se reinicia a mitad,
+  al arrancar (o en el siguiente ciclo) ese ciclo se registra como ``interrumpido_reinicio``.
+- ``avisos``: lo que el usuario debe ver (envíos, documentos que requieren revisión, errores), con ``leido``.
 
 Un solo ciclo a la vez: un lock del proceso y un archivo de bloqueo (``.ciclo.lock``) por si hay dos procesos.
+Los logs de cada paso identifican la cuenta solo por ``cuenta_id`` y los correos por su id de Gmail: nunca
+incluyen email, asunto, nombres de archivo ni importes.
 """
 
 from __future__ import annotations
@@ -68,6 +76,71 @@ INTERVALO_PREDETERMINADO = 20
 TERMINALES = {"extraido", "omitido", "error"}
 # Estados finales del envío automático: nunca se vuelve a enviar solo.
 TERMINALES_ENVIO = {"enviado", "requiere_revision", "error", "incierto", "sin_savedata", "omitido"}
+
+MAX_DESCARTES = 200
+MAX_DESCARTES_CICLO = 50
+MAX_AVISOS = 100
+
+# Motivos de descarte de un correo o adjunto (el frontend tiene su propio texto para cada código).
+MOTIVOS: dict[str, str] = {
+    "id_invalido": "Identificador de Gmail no valido.",
+    "sin_fecha": "Gmail no informo la fecha de recepcion.",
+    "anterior_a_activacion": "Llego antes de activar la extraccion automatica.",
+    "asunto_no_coincide": "El asunto no parece un estado de cuenta.",
+    "sin_adjunto_valido": "El correo no trae un PDF o imagen extraible.",
+    "adjunto_no_extraible": "El adjunto no es PDF ni imagen.",
+    "ya_tenia_extraccion": "Ya tenia una extraccion guardada; no se toca.",
+    "guardado_por_usuario": "El usuario guardo el documento mientras se extraia.",
+    "envio_omitido": "No se envio automaticamente a SaveData.",
+    "sin_savedata": "SAVEDATA_URL no esta configurada: se extrajo pero no se envio.",
+}
+INTERRUMPIDO_REINICIO = "El backend se reinicio o se apago antes de terminar el ciclo."
+
+
+def _proceso_vivo(pid: int) -> bool:
+    """Si el proceso ``pid`` sigue vivo. Ante la duda (sin permisos) se considera vivo."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: existe, pero es de otro usuario.
+        try:
+            codigo = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(codigo)):
+                return True
+            return codigo.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _resumen_vacio() -> dict[str, int]:
+    return {"correos_encontrados": 0, "extraidos": 0, "enviados": 0, "requieren_revision": 0, "inciertos": 0,
+            "omitidos": 0, "errores": 0, "ya_revisados": 0}
+
+
+def _tipos_adjuntos(adjuntos: list[dict[str, Any]]) -> str:
+    """Tipos de los adjuntos (tipo MIME y extensión), nunca el nombre del archivo."""
+    tipos = []
+    for adjunto in adjuntos:
+        extension = Path(str(adjunto.get("filename") or "")).suffix.lower()[:10]
+        tipo = str(adjunto.get("mimeType") or "desconocido")[:60]
+        tipos.append(f"{tipo} ({extension})" if extension else tipo)
+    return ", ".join(dict.fromkeys(tipos))
 
 
 def intervalo_desde_entorno(valor: str | None) -> float:
@@ -234,6 +307,14 @@ class ExtractorAutomatico:
         self._despertar = threading.Event()
         self._hilo: threading.Thread | None = None
         self._proxima: datetime | None = None
+        # Marca del ciclo en curso en este proceso: "revisando" solo mientras existe.
+        self._en_curso_desde: datetime | None = None
+        # El siguiente ciclo lo pidió el usuario ("Revisar ahora").
+        self._manual = False
+        # Última cuenta conocida: permite registrar un ciclo que termina sin poder consultar Gmail.
+        self._cuenta_conocida: str | None = None
+        # Distingue esta instancia de una anterior en el mismo proceso (equivale a un reinicio).
+        self._instancia = uuid.uuid4().hex[:12]
 
     # --- Estado persistente -------------------------------------------------------------------
 
@@ -242,8 +323,9 @@ class ExtractorAutomatico:
 
     def _leer(self, email: str) -> dict[str, Any]:
         ruta = self._ruta(email)
-        base: dict[str, Any] = {"activo": False, "activado_en": None, "ultimo_correo": None, "ultima_revision": None, "ultimo_resultado": None, "ultimo_error": None,
-                                "envio_activo": False, "solo_si_cuadra": True, "envio_activado_en": None, "adjuntos": {}}
+        base: dict[str, Any] = {"activo": False, "activado_en": None, "ultimo_correo": None, "revisado_hasta": None, "ultima_revision": None, "ultimo_resultado": None,
+                                "ultimo_error": None, "envio_activo": False, "solo_si_cuadra": True, "envio_activado_en": None, "adjuntos": {},
+                                "descartados": {}, "ultimo_ciclo": None, "ciclo_en_curso": None, "avisos": [], "revision_solicitada_en": None}
         if not ruta.exists():
             return base
         try:
@@ -252,7 +334,19 @@ class ExtractorAutomatico:
             # Nunca se pierde la fecha de activación en silencio: un archivo dañado deja el proceso pausado.
             logger.exception("Estado de la extraccion automatica danado: %s", ruta.name)
             return base
-        return {**base, **datos, "adjuntos": dict(datos.get("adjuntos") or {})}
+        estado = {**base, **datos, "adjuntos": dict(datos.get("adjuntos") or {}), "descartados": dict(datos.get("descartados") or {}),
+                  "avisos": list(datos.get("avisos") or [])}
+        ultimo = estado.get("ultimo_correo")
+        if isinstance(ultimo, dict) and not any(clave.startswith(f"{ultimo.get('id')}__") for clave in estado["adjuntos"]):
+            # Versiones anteriores marcaban como "último correo" uno sin ningún adjunto válido: solo acota la búsqueda.
+            estado["revisado_hasta"] = self._mas_reciente(estado.get("revisado_hasta"), ultimo.get("recibido"))
+            estado["ultimo_correo"] = None
+        return estado
+
+    @staticmethod
+    def _mas_reciente(*valores: Any) -> str | None:
+        fechas = [fecha for fecha in (_fecha(valor) for valor in valores) if fecha is not None]
+        return _iso(max(fechas)) if fechas else None
 
     def _mutar(self, email: str, cambio: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
         with self._estado_lock:
@@ -276,7 +370,7 @@ class ExtractorAutomatico:
                 estado["activado_en"] = _iso(self.reloj())
         self._mutar(email, cambio)
         if activo:
-            self.revisar_ahora()
+            self.revisar_ahora(email)
         return self.estado(email)
 
     def savedata_configurada(self) -> bool:
@@ -309,12 +403,29 @@ class ExtractorAutomatico:
             gemini_listo = bool(self.gemini.status().get("enabled"))
         except Exception:
             gemini_listo = False
+        en_curso_desde = self._en_curso_desde or self._otro_proceso_en_curso()
+        solicitada = _fecha(estado.get("revision_solicitada_en"))
+        ultimo_ciclo = estado.get("ultimo_ciclo") if isinstance(estado.get("ultimo_ciclo"), dict) else None
+        inicio_ultimo = _fecha((ultimo_ciclo or {}).get("inicio"))
+        # "Revisar ahora" sigue pendiente hasta que empieza un ciclo posterior (con un margen por si el hilo murió).
+        pendiente = (solicitada is not None and (inicio_ultimo is None or inicio_ultimo < solicitada)
+                     and self.reloj() - solicitada < timedelta(minutes=self.intervalo_minutos + 5))
+        descartados = sorted(estado["descartados"].items(), key=lambda par: str(par[1].get("ultima_vez") or ""), reverse=True)
+        avisos = [aviso for aviso in estado["avisos"] if isinstance(aviso, dict)][:MAX_AVISOS]
         return {
             "activo": bool(estado["activo"]),
             "activado_en": estado["activado_en"],
             "ultima_revision": estado["ultima_revision"],
             "proxima_revision": _iso(self._proxima) if estado["activo"] and self.corriendo() else None,
-            "en_curso": self._ciclo.locked(),
+            "en_curso": en_curso_desde is not None,
+            "ciclo_en_curso_desde": _iso(en_curso_desde),
+            "revision_solicitada_en": estado.get("revision_solicitada_en"),
+            "revision_pendiente": bool(pendiente),
+            "ultimo_ciclo": ultimo_ciclo,
+            "descartados": [{"clave": clave, **{k: entrada.get(k) for k in ("message_id", "part_id", "motivo", "detalle", "asunto", "recibido", "primera_vez", "ultima_vez", "veces")}}
+                            for clave, entrada in descartados[:MAX_DESCARTES]],
+            "avisos": avisos,
+            "avisos_sin_leer": sum(1 for aviso in avisos if not aviso.get("leido")),
             "intervalo_minutos": self.intervalo_minutos,
             "ultimo_resultado": estado["ultimo_resultado"],
             "ultimo_error": estado["ultimo_error"],
@@ -334,20 +445,55 @@ class ExtractorAutomatico:
             },
         }
 
+    def marcar_avisos_leidos(self, email: str, ids: list[str] | None = None) -> dict[str, Any]:
+        """Marca como leídos los avisos ``ids`` (o todos)."""
+        def cambio(estado: dict[str, Any]) -> None:
+            estado["avisos"] = [{**aviso, "leido": True} if ids is None or aviso.get("id") in ids else aviso for aviso in estado["avisos"] if isinstance(aviso, dict)]
+        self._mutar(email, cambio)
+        return self.estado(email)
+
     # --- Bloqueo entre procesos ---------------------------------------------------------------
 
+    def _ruta_bloqueo(self) -> Path:
+        return self.raiz / ".ciclo.lock"
+
+    def _leer_bloqueo(self) -> tuple[int, float] | None:
+        """(pid, antigüedad en segundos) del archivo de bloqueo, o None si no existe."""
+        ruta = self._ruta_bloqueo()
+        try:
+            antiguedad = time.time() - ruta.stat().st_mtime
+            contenido = ruta.read_text(encoding="utf-8").split()
+        except (FileNotFoundError, OSError, UnicodeDecodeError):
+            return None
+        try:
+            pid = int(contenido[0]) if contenido else 0
+        except ValueError:
+            pid = 0
+        return pid, antiguedad
+
+    def _bloqueo_caducado(self, pid: int, antiguedad: float) -> bool:
+        """Más viejo que ``BLOQUEO_CADUCA_SEGUNDOS`` o de otro proceso que ya murió (p. ej. un ``--reload``)."""
+        return antiguedad > BLOQUEO_CADUCA_SEGUNDOS or (pid != os.getpid() and not _proceso_vivo(pid))
+
+    def _otro_proceso_en_curso(self) -> datetime | None:
+        """Inicio aproximado del ciclo de otro proceso vivo, si lo hay."""
+        if self._ciclo.locked():
+            return None
+        bloqueo = self._leer_bloqueo()
+        if bloqueo is None or bloqueo[0] == os.getpid() or self._bloqueo_caducado(*bloqueo):
+            return None
+        return self.reloj() - timedelta(seconds=bloqueo[1])
+
     def _tomar_bloqueo(self) -> Path | None:
-        ruta = self.raiz / ".ciclo.lock"
+        ruta = self._ruta_bloqueo()
         self.raiz.mkdir(parents=True, exist_ok=True)
         for _ in range(2):
             try:
                 descriptor = os.open(ruta, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
-                try:
-                    if time.time() - ruta.stat().st_mtime > BLOQUEO_CADUCA_SEGUNDOS:
-                        ruta.unlink(missing_ok=True)
-                        continue
-                except FileNotFoundError:
+                bloqueo = self._leer_bloqueo()
+                if bloqueo is None or self._bloqueo_caducado(*bloqueo):
+                    ruta.unlink(missing_ok=True)
                     continue
                 return None
             with os.fdopen(descriptor, "w", encoding="utf-8") as archivo:
@@ -355,7 +501,79 @@ class ExtractorAutomatico:
             return ruta
         return None
 
+    # --- Ciclos interrumpidos por un reinicio -------------------------------------------------
+
+    def _marca_huerfana(self, marca: Any, *, con_bloqueo: bool) -> bool:
+        """Si la marca ``ciclo_en_curso`` es de un ciclo que ya no está corriendo.
+
+        Con el bloqueo tomado ningún otro ciclo puede estar corriendo: cualquier marca es de un ciclo muerto.
+        """
+        if not isinstance(marca, dict):
+            return False
+        if con_bloqueo:
+            return True
+        pid = int(marca.get("pid") or 0)
+        if pid == os.getpid():
+            return marca.get("instancia") != self._instancia or self._en_curso_desde is None
+        return not _proceso_vivo(pid)
+
+    def _registrar_interrupcion(self, estado: dict[str, Any], *, con_bloqueo: bool) -> bool:
+        """Convierte una marca ``ciclo_en_curso`` huérfana en un ``ultimo_ciclo`` "interrumpido por reinicio" con aviso."""
+        marca = estado.get("ciclo_en_curso")
+        if not self._marca_huerfana(marca, con_bloqueo=con_bloqueo):
+            return False
+        estado["ciclo_en_curso"] = None
+        estado["ultimo_ciclo"] = {"inicio": marca.get("inicio"), "fin": None, "detectado_en": _iso(self.reloj()), "origen": marca.get("origen") or "programado",
+                                  "resultado": "interrumpido_reinicio", "error": INTERRUMPIDO_REINICIO, **_resumen_vacio(), "descartes": [], "descartes_total": 0}
+        estado["ultimo_resultado"] = "interrumpido_reinicio"
+        estado["ultimo_error"] = INTERRUMPIDO_REINICIO
+        aviso = self._aviso("error_ciclo", "Un ciclo de la extraccion automatica se interrumpio por un reinicio del backend; se retomara en la siguiente revision.")
+        estado["avisos"] = [aviso, *[a for a in estado.get("avisos") or [] if isinstance(a, dict)]][:MAX_AVISOS]
+        return True
+
+    def _recuperar_interrumpido(self, email: str, *, con_bloqueo: bool) -> bool:
+        """Registra como ``interrumpido_reinicio`` un ciclo de esta cuenta que nunca llegó a cerrarse."""
+        registrado = False
+
+        def cambio(estado: dict[str, Any]) -> None:
+            nonlocal registrado
+            registrado = self._registrar_interrupcion(estado, con_bloqueo=con_bloqueo)
+        with self._estado_lock:
+            if not isinstance(self._leer(email).get("ciclo_en_curso"), dict):
+                return False  # Sin marca: no se reescribe el archivo.
+        self._mutar(email, cambio)
+        if registrado:
+            logger.warning("Ciclo automatico interrumpido por reinicio registrado cuenta=%s", cuenta_id(email))
+        return registrado
+
+    def _recuperar_al_arrancar(self) -> None:
+        """Al arrancar: los ciclos que el reinicio cortó antes de cerrarse quedan registrados, no como fantasmas.
+
+        Se recorre cada archivo de cuenta porque al arrancar aún no se sabe qué cuenta está conectada.
+        """
+        if not self.raiz.exists():
+            return
+        bloqueo = self._leer_bloqueo()
+        if bloqueo is not None and not self._bloqueo_caducado(*bloqueo):
+            return  # Otro proceso vivo está en un ciclo: él cerrará el suyo.
+        for ruta in self.raiz.glob("*.json"):
+            with self._estado_lock:
+                try:
+                    estado = json.loads(ruta.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(estado, dict) or not self._registrar_interrupcion(estado, con_bloqueo=False):
+                    continue
+                escribir_atomico(ruta, estado)
+            logger.warning("Ciclo automatico interrumpido por reinicio registrado cuenta=%s", ruta.stem)
+
     # --- Ciclo --------------------------------------------------------------------------------
+
+    def _tomar_origen(self) -> str:
+        with self._estado_lock:
+            origen = "manual" if self._manual else "programado"
+            self._manual = False
+        return origen
 
     def ejecutar_ciclo(self) -> dict[str, Any]:
         """Un ciclo completo. Si ya hay otro en curso (en este u otro proceso) no hace nada."""
@@ -364,64 +582,158 @@ class ExtractorAutomatico:
         try:
             bloqueo = self._tomar_bloqueo()
             if bloqueo is None:
+                logger.info("Ciclo automatico omitido: otro proceso tiene un ciclo en curso")
                 return {"resultado": "en_curso"}
+            self._en_curso_desde = self.reloj()
             try:
-                return self._ciclo_protegido()
+                return self._ciclo_protegido(self._tomar_origen())
             finally:
+                self._en_curso_desde = None
                 bloqueo.unlink(missing_ok=True)
         finally:
             self._ciclo.release()
 
-    def _ciclo_protegido(self) -> dict[str, Any]:
+    def _salida_temprana(self, email: str | None, inicio: datetime, origen: str, resultado: str, error: str | None) -> dict[str, Any]:
+        """Ciclos que terminan antes de revisar Gmail: también quedan registrados (si se conoce la cuenta)."""
+        email = email or self._cuenta_conocida
+        logger.info("Ciclo automatico fin resultado=%s origen=%s cuenta=%s", resultado, origen, cuenta_id(email) if email else "desconocida")
+        if email:
+            ciclo = {"inicio": _iso(inicio), "fin": _iso(self.reloj()), "origen": origen, "resultado": resultado, "error": error, **_resumen_vacio(), "descartes": [], "descartes_total": 0}
+
+            def cambio(estado: dict[str, Any]) -> None:
+                estado["ultimo_ciclo"] = ciclo
+                if resultado != "pausado":
+                    estado["ultima_revision"] = ciclo["fin"]
+                    estado["ultimo_resultado"] = resultado
+                    estado["ultimo_error"] = error
+            try:
+                self._mutar(email, cambio)
+            except OSError:
+                logger.exception("Ciclo automatico: no se pudo registrar el resultado")
+        return {"resultado": resultado}
+
+    def _ciclo_protegido(self, origen: str = "programado") -> dict[str, Any]:
+        inicio = self.reloj()
+        logger.info("Ciclo automatico inicio origen=%s", origen)
         try:
             email = self.gmail.profile().get("email")
         except GmailNotConnectedError:
-            return {"resultado": "sin_gmail"}
+            return self._salida_temprana(None, inicio, origen, "sin_gmail", "Gmail no esta conectado.")
         except GmailRateLimitError:
-            return {"resultado": "limite_gmail"}
+            return self._salida_temprana(None, inicio, origen, "limite_gmail", "Gmail limito las consultas; se reintentara en la siguiente revision.")
         except Exception as error:
-            logger.warning("Extraccion automatica: no se pudo identificar la cuenta: %s", error)
-            return {"resultado": "sin_gmail"}
+            logger.warning("Ciclo automatico: no se pudo identificar la cuenta (%s)", error.__class__.__name__)
+            return self._salida_temprana(None, inicio, origen, "sin_gmail", "No se pudo identificar la cuenta de Gmail.")
         if not email:
-            return {"resultado": "sin_gmail"}
+            return self._salida_temprana(None, inicio, origen, "sin_gmail", "Gmail no esta conectado.")
+        self._cuenta_conocida = email
+        # Con el bloqueo tomado, una marca de ciclo que quedó en el archivo es de un ciclo que el reinicio cortó.
+        self._recuperar_interrumpido(email, con_bloqueo=True)
         estado = self._leer(email)
         activado = _fecha(estado.get("activado_en"))
         if not estado["activo"] or activado is None:
-            return {"resultado": "pausado"}
-        # Reintentos de envío pendientes: no dependen de Gmail ni de Gemini.
-        envios_previos = self._procesar_envios(email)
-        if not self.gemini.status().get("enabled"):
-            self._cerrar_ciclo(email, "sin_gemini", None)
-            return {"resultado": "sin_gemini"}
+            return self._salida_temprana(email, inicio, origen, "pausado", None)
+        logger.info("Ciclo automatico cuenta=%s", cuenta_id(email))
+        self._mutar(email, lambda e: e.__setitem__("ciclo_en_curso", {"inicio": _iso(inicio), "origen": origen, "pid": os.getpid(), "instancia": self._instancia}))
 
-        resumen = {"resultado": "ok", "extraidos": 0, "errores": 0, "omitidos": 0, "enviados": envios_previos}
+        ctx: dict[str, Any] = {"resumen": _resumen_vacio(), "descartes": [], "claves": {"enviado": [], "requiere_revision": [], "error": [], "incierto": []}}
+        resumen = ctx["resumen"]
+        resultado, error = "ok", None
         try:
-            self._procesar(email, estado, activado, resumen)
+            # Reintentos de envío pendientes: no dependen de Gmail ni de Gemini.
+            self._procesar_envios(email, ctx)
+            if not self.gemini.status().get("enabled"):
+                resultado, error = "sin_gemini", "Gemini no esta configurado."
+            else:
+                self._procesar(email, estado, activado, ctx)
         except _CortarCiclo as corte:
-            resumen["resultado"] = "interrumpido"
-            self._cerrar_ciclo(email, "interrumpido", str(corte) or None)
-            return resumen
-        except GmailRateLimitError as error:
-            resumen["resultado"] = "limite_gmail"
-            self._cerrar_ciclo(email, "limite_gmail", str(error))
-            return resumen
-        except Exception as error:
-            logger.exception("Extraccion automatica: el ciclo fallo")
-            resumen["resultado"] = "error"
-            self._cerrar_ciclo(email, "error", str(error))
-            return resumen
-        self._cerrar_ciclo(email, "ok", None)
-        return resumen
+            resultado, error = ("interrumpido_reinicio", INTERRUMPIDO_REINICIO) if self._parar.is_set() else ("interrumpido", str(corte) or None)
+        except GmailRateLimitError as fallo:
+            resultado, error = "limite_gmail", str(fallo)
+        except Exception as fallo:
+            logger.exception("Ciclo automatico: el ciclo fallo")
+            resultado, error = "error", str(fallo) or fallo.__class__.__name__
+        self._cerrar_ciclo(email, resultado, error, inicio=inicio, origen=origen, ctx=ctx)
+        if resultado == "sin_gemini":
+            return {"resultado": "sin_gemini"}
+        return {"resultado": resultado, **resumen}
 
-    def _cerrar_ciclo(self, email: str, resultado: str, error: str | None) -> None:
+    def _aviso(self, tipo: str, texto: str, claves: list[str] | None = None) -> dict[str, Any]:
+        return {"id": uuid.uuid4().hex[:12], "fecha": _iso(self.reloj()), "tipo": tipo, "texto": texto, "claves": list(claves or [])[:20], "leido": False}
+
+    def _avisos_del_ciclo(self, resultado: str, error: str | None, ctx: dict[str, Any]) -> list[dict[str, Any]]:
+        claves = ctx["claves"]
+        avisos = []
+        if claves["enviado"]:
+            n = len(claves["enviado"])
+            avisos.append(self._aviso("enviado", f"Se {'envio' if n == 1 else 'enviaron'} {n} documento{'' if n == 1 else 's'} a SaveData automaticamente.", claves["enviado"]))
+        if claves["requiere_revision"]:
+            n = len(claves["requiere_revision"])
+            avisos.append(self._aviso("requiere_revision", f"{n} documento{' requiere' if n == 1 else 's requieren'} revision antes de enviarse a SaveData.", claves["requiere_revision"]))
+        if claves["incierto"]:
+            n = len(claves["incierto"])
+            avisos.append(self._aviso("incierto", f"{n} envio{'' if n == 1 else 's'} incierto{'' if n == 1 else 's'}: verifica en SaveData si {'llego' if n == 1 else 'llegaron'}.", claves["incierto"]))
+        if claves["error"]:
+            n = len(claves["error"])
+            avisos.append(self._aviso("error", f"{n} documento{'' if n == 1 else 's'} con error al extraer o enviar.", claves["error"]))
+        if resultado in ("error", "interrumpido_reinicio"):
+            texto = INTERRUMPIDO_REINICIO if resultado == "interrumpido_reinicio" else f"El ciclo de la extraccion automatica fallo: {(error or '')[:200]}"
+            avisos.append(self._aviso("error_ciclo", texto))
+        return avisos
+
+    def _cerrar_ciclo(self, email: str, resultado: str, error: str | None, *, inicio: datetime | None = None, origen: str = "programado", ctx: dict[str, Any] | None = None) -> None:
+        ctx = ctx or {"resumen": _resumen_vacio(), "descartes": [], "claves": {"enviado": [], "requiere_revision": [], "error": [], "incierto": []}}
+        fin = _iso(self.reloj())
+        resumen = ctx["resumen"]
+        ciclo = {"inicio": _iso(inicio) or fin, "fin": fin, "origen": origen, "resultado": resultado, "error": error, **resumen,
+                 "descartes": ctx["descartes"][:MAX_DESCARTES_CICLO], "descartes_total": len(ctx["descartes"])}
+        avisos = self._avisos_del_ciclo(resultado, error, ctx)
+
         def cambio(estado: dict[str, Any]) -> None:
-            estado["ultima_revision"] = _iso(self.reloj())
+            estado["ultima_revision"] = fin
             estado["ultimo_resultado"] = resultado
             estado["ultimo_error"] = error
+            estado["ultimo_ciclo"] = ciclo
+            estado["ciclo_en_curso"] = None
+            estado["avisos"] = [*reversed(avisos), *estado["avisos"]][:MAX_AVISOS]
         self._mutar(email, cambio)
+        logger.info("Ciclo automatico fin resultado=%s origen=%s correos=%d extraidos=%d enviados=%d requieren_revision=%d inciertos=%d omitidos=%d errores=%d ya_revisados=%d",
+                    resultado, origen, resumen["correos_encontrados"], resumen["extraidos"], resumen["enviados"], resumen["requieren_revision"], resumen["inciertos"],
+                    resumen["omitidos"], resumen["errores"], resumen["ya_revisados"])
+
+    def _descartar(self, email: str, ctx: dict[str, Any], clave: str, motivo: str, *, message_id: str, part_id: str | None = None,
+                   detalle: str | None = None, mensaje: dict[str, Any] | None = None) -> None:
+        """Registra por qué se descartó un correo o adjunto. Repetido con el mismo motivo solo actualiza la fecha."""
+        ahora = _iso(self.reloj())
+        nuevo = True
+
+        def cambio(estado: dict[str, Any]) -> None:
+            nonlocal nuevo
+            previo = estado["descartados"].get(clave)
+            nuevo = not isinstance(previo, dict) or previo.get("motivo") != motivo
+            entrada = {
+                "message_id": message_id[:128], "part_id": part_id, "motivo": motivo, "detalle": (detalle or MOTIVOS.get(motivo) or "")[:300],
+                "asunto": str((mensaje or {}).get("subject") or (previo or {}).get("asunto") or "")[:140] or None,
+                "recibido": (mensaje or {}).get("receivedAt") or (previo or {}).get("recibido"),
+                "primera_vez": ahora if nuevo else previo.get("primera_vez"), "ultima_vez": ahora,
+                "veces": 1 if nuevo else int(previo.get("veces") or 1) + 1,
+            }
+            estado["descartados"][clave] = entrada
+            if len(estado["descartados"]) > MAX_DESCARTES:
+                ordenados = sorted(estado["descartados"].items(), key=lambda par: str(par[1].get("ultima_vez") or ""), reverse=True)
+                estado["descartados"] = dict(ordenados[:MAX_DESCARTES])
+        self._mutar(email, cambio)
+        logger.info("Ciclo automatico descartado message_id=%s part_id=%s motivo=%s%s", message_id[:128] if ID_DOCUMENTO_SEGURO.fullmatch(message_id) else "(invalido)",
+                    part_id or "-", motivo, "" if nuevo else " (ya registrado)")
+        if nuevo:
+            ctx["resumen"]["omitidos"] += 1
+            ctx["descartes"].append({"clave": clave, "message_id": message_id[:128], "part_id": part_id, "motivo": motivo,
+                                     "detalle": (detalle or MOTIVOS.get(motivo) or "")[:300], "asunto": str((mensaje or {}).get("subject") or "")[:140] or None})
+        else:
+            ctx["resumen"]["ya_revisados"] += 1
 
     def _candidatos(self, estado: dict[str, Any], activado: datetime) -> list[str]:
-        ultimo = _fecha((estado.get("ultimo_correo") or {}).get("recibido"))
+        ultimo = _fecha(self._mas_reciente((estado.get("ultimo_correo") or {}).get("recibido"), estado.get("revisado_hasta")))
         desde = activado if ultimo is None else max(activado, ultimo - MARGEN_BUSQUEDA)
         query = f"{filtro_estados.construir_query('inbox')} after:{int(desde.timestamp())}"
         ids = self.gmail.buscar_ids(query, MAX_CORREOS_POR_CICLO)
@@ -429,49 +741,88 @@ class ExtractorAutomatico:
         pendientes = [clave.split("__", 1)[0] for clave, entrada in estado["adjuntos"].items() if entrada.get("estado") not in TERMINALES]
         return list(dict.fromkeys([*pendientes, *ids]))
 
-    def _procesar(self, email: str, estado: dict[str, Any], activado: datetime, resumen: dict[str, Any]) -> None:
+    def _avanzar(self, email: str, campo: str, valor: Any) -> None:
+        def cambio(estado: dict[str, Any]) -> None:
+            if campo == "revisado_hasta":
+                estado["revisado_hasta"] = self._mas_reciente(estado.get("revisado_hasta"), valor)
+            else:
+                actual = _fecha((estado.get("ultimo_correo") or {}).get("recibido"))
+                if actual is None or actual < (_fecha(valor["recibido"]) or actual):
+                    estado["ultimo_correo"] = valor
+        self._mutar(email, cambio)
+
+    def _procesar(self, email: str, estado: dict[str, Any], activado: datetime, ctx: dict[str, Any]) -> None:
         campos = self.campos_configurados(email)
-        ultimo: dict[str, Any] | None = estado.get("ultimo_correo")
-        for message_id in self._candidatos(estado, activado):
+        candidatos = self._candidatos(estado, activado)
+        ctx["resumen"]["correos_encontrados"] = len(candidatos)
+        logger.info("Ciclo automatico correos encontrados=%d", len(candidatos))
+        for message_id in candidatos:
             if self._parar.is_set():
                 raise _CortarCiclo("El backend se esta apagando.")
             if not ID_DOCUMENTO_SEGURO.fullmatch(message_id):
+                self._descartar(email, ctx, f"invalido:{message_id[:100]}", "id_invalido", message_id=message_id)
                 continue
             mensaje = self.gmail.get_message(message_id)
             recibido = _fecha(mensaje.get("receivedAt"))
             # Solo correos que llegaron después de activar el proceso; nunca los anteriores.
-            if recibido is None or recibido <= activado:
+            if recibido is None:
+                self._descartar(email, ctx, message_id, "sin_fecha", message_id=message_id, mensaje=mensaje)
+                continue
+            if recibido <= activado:
+                self._descartar(email, ctx, message_id, "anterior_a_activacion", message_id=message_id, mensaje=mensaje)
                 continue
             if filtro_estados.asunto_coincide(mensaje.get("subject", "")) is None:
+                self._descartar(email, ctx, message_id, "asunto_no_coincide", message_id=message_id, mensaje=mensaje)
+                self._avanzar(email, "revisado_hasta", _iso(recibido))
                 continue
-            completo = True
-            for adjunto in mensaje.get("attachments") or []:
-                part_id = str(adjunto.get("partId") or "")
-                if not filtro_estados.es_documento_extraible(adjunto) or not ID_DOCUMENTO_SEGURO.fullmatch(part_id):
+            adjuntos = list(mensaje.get("attachments") or [])
+            validos = [a for a in adjuntos if filtro_estados.es_documento_extraible(a) and ID_DOCUMENTO_SEGURO.fullmatch(str(a.get("partId") or ""))]
+            if not validos:
+                detalle = (f"{MOTIVOS['sin_adjunto_valido']} Adjuntos encontrados: {_tipos_adjuntos(adjuntos)}." if adjuntos
+                           else f"{MOTIVOS['sin_adjunto_valido']} El correo no trae adjuntos (el documento puede venir como enlace o insertado en el cuerpo).")
+                self._descartar(email, ctx, message_id, "sin_adjunto_valido", message_id=message_id, detalle=detalle, mensaje=mensaje)
+                self._avanzar(email, "revisado_hasta", _iso(recibido))
+                continue
+            for adjunto in adjuntos:
+                if adjunto in validos:
                     continue
-                if self._procesar_adjunto(email, message_id, part_id, adjunto, campos, resumen) not in TERMINALES:
+                part_id = str(adjunto.get("partId") or "")
+                motivo = "adjunto_no_extraible" if not filtro_estados.es_documento_extraible(adjunto) else "id_invalido"
+                clave = f"{message_id}__{part_id}" if ID_DOCUMENTO_SEGURO.fullmatch(part_id) else f"{message_id}__invalido"
+                self._descartar(email, ctx, clave, motivo, message_id=message_id, part_id=part_id[:32] or None,
+                                detalle=f"{MOTIVOS[motivo]} Tipo: {_tipos_adjuntos([adjunto])}.", mensaje=mensaje)
+            completo = True
+            for adjunto in validos:
+                part_id = str(adjunto.get("partId"))
+                if self._procesar_adjunto(email, message_id, part_id, adjunto, campos, ctx, mensaje) not in TERMINALES:
                     completo = False
-            if completo and (ultimo is None or (_fecha(ultimo.get("recibido")) or activado) < recibido):
-                ultimo = {"id": message_id, "recibido": _iso(recibido)}
-                self._mutar(email, lambda e, u=ultimo: e.__setitem__("ultimo_correo", u))
+            if completo:
+                self._avanzar(email, "ultimo_correo", {"id": message_id, "recibido": _iso(recibido)})
+                self._avanzar(email, "revisado_hasta", _iso(recibido))
 
-    def _procesar_adjunto(self, email: str, message_id: str, part_id: str, adjunto: dict[str, Any], campos: list[dict[str, Any]], resumen: dict[str, Any]) -> str:
+    def _procesar_adjunto(self, email: str, message_id: str, part_id: str, adjunto: dict[str, Any], campos: list[dict[str, Any]], ctx: dict[str, Any],
+                          mensaje: dict[str, Any] | None = None) -> str:
+        resumen = ctx["resumen"]
         clave = f"{message_id}__{part_id}"
         entrada = self._leer(email)["adjuntos"].get(clave) or {}
         if entrada.get("estado") in TERMINALES:
+            resumen["ya_revisados"] += 1
             return entrada["estado"]
         intentos = int(entrada.get("intentos") or 0)
         if intentos >= MAX_INTENTOS:
             self._anotar(email, clave, estado="error", error=entrada.get("error") or "Se agotaron los intentos.")
             resumen["errores"] += 1
+            ctx["claves"]["error"].append(clave)
+            logger.info("Ciclo automatico adjunto error message_id=%s part_id=%s motivo=intentos_agotados", message_id, part_id)
             return "error"
         # Una extracción guardada (o editada) por el usuario nunca se toca.
         if self.almacen.obtener(email, message_id, part_id) is not None:
             self._anotar(email, clave, estado="omitido", error=None)
-            resumen["omitidos"] += 1
+            self._descartar(email, ctx, clave, "ya_tenia_extraccion", message_id=message_id, part_id=part_id, mensaje=mensaje)
             return "omitido"
 
         # El intento queda contado en disco antes de llamar a Gemini.
+        logger.info("Ciclo automatico extrayendo message_id=%s part_id=%s intento=%d/%d", message_id, part_id, intentos + 1, MAX_INTENTOS)
         self._anotar(email, clave, estado="en_curso", intentos=intentos + 1, error=None)
         filename = str(adjunto.get("filename") or "")
         attachment_id = str(adjunto.get("id") or "")
@@ -481,15 +832,16 @@ class ExtractorAutomatico:
         except (GmailRateLimitError, GmailNotConnectedError, GeminiUnavailableError) as error:
             # No es culpa del documento: el intento no cuenta y se sigue en el siguiente ciclo.
             self._anotar(email, clave, estado="pendiente", intentos=intentos, error=str(error))
+            logger.info("Ciclo automatico adjunto pendiente message_id=%s part_id=%s motivo=%s", message_id, part_id, error.__class__.__name__)
             raise _CortarCiclo(str(error)) from error
         except GeminiRequestError as error:
-            estado = self._fallo(email, clave, intentos + 1, str(error), resumen)
+            estado = self._fallo(email, clave, intentos + 1, str(error), ctx, f"gemini_http_{error.status_code}")
             if error.status_code == 429:
                 raise _CortarCiclo(str(error)) from error
             return estado
         except Exception as error:
             logger.exception("Extraccion automatica fallo para %s", clave)
-            return self._fallo(email, clave, intentos + 1, str(error) or error.__class__.__name__, resumen)
+            return self._fallo(email, clave, intentos + 1, str(error) or error.__class__.__name__, ctx, error.__class__.__name__)
 
         try:
             solicitud = borrador_desde_extraccion(resultado, campos, filename=nombre or filename, attachment_id=attachment_id or None, lote=uuid.uuid4().hex[:8])
@@ -497,44 +849,68 @@ class ExtractorAutomatico:
         except (ConflictoVersion, EnvioEnCurso):
             # El usuario guardó este documento mientras Gemini extraía: lo suyo se conserva.
             self._anotar(email, clave, estado="omitido", error=None)
-            resumen["omitidos"] += 1
+            self._descartar(email, ctx, clave, "guardado_por_usuario", message_id=message_id, part_id=part_id, mensaje=mensaje)
             return "omitido"
         except Exception as error:
             logger.exception("Extraccion automatica: no se pudo guardar %s", clave)
-            return self._fallo(email, clave, intentos + 1, str(error) or error.__class__.__name__, resumen)
+            return self._fallo(email, clave, intentos + 1, str(error) or error.__class__.__name__, ctx, error.__class__.__name__)
         # Solo lo extraído con el envío automático encendido se envía solo.
         enviar_auto = bool(self._leer(email).get("envio_activo"))
         self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"), enviar_auto=enviar_auto)
         resumen["extraidos"] += 1
-        logger.info("Extraccion automatica guardada %s transacciones=%d", clave, len(documento.get("transacciones", [])))
-        if enviar_auto and self._enviar_auto(email, message_id, part_id) == "enviado":
-            resumen["enviados"] = resumen.get("enviados", 0) + 1
+        logger.info("Ciclo automatico adjunto extraido message_id=%s part_id=%s transacciones=%d envio_auto=%s", message_id, part_id, len(documento.get("transacciones", [])), enviar_auto)
+        if enviar_auto:
+            self._contar_envio(email, ctx, message_id, part_id, self._enviar_auto(email, message_id, part_id))
         return "extraido"
 
-    def _fallo(self, email: str, clave: str, intentos: int, mensaje: str, resumen: dict[str, Any]) -> str:
+    def _fallo(self, email: str, clave: str, intentos: int, mensaje: str, ctx: dict[str, Any], causa: str = "error") -> str:
         estado = "error" if intentos >= MAX_INTENTOS else "pendiente"
         self._anotar(email, clave, estado=estado, intentos=intentos, error=mensaje[:500])
+        logger.info("Ciclo automatico adjunto fallo clave=%s intento=%d/%d causa=%s estado=%s", clave, intentos, MAX_INTENTOS, causa, estado)
         if estado == "error":
-            resumen["errores"] += 1
+            ctx["resumen"]["errores"] += 1
+            ctx["claves"]["error"].append(clave)
         return estado
 
     # --- Envío automático a SaveData -----------------------------------------------------------
 
-    def _procesar_envios(self, email: str) -> int:
+    def _contar_envio(self, email: str, ctx: dict[str, Any], message_id: str, part_id: str, estado: str | None) -> None:
+        """Suma al resumen del ciclo lo que pasó con un envío automático (y registra por qué no se envió)."""
+        if estado is None:
+            return
+        clave = f"{message_id}__{part_id}"
+        resumen, claves = ctx["resumen"], ctx["claves"]
+        logger.info("Ciclo automatico envio message_id=%s part_id=%s estado=%s", message_id, part_id, estado)
+        if estado == "enviado":
+            resumen["enviados"] += 1
+            claves["enviado"].append(clave)
+        elif estado == "requiere_revision":
+            resumen["requieren_revision"] += 1
+            claves["requiere_revision"].append(clave)
+        elif estado == "incierto":
+            resumen["inciertos"] += 1
+            claves["incierto"].append(clave)
+        elif estado == "error":
+            resumen["errores"] += 1
+            claves["error"].append(clave)
+        elif estado in ("omitido", "sin_savedata"):
+            envio = (self._leer(email)["adjuntos"].get(clave) or {}).get("envio") or {}
+            motivo = "sin_savedata" if estado == "sin_savedata" else "envio_omitido"
+            detalle = f"{MOTIVOS[motivo]} {envio.get('error') or ''}".strip()
+            self._descartar(email, ctx, clave, motivo, message_id=message_id, part_id=part_id, detalle=detalle)
+
+    def _procesar_envios(self, email: str, ctx: dict[str, Any]) -> None:
         """Reintenta los envíos automáticos que quedaron pendientes (o interrumpidos) en ciclos anteriores."""
         estado = self._leer(email)
         if not estado.get("envio_activo"):
-            return 0
-        enviados = 0
+            return
         for clave, entrada in estado["adjuntos"].items():
             if entrada.get("estado") != "extraido" or not entrada.get("enviar_auto"):
                 continue
             if (entrada.get("envio") or {}).get("estado") in TERMINALES_ENVIO:
                 continue
             message_id, _, part_id = clave.partition("__")
-            if self._enviar_auto(email, message_id, part_id) == "enviado":
-                enviados += 1
-        return enviados
+            self._contar_envio(email, ctx, message_id, part_id, self._enviar_auto(email, message_id, part_id))
 
     def _anotar_envio(self, email: str, clave: str, **valores: Any) -> dict[str, Any]:
         def cambio(estado: dict[str, Any]) -> None:
@@ -628,6 +1004,7 @@ class ExtractorAutomatico:
 
         # El intento queda contado en disco antes de contactar SaveData.
         self._anotar_envio(email, clave, estado="en_curso", intentos=intentos + 1, error=None)
+        logger.info("Ciclo automatico enviando a SaveData message_id=%s part_id=%s intento=%d/%d", message_id, part_id, intentos + 1, MAX_INTENTOS)
         return self._enviar_y_registrar(email, message_id, part_id, version_revisada, intentos + 1, propios)
 
     def _marcar_revisado(self, version: Any) -> Callable[[dict[str, Any] | None], dict[str, Any]]:
@@ -661,7 +1038,7 @@ class ExtractorAutomatico:
             return self._terminar_envio(email, message_id, part_id, estado, error=(str(error) or error.__class__.__name__)[:500])
 
         ids = [*propios, intento["id"]]
-        logger.info("Envio automatico %s__%s resultado=%s", message_id, part_id, respuesta.resultado)
+        logger.info("Ciclo automatico respuesta SaveData message_id=%s part_id=%s resultado=%s http=%s", message_id, part_id, respuesta.resultado, respuesta.http_status)
         if respuesta.resultado == "exito":
             return self._terminar_envio(email, message_id, part_id, "enviado", error=None, intentos_ids=ids, intento_id=intento["id"])
         if respuesta.resultado == "incierto":
@@ -678,6 +1055,10 @@ class ExtractorAutomatico:
     def iniciar(self) -> None:
         if self.corriendo():
             return
+        try:
+            self._recuperar_al_arrancar()
+        except Exception:
+            logger.exception("Extraccion automatica: no se pudieron revisar los ciclos interrumpidos")
         self._parar.clear()
         self._hilo = threading.Thread(target=self._bucle, name="nexora-automatico", daemon=True)
         self._hilo.start()
@@ -690,10 +1071,20 @@ class ExtractorAutomatico:
         self._hilo = None
         self._proxima = None
 
-    def revisar_ahora(self) -> bool:
-        """Adelanta la siguiente revisión. False si ya hay un ciclo en curso."""
-        if self._ciclo.locked():
+    def revisar_ahora(self, email: str | None = None) -> bool:
+        """Adelanta la siguiente revisión. False si ya hay un ciclo en curso (en este u otro proceso).
+
+        Con ``email`` deja la solicitud registrada en el archivo: la tarjeta la muestra pendiente hasta que empieza
+        un ciclo posterior, y el ciclo queda registrado aunque termine sin poder consultar Gmail.
+        """
+        if self._ciclo.locked() or self._otro_proceso_en_curso() is not None:
             return False
+        with self._estado_lock:
+            self._manual = True
+        if email:
+            self._cuenta_conocida = email
+            self._mutar(email, lambda estado: estado.__setitem__("revision_solicitada_en", _iso(self.reloj())))
+        logger.info("Revision manual solicitada")
         if self.corriendo():
             self._despertar.set()
         else:
