@@ -1,5 +1,7 @@
 import type { Resumen, ResultadoCampo, SugerenciaCampo, Transaccion } from '../types'
 import type { FormatoNumerico, ValidacionContable } from './contabilidad'
+import type { CampoPlantilla } from './plantillaCampos'
+import type { TipoDocumentoDetectado } from './tiposDocumentoApi'
 
 const API_URL = import.meta.env.DEV ? '/api' : (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 
@@ -24,6 +26,12 @@ export type GeminiExtractionResponse = {
   /** Lo que encontró la IA para cada columna manual que se le pidió buscar. */
   resultados_campos?: ResultadoCampo[]
   warnings: string[]
+  /** Tipo de documento detectado (o el elegido con `tipoId`). */
+  tipo_documento?: TipoDocumentoDetectado
+  /** Campos del tipo cuando no es Estado de cuenta (Estado de cuenta usa la configuración de campos de siempre). */
+  campos_tipo?: CampoPlantilla[] | null
+  /** Aseguradora (o emisor) que la IA leyó en el documento. */
+  aseguradora?: string
 }
 
 /** Respuesta de "Llenar con IA": valores por índice de las filas enviadas, o un valor único del documento. */
@@ -62,8 +70,9 @@ export const geminiApi = {
   disable: () => request<GeminiStatus>('/gemini/config', { method: 'DELETE' }),
   /** `forzar` ignora la caché del backend (re-extracción); `signal` cancela la petición al cambiar de documento. */
   /** `campos` son los nombres de las columnas manuales que Gemini debe buscar en el documento. */
-  extract: (messageId: string, attachmentId: string, { forzar = false, signal, campos = [] }: { forzar?: boolean; signal?: AbortSignal; campos?: string[] } = {}) =>
-    request<GeminiExtractionResponse>('/gemini/extract', { method: 'POST', body: JSON.stringify({ messageId, attachmentId, forzar, ...(campos.length > 0 ? { campos_solicitados: campos } : {}) }), signal }),
+  /** Sin `tipoId` el backend detecta el tipo (reglas o IA); con `tipoId` extrae con ese tipo. */
+  extract: (messageId: string, attachmentId: string, { forzar = false, signal, campos = [], tipoId = null }: { forzar?: boolean; signal?: AbortSignal; campos?: string[]; tipoId?: string | null } = {}) =>
+    request<GeminiExtractionResponse>('/gemini/extract', { method: 'POST', body: JSON.stringify({ messageId, attachmentId, forzar, ...(campos.length > 0 ? { campos_solicitados: campos } : {}), ...(tipoId ? { tipo_id: tipoId } : { detectar: true }) }), signal }),
   /** "Llenar con IA": busca una sola columna para las filas actuales, sin re-extraer los movimientos. */
   llenarCampo: (messageId: string, attachmentId: string, nombre: string, filas: FilaParaCampo[]) =>
     request<RespuestaLlenarCampo>('/gemini/campos', { method: 'POST', body: JSON.stringify({ messageId, attachmentId, nombre, filas }) }),

@@ -25,6 +25,8 @@ import { tieneCapaDeTexto, type PaginaTexto } from './services/textoPdf'
 import { compatibles, ETIQUETA_CAMPO, movimientoDesdeFila, posicionParaInsertar, valorParaCaptura, verificar, type MarcaVerificacion } from './services/verificacion'
 import { PanelVerificacion, VisorPdf, type EstadoTextoDocumento, type Resaltado } from './VisorPdf'
 import { HistorialEnviosPage } from './HistorialEnvios'
+import { deteccionManual, esContable, solicitudDe, textoDeteccion, tiposDocumentoApi, tiposVigentes, type TipoDocumento, type TipoDocumentoDetectado } from './services/tiposDocumentoApi'
+import { TiposDocumentoSeccion } from './TiposDocumento'
 import {
   ArrowDownToLine,
   ArrowLeft,
@@ -72,6 +74,12 @@ const navSections: { label: string; items: { to: string; label: string; icon: Ic
   { label: 'Operación', items: [{ to: '/emails', label: 'Correos', icon: Mail }, { to: '/extraction', label: 'Extracción', icon: FileSearch }, { to: '/envios', label: 'Envíos', icon: Send }] },
   { label: 'Sistema', items: [{ to: '/configuracion', label: 'Configuración', icon: SettingsIcon }] },
 ]
+
+/** Campos de la configuración que se aplican a un resultado de Gemini: los de su tipo o, en un estado de cuenta, los de siempre. */
+const camposConfiguradosDe = (resultado: GeminiExtractionResponse) => (Array.isArray(resultado.campos_tipo) ? resultado.campos_tipo : plantillaVigente.actual())
+
+/** Validación vacía para los tipos que no son estado de cuenta: no hay validación contable. */
+const VALIDACION_NO_APLICA: ValidacionContable = { cuadra: null, tolerancia: '0.00', suma_cargos: null, suma_abonos: null, comprobaciones: [], filas_discontinuas: [], filas_excluidas: [], importes_invalidos: [] }
 
 function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -531,7 +539,7 @@ export function ExtractionTabsWorkspace({ archivos, lote, mode, onModeChange }: 
       const resultado = resultados[archivo.clave]
       if (!resultado || !archivo.partId || !sinAbrirConResultado(archivo.clave)) continue
       // Sin nada guardado en el backend (la cola no extrae lo guardado): el borrador parte de un documento vacío.
-      const { documento } = documentoDesdeExtraccion(resultado.datos, [], nuevoLoteExtraccion(), aplicarPlantilla([], plantillaVigente.actual()))
+      const { documento } = documentoDesdeExtraccion(resultado.datos, [], nuevoLoteExtraccion(), aplicarPlantilla([], camposConfiguradosDe(resultado.datos)))
       borradores.guardar(claveBorrador(cuenta, archivo.messageId, archivo.partId), { version_base: null, guardadoEn: new Date().toISOString(), documento })
     }
   }
@@ -707,9 +715,25 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const correcciones = contarCorrecciones(transactions)
   const huboExtraccion = documento.resumen !== null || transactions.some((transaccion) => transaccion.origen !== 'manual')
   // La misma validación del backend, recalculada sobre la lista editada.
-  const validacion = useMemo(() => validarContabilidad(documento.resumen ?? {}, transactions, documento.formato_numerico), [documento.resumen, transactions, documento.formato_numerico])
+  // Tipo de documento: solo Estado de cuenta tiene columnas fijas y validación contable.
+  const tipos = useSyncExternalStore(tiposVigentes.suscribir, tiposVigentes.actual)
+  useEffect(() => { void tiposVigentes.cargar() }, [])
+  const contable = esContable(documento.tipo_documento)
+  const tipoActual = documento.tipo_documento?.tipo_id ? tipos.find((tipo) => tipo.id === documento.tipo_documento?.tipo_id) ?? null : contable ? tipos.find((tipo) => tipo.contable) ?? null : null
+  const nombreSeccion = contable ? 'Movimientos' : tipoActual?.seccion?.nombre ?? 'Filas'
+  const validacion = useMemo(() => (contable ? validarContabilidad(documento.resumen ?? {}, transactions, documento.formato_numerico) : VALIDACION_NO_APLICA), [contable, documento.resumen, transactions, documento.formato_numerico])
   const alertas = useMemo(() => alertasPorFila(validacion), [validacion])
-  const problemas = useMemo(() => contarProblemas(validacion, documento.resumen, transactions), [validacion, documento.resumen, transactions])
+  const problemas = useMemo(() => contarProblemas(validacion, documento.resumen, transactions, contable), [validacion, documento.resumen, transactions, contable])
+  /** "Cambiar tipo": el documento queda con el tipo elegido y recibe sus campos vacíos (nunca se borra nada). */
+  const cambiarTipo = (tipoId: string) => {
+    const tipo = tipos.find((item) => item.id === tipoId)
+    if (!tipo) return
+    setLista((prev) => {
+      const base = prev.documentKey === documentKey ? prev : listaVacia(documentKey)
+      const campos = aplicarPlantilla(base.documento.campos_extra, tipo.contable ? plantillaVigente.actual() : tipo.campos)
+      return { ...base, documento: { ...base.documento, estado: 'borrador', campos_extra: campos, tipo_documento: deteccionManual(tipo, base.documento.tipo_documento) } }
+    })
+  }
 
   // Verificación visual: se recalcula con cada edición; nada de esto se guarda.
   const esPdf = filename.toLowerCase().endsWith('.pdf')
@@ -849,8 +873,18 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
         avisosCampos: aviso ? { ...prev.avisosCampos, [campo.id]: aviso } : prev.avisosCampos,
       }
     })
+    const tipoDelDocumento = esContable(documento.tipo_documento) ? null : documento.tipo_documento?.tipo_id ?? null
     void (async () => {
       try {
+        if (tipoDelDocumento) {
+          const tipo = (await tiposVigentes.cargar()).find((item) => item.id === tipoDelDocumento)
+          if (!tipo) throw new Error('el tipo de documento ya no existe')
+          const existente = tipo.campos.find((campo) => nombreComparable(campo.nombre) === nombreComparable(configurado.nombre))
+          if (existente) { fijarVinculo(existente.id); return }
+          const respuesta = await tiposDocumentoApi.editar(tipo.id, solicitudDe(tipo, agregarAPlantilla(tipo.campos, { ...configurado, id: plantillaId })))
+          tiposVigentes.fijar(respuesta.tipos)
+          return
+        }
         const actual = await plantillaCamposApi.obtener()
         const existente = actual.campos.find((campo) => nombreComparable(campo.nombre) === nombreComparable(configurado.nombre))
         if (existente) { fijarVinculo(existente.id); return }
@@ -1032,6 +1066,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
       attachmentId,
       campos_extra: enviado.campos_extra,
       sugerencias_campos: enviado.sugerencias_campos,
+      ...(enviado.tipo_documento ? { tipo_documento: enviado.tipo_documento } : {}),
     }))
     if (documentKeyActual.current !== clave) return
     setGuardando(false)
@@ -1082,7 +1117,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
     setLista((prev) => {
       const base = prev.documentKey === clave ? prev : listaVacia(clave)
       // Los campos de la configuración que el documento no tiene se agregan vacíos (nunca se borra nada).
-      const campos = aplicarPlantilla(base.documento.campos_extra, plantillaVigente.actual())
+      const campos = aplicarPlantilla(base.documento.campos_extra, camposConfiguradosDe(result))
       const { documento: combinado, combinacion, llenado } = documentoDesdeExtraccion(result, base.documento.transacciones, lote, campos)
       const mostrarAviso = forzar || combinacion.conservadas > 0 || llenado.length > 0
       return {
@@ -1126,7 +1161,9 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
       const status = geminiStatus ?? await geminiApi.status()
       if (!status.enabled) throw new Error('Gemini no está conectado o habilitado en FastAPI.')
       const plantilla = await plantillaVigente.cargar()
-      return geminiApi.extract(messageId, attachmentId, { forzar, signal, campos: camposParaSolicitar(aplicarPlantilla(documento.campos_extra, plantilla)) })
+      // Un tipo elegido a mano se respeta al volver a extraer; si no, el backend vuelve a detectarlo.
+      const tipoId = documento.tipo_documento?.metodo === 'manual' ? documento.tipo_documento.tipo_id : null
+      return geminiApi.extract(messageId, attachmentId, { forzar, signal, campos: camposParaSolicitar(aplicarPlantilla(documento.campos_extra, plantilla)), ...(tipoId ? { tipoId } : {}) })
     }, {
       exito: (result) => {
         aplicarResultadoGemini(result, forzar)
@@ -1156,7 +1193,8 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
       <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
         <div className="flex min-w-0 items-center gap-3">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-coral/10 text-coral"><FileText size={18} /></div>
-          <div className="min-w-0"><div className="eyebrow">Revisión de estado de cuenta · {fileType}</div><div className="truncate text-sm font-bold text-ink sm:text-base">{filename}</div></div>
+          <div className="min-w-0"><div className="eyebrow">Revisión de {contable ? 'estado de cuenta' : (tipoActual?.nombre ?? 'documento').toLowerCase()} · {fileType}</div><div className="truncate text-sm font-bold text-ink sm:text-base">{filename}</div></div>
+          <SelectorTipo tipos={tipos} detectado={documento.tipo_documento} actual={tipoActual} habilitado={cargaLista} onCambiar={cambiarTipo} />
           <span className={`hidden shrink-0 rounded-full px-2.5 py-1 text-[10px] font-bold sm:inline-flex ${versionGuardada?.estado === 'revisado' ? 'bg-emerald-50 text-emerald-700' : versionGuardada ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-600'}`}>{estadoVisible}{versionGuardada && ` · v${versionGuardada.version}`}</span>
           {sinGuardar && <span role="status" className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-100 px-2.5 py-1 text-[10px] font-bold text-amber-800"><span className="h-1.5 w-1.5 rounded-full bg-amber-500" />Cambios sin guardar</span>}{modificadoTrasEnvio && <span className="inline-flex shrink-0 rounded-full bg-orange-100 px-2.5 py-1 text-[10px] font-bold text-orange-800">Modificado después del último envío</span>}
         </div>
@@ -1165,9 +1203,10 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
           {mode === 'gemini' && <button type="button" onClick={solicitarExtraccion} disabled={!puedeExtraer} className="btn-primary px-3 py-2"><Sparkles size={14} className={extracting ? 'animate-pulse' : ''} />{extracting ? `Extrayendo ${progress}%` : cola?.estado === 'extrayendo' ? 'Extrayendo…' : cola?.estado === 'en_cola' ? 'En cola…' : geminiStatus?.enabled !== true ? 'Extracción IA no disponible' : huboExtraccion ? 'Re-extraer con Gemini' : 'Extraer con Gemini'}</button>}
           <button type="button" onClick={() => navigate('/emails')} className="btn-soft px-3 py-2"><ArrowLeft size={14} />Volver</button>
           <button type="button" onClick={guardarCambios} disabled={!puedeGuardar || !sinGuardar} className="btn-soft px-3 py-2"><Check size={14} />{guardando ? 'Guardando…' : 'Guardar'}</button>
-          <button type="button" onClick={marcarRevisado} disabled={!puedeGuardar || transactions.length === 0 || (versionGuardada !== null && versionGuardada.estado !== 'borrador' && !sinGuardar)} className="btn-primary px-3 py-2"><FileCheck2 size={14} />Marcar como revisado</button>
+          <button type="button" onClick={marcarRevisado} disabled={!puedeGuardar || (contable ? transactions.length === 0 : transactions.length === 0 && documento.campos_extra.length === 0) || (versionGuardada !== null && versionGuardada.estado !== 'borrador' && !sinGuardar)} className="btn-primary px-3 py-2"><FileCheck2 size={14} />Marcar como revisado</button>
         </div>
       </div>
+      {documento.tipo_documento?.requiere_revision && <div role="status" className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">Requiere revisión: {documento.tipo_documento.motivo ?? 'confirma el tipo de documento.'} No se enviará automáticamente. Elige el tipo o configúralo en Configuración → Tipos de documento.</div>}
       {envioAuto && <div role="status" className="mt-3 rounded-lg border border-violet-200 bg-violet-50 px-3 py-2.5 text-xs font-medium text-violet-800">{textoAvisoEnviadoAuto(envioAuto)}</div>}
       {!partId && <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">Este enlace no identifica el adjunto de forma estable, así que no se puede guardar. Vuelve a abrir el documento desde Correos.</div>}
       {mode === 'gemini' && !geminiStatus?.enabled && <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">{geminiError ?? 'Consultando disponibilidad de Gemini en FastAPI. La extracción no generará datos hasta que esté habilitado.'}</div>}
@@ -1198,11 +1237,12 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
         panel: <PanelVerificacion estado={estadoTexto} visible={verificacionVisible} resultado={verificacion} destino={destino ? nombreDestino(destino) : null} onCancelarDestino={() => setDestino(null)} mensaje={mensajeCaptura} onCerrarMensaje={() => setMensajeCaptura(null)} filaPorAgregar={filaPorAgregar === null ? null : datosDocumento?.filas[filaPorAgregar] ?? null} onAgregar={agregarDesdeDocumento} onCancelarAgregar={() => { setFilaPorAgregar(null); setResaltado(null) }} />,
       }} /></section>
       <section className="panel flex min-h-[520px] min-w-0 flex-col overflow-hidden 2xl:min-h-0">
-        <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-5"><div><div className="text-sm font-bold text-ink">Movimientos</div><div className="mt-0.5 text-[11px] text-slate-400">{versionGuardada ? `Guardado ${new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(versionGuardada.actualizado))}` : mode === 'gemini' ? 'Resultado del backend Gemini' : 'Captura manual'}</div></div><button type="button" onClick={agregarTransaccion} disabled={!cargaLista} className="btn-soft px-2.5 py-1.5 text-xs"><Plus size={14} />Agregar</button></div>
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-5"><div><div className="text-sm font-bold text-ink">{nombreSeccion}</div><div className="mt-0.5 text-[11px] text-slate-400">{versionGuardada ? `Guardado ${new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(versionGuardada.actualizado))}` : mode === 'gemini' ? 'Resultado del backend Gemini' : 'Captura manual'}</div></div><button type="button" onClick={agregarTransaccion} disabled={!cargaLista} className="btn-soft px-2.5 py-1.5 text-xs"><Plus size={14} />Agregar</button></div>
         {cargando && <div className="flex items-center justify-center gap-2 px-4 py-10 text-xs text-slate-400"><RefreshCw size={15} className="animate-spin" />Cargando la extracción guardada…</div>}
         {cargaLista && !versionGuardada && transactions.length === 0 && !extracting && !colaActiva && cola?.estado !== 'error' && <div className="border-b border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">Este documento no tiene una extracción guardada. {mode === 'gemini' ? <>Pulsa <strong>Extraer con Gemini</strong> para obtenerla.</> : <>Captura los movimientos con <strong>Agregar</strong> o cambia al modo Gemini para extraerlos.</>}</div>}
         {!cargando && <div className="min-h-0 flex-1 overflow-auto scrollbar-thin"><TablaTransacciones transacciones={transactions} columnas={{
           campos: documento.campos_extra,
+          seccion: contable ? null : nombreSeccion,
           onCambiar: cambiarExtra,
           onCambiarValorDocumento: cambiarValorDocumento,
           onEnfocarDocumento: enfocarValorDocumento,
@@ -1221,9 +1261,25 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
       </section>
     </div>
     {barraPestanas}
-    <PanelValidacion validacion={validacion} transacciones={transactions} conResumen={documento.resumen !== null} />
+    {contable && <PanelValidacion validacion={validacion} transacciones={transactions} conResumen={documento.resumen !== null} />}
     <PanelEnvioSaveData key={documentKey ?? 'sin-documento'} messageId={messageId} partId={partId} guardado={versionGuardada} sinGuardar={sinGuardar} modificadoTrasEnvio={modificadoTrasEnvio} onActualizado={alActualizarEnvio} />
-    <ResumenEditable filename={filename} modelo={documento.modelo} resumen={documento.resumen} movimientos={transactions.length} warnings={deEsteDocumento ? lista.warnings : []} habilitado={cargaLista} destino={verificando && destino?.tipo === 'resumen' ? destino.campo : null} onCambiar={cambiarResumen} onEnfocar={enfocarCampoResumen} />
+    {contable && <ResumenEditable filename={filename} modelo={documento.modelo} resumen={documento.resumen} movimientos={transactions.length} warnings={deEsteDocumento ? lista.warnings : []} habilitado={cargaLista} destino={verificando && destino?.tipo === 'resumen' ? destino.campo : null} onCambiar={cambiarResumen} onEnfocar={enfocarCampoResumen} />}
+  </div>
+}
+
+/** Tipo del documento con su color, cómo se detectó y un selector para cambiarlo. */
+function SelectorTipo({ tipos, detectado, actual, habilitado, onCambiar }: { tipos: TipoDocumento[]; detectado: TipoDocumentoDetectado | undefined; actual: TipoDocumento | null; habilitado: boolean; onCambiar: (tipoId: string) => void }) {
+  const nombre = actual?.nombre ?? detectado?.nombre ?? (detectado ? 'Sin configurar' : 'Estado de cuenta')
+  const codigo = actual?.codigo ?? detectado?.codigo ?? (detectado ? null : 'EC')
+  const color = actual?.color ?? detectado?.color ?? (detectado ? '#94a3b8' : '#2563eb')
+  return <div className="flex min-w-0 shrink-0 items-center gap-2">
+    <span data-testid="tipo-documento" title={textoDeteccion(detectado)} className="inline-flex max-w-[16rem] items-center gap-1.5 truncate rounded-full border px-2.5 py-1 text-[10px] font-bold" style={{ borderColor: `${color}55`, backgroundColor: `${color}14`, color }}>
+      <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: color }} />{nombre}{codigo && ` · ${codigo}`}
+    </span>
+    {tipos.length > 0 && <select aria-label="Cambiar tipo de documento" value={actual?.id ?? ''} disabled={!habilitado} onChange={(event) => { if (event.target.value) onCambiar(event.target.value) }} className="max-w-[9rem] rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[11px] text-slate-600">
+      {!actual && <option value="">Cambiar tipo…</option>}
+      {tipos.map((tipo) => <option key={tipo.id} value={tipo.id}>{tipo.nombre} · {tipo.codigo}</option>)}
+    </select>}
   </div>
 }
 
@@ -1424,6 +1480,8 @@ function NumeroMovimiento({ numero, total, onMover }: { numero: number; total: n
 
 type ColumnasTabla = {
   campos: CampoExtra[]
+  /** Nombre de la sección repetible cuando el tipo no es estado de cuenta: la tabla no muestra las columnas fijas. */
+  seccion?: string | null
   onCambiar: (id: string, campoId: string, valor: string) => void
   /** Valor de un campo del documento (se guarda una sola vez). */
   onCambiarValorDocumento: (id: string, valor: string) => void
@@ -1459,7 +1517,7 @@ function TablaTransacciones({ transacciones, columnas, alertas, onCambiar, onEli
   const encabezado = (campo: CampoExtra) => <EncabezadoCampo campo={campo} campos={columnas.campos} onRenombrar={columnas.onRenombrar} onEliminar={columnas.onEliminar} onLlenar={() => columnas.onLlenar(campo.id)} llenando={columnas.llenando.includes(campo.id)} motivoNoLlenar={columnas.motivoNoLlenar} aviso={columnas.avisos[campo.id] ?? null} onCerrarAviso={() => columnas.onCerrarAviso(campo.id)} onCambiarAlcance={(alcance) => columnas.onCambiarAlcance(campo.id, alcance)} puedeSerDelDocumento={puedeSerDelDocumento(transacciones, campo)} />
   const claseEntrada = (resaltada: boolean, extra = '') => `w-full rounded-md border px-2 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${resaltada ? 'border-violet-100 bg-violet-50 text-violet-900' : 'border-transparent bg-slate-50/70 hover:border-slate-200'} ${extra}`
   return <div ref={tabla} className="text-xs">
-    <table aria-label="Movimientos del estado de cuenta" style={{ width: 112 + transacciones.length * 188 }} className="table-fixed border-collapse text-xs">
+    <table aria-label={columnas.seccion ? `${columnas.seccion} del documento` : 'Movimientos del estado de cuenta'} style={{ width: 112 + transacciones.length * 188 }} className="table-fixed border-collapse text-xs">
         <colgroup><col className="w-28" />{transacciones.map((transaccion) => <col key={transaccion.id} className="w-[188px]" />)}</colgroup>
         <thead><tr>
           <th scope="col" className="sticky left-0 top-0 z-20 border-b border-r border-slate-200 bg-slate-50 px-2 py-1.5 text-left align-top text-[10px] font-bold uppercase tracking-wider text-slate-400"><div title="Número del movimiento. Escribe otro número para moverlo.">#</div><div className="mt-1 normal-case tracking-normal">{columnas.menu}</div></th>
@@ -1472,7 +1530,7 @@ function TablaTransacciones({ transacciones, columnas, alertas, onCambiar, onEli
           })}
         </tr></thead>
         <tbody>
-          {transacciones.length > 0 && columnasTabla.map((columna) => <tr key={columna.campo} className="border-b border-slate-100 align-top">
+          {transacciones.length > 0 && !columnas.seccion && columnasTabla.map((columna) => <tr key={columna.campo} className="border-b border-slate-100 align-top">
             <th scope="row" className="sticky left-0 z-[5] border-r border-slate-200 bg-white px-2 py-2.5 text-left text-[10px] font-bold uppercase tracking-wider text-slate-400">{columna.etiqueta}</th>
             {transacciones.map((transaccion, index) => {
               const dudoso = columna.monto && transaccion.dudosos.includes(columna.campo as CampoMonto)
@@ -1720,7 +1778,7 @@ export function SettingsPageV3() {
   const contenido: Record<SeccionConfig, React.ReactNode> = {
     conexiones: <><div className="mb-5 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500"><div className="flex items-center gap-2"><ShieldCheck size={16} className="text-emerald-600" /><span>Las claves se guardan en FastAPI y nunca se muestran completas ni se almacenan en el navegador.</span></div></div><div className="grid gap-5 2xl:grid-cols-2 2xl:items-start"><IntegrationCard icon={Globe2} iconClass="bg-blue-50 text-blue-600" title="Gmail" description="Conexión real mediante OAuth 2.0." connected={Boolean(gmailStatus?.connected)} onToggle={() => void handleGmail()}><div className="grid gap-4 sm:grid-cols-2"><SettingField label="Cuenta asociada" value={gmailStatus?.email ?? 'No conectada'} /><SettingField label="Estado" value={gmailStatus?.connected ? 'OAuth activo · Gmail API' : 'Esperando autorización'} /></div></IntegrationCard><IntegrationCard icon={Gem} iconClass="bg-violet-50 text-violet-600" title="Gemini" description="Guarda tu API key y activa la extracción desde esta pantalla." connected={Boolean(geminiStatus?.enabled)} onToggle={() => void (geminiStatus?.enabled ? disableGemini() : saveGemini())}><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">API key de Gemini</span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} className="input" placeholder={geminiStatus?.maskedKey ?? 'Pega aquí tu API key'} autoComplete="new-password" /></label><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Modelo</span><select value={model} onChange={(event) => setModel(event.target.value)} className="input"><option value="gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option><option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite · respaldo</option><option value="gemini-3.8-flash">Gemini 3.8 Flash · documentos complejos</option></select></label></div><div className="mt-4 flex flex-wrap items-center gap-2"><button onClick={() => void saveGemini()} className="btn-primary"><Check size={14} />Guardar y activar</button><button onClick={() => void disableGemini()} className="btn-soft" disabled={!geminiStatus?.configured}><X size={14} />Desactivar</button>{geminiStatus?.configured && <span className="text-xs text-slate-500">Key guardada: {geminiStatus.maskedKey}</span>}</div></IntegrationCard></div><div className="mt-5 grid gap-4 sm:grid-cols-2"><SmallSetting icon={ShieldCheck} title="Privacidad" description="Key protegida en el servidor" /><SmallSetting icon={Sparkles} title="Modelo activo" description={geminiStatus?.model ?? model} /><div className="sm:col-span-2"><SmallSetting icon={Code2} title="API FastAPI" description="Configuración persistente" /></div></div></>,
     savedata: <section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-savedata"><div className="mb-5 flex items-start gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600"><Send size={19} /></div><div><h3 id="titulo-config-savedata" className="font-display text-base font-bold text-ink">SaveData</h3><p className="mt-1 text-xs text-slate-500">Envío de extracciones revisadas. La URL se define en el backend con SAVEDATA_URL; el navegador nunca la llama directamente.</p></div></div><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Sucursal predeterminada</span><input type="text" inputMode="numeric" value={sucursalPredeterminada} onChange={(event) => setSucursalPredeterminada(event.target.value)} className="input" placeholder="Ej. 3102" /></label><SettingField label="URL de SaveData" value={savedata ? savedata.url ?? 'Sin configurar (SAVEDATA_URL)' : 'Consultando…'} /></div><div className="mt-4"><button type="button" onClick={() => void guardarSucursal()} className="btn-primary"><Check size={14} />Guardar sucursal</button></div></section>,
-    'tipos-documento': gmailConectado ? <TarjetaCamposConfigurados onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} /> : sinGmail ? avisoSinGmail : null,
+    'tipos-documento': gmailConectado ? <TiposDocumentoSeccion onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} editorEstadoDeCuenta={<TarjetaCamposConfigurados onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} />} /> : sinGmail ? avisoSinGmail : null,
     automatizacion: gmailConectado ? <TarjetaExtraccionAutomatica onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} /> : sinGmail ? avisoSinGmail : null,
   }
   return <><PageHeading eyebrow="Integraciones y preferencias" title="Configuración" description="Administra Gmail y Gemini desde Nexora sin editar el archivo .env."><span className="flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700"><ShieldCheck size={14} />Configuración en backend</span></PageHeading>{error && <ErrorNotice text={error} onClose={() => setError(null)} />}{notice && <Notice text={notice} onClose={() => setNotice(null)} />}<div className="xl:grid xl:grid-cols-[260px_minmax(0,1fr)] xl:items-start xl:gap-8">
@@ -1740,7 +1798,7 @@ type IndicadorSeccion = { ok: boolean | null; texto: string }
 const SECCIONES_CONFIG: { id: SeccionConfig; label: string; descripcion: string; detalle: string; icon: Icon }[] = [
   { id: 'conexiones', label: 'Conexiones', descripcion: 'Gmail y Gemini', detalle: 'Cuentas y servicios que Nexora usa para leer los correos y extraer los datos.', icon: Plug },
   { id: 'savedata', label: 'SaveData', descripcion: 'URL y sucursal predeterminada', detalle: 'Destino de las extracciones revisadas.', icon: Send },
-  { id: 'tipos-documento', label: 'Tipos de documento', descripcion: 'Campos que se capturan', detalle: 'Qué datos se capturan de cada estado de cuenta.', icon: FileStack },
+  { id: 'tipos-documento', label: 'Tipos de documento', descripcion: 'Tipos, reglas y campos', detalle: 'Cómo se reconoce cada documento que llega (pólizas, estados de cuenta…) y qué datos se capturan de cada tipo.', icon: FileStack },
   { id: 'automatizacion', label: 'Automatización', descripcion: 'Extracción y envío automáticos', detalle: 'Extracción y envío automáticos, estado del proceso, último ciclo, avisos y descartados.', icon: Workflow },
 ]
 

@@ -3,6 +3,7 @@ import { migrarColumnasUnicas, rellenarColumnas, type ResultadoLlenado } from '.
 import type { FormatoNumerico, ValidacionContable } from './contabilidad'
 import { ErrorApi, type EstadoExtraccion, type ExtraccionGuardada, type ProblemasRevision } from './extraccionesApi'
 import type { GeminiExtractionResponse } from './geminiApi'
+import type { TipoDocumentoDetectado } from './tiposDocumentoApi'
 import { combinarExtraccion, ordenarPorFecha, type ResultadoCombinacion } from './transacciones'
 
 /** Lo que el usuario edita de un documento y se persiste en el backend. */
@@ -17,6 +18,8 @@ export type DocumentoEditable = {
   campos_extra: CampoExtra[]
   /** Campos que propuso la IA en la última extracción; se guardan para que el menú siga disponible al recargar. */
   sugerencias_campos: SugerenciaCampo[]
+  /** Tipo de documento (detectado o elegido). Sin él, el documento es un estado de cuenta. */
+  tipo_documento?: TipoDocumentoDetectado
 }
 
 export const documentoVacio = (): DocumentoEditable => ({ estado: 'borrador', resumen: null, transacciones: [], formato_numerico: null, modelo: null, prompt_version: null, campos_extra: [], sugerencias_campos: [] })
@@ -41,7 +44,7 @@ export function documentoDesdeExtraccion(result: GeminiExtractionResponse, actua
   const resultados = Array.isArray(result.resultados_campos) ? result.resultados_campos : []
   const { transacciones, campos: camposLlenos, llenado } = rellenarColumnas(combinacion.transacciones, campos, sugerencias, resultados)
   return {
-    documento: { estado: 'borrador', resumen: result.resumen, transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version, campos_extra: camposLlenos, sugerencias_campos: sugerencias },
+    documento: { estado: 'borrador', resumen: result.resumen, transacciones, formato_numerico: result.formato_numerico, modelo: result.model, prompt_version: result.prompt_version, campos_extra: camposLlenos, sugerencias_campos: sugerencias, ...(result.tipo_documento ? { tipo_documento: result.tipo_documento } : {}) },
     combinacion: { ...combinacion, transacciones },
     llenado,
   }
@@ -56,6 +59,7 @@ export const documentoDesdeGuardado = (guardado: ExtraccionGuardada): DocumentoE
   prompt_version: guardado.prompt_version,
   campos_extra: Array.isArray(guardado.campos_extra) ? guardado.campos_extra : [],
   sugerencias_campos: Array.isArray(guardado.sugerencias_campos) ? guardado.sugerencias_campos : [],
+  ...(guardado.tipo_documento ? { tipo_documento: guardado.tipo_documento } : {}),
 })
 
 /** JSON con claves ordenadas y sin `undefined`: la misma información da siempre la misma firma. */
@@ -75,14 +79,17 @@ export function hayCambios(documento: DocumentoEditable, firmaGuardada: string |
   return firmaContenido(documento) !== firmaGuardada
 }
 
-/** Mismo cálculo que contar_problemas() del backend: lo que exige confirmación para marcar como revisado. */
-export function contarProblemas(validacion: ValidacionContable, resumen: Resumen | null, transacciones: Transaccion[]): ProblemasRevision {
+/**
+ * Mismo cálculo que contar_problemas() del backend: lo que exige confirmación para marcar como revisado. Sin
+ * validación contable (`contable` = false: tipos que no son estado de cuenta) no cuenta la validación incompleta.
+ */
+export function contarProblemas(validacion: ValidacionContable, resumen: Resumen | null, transacciones: Transaccion[], contable = true): ProblemasRevision {
   const diferencias = validacion.comprobaciones.filter((item) => item.estado === 'diferencia').length
   const dudososPorFila = new Set(transacciones.flatMap((transaccion) => transaccion.dudosos.map((campo) => `${transaccion.id}|${campo}`)))
   const dudosos = (resumen?.dudosos.length ?? 0) + dudososPorFila.size
   const invalidos = validacion.importes_invalidos.filter((item) => !dudososPorFila.has(`${item.id}|${item.campo}`)).length
   const enRevision = transacciones.filter((transaccion) => transaccion.revision).length
-  const incompleta = validacion.cuadra === null
+  const incompleta = contable && validacion.cuadra === null
   return { cuadra: validacion.cuadra, diferencias, dudosos, invalidos, en_revision: enRevision, validacion_incompleta: incompleta, total: diferencias + dudosos + invalidos + enRevision + (incompleta ? 1 : 0) }
 }
 

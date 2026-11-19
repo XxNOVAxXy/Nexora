@@ -31,6 +31,12 @@ vi.mock('./services/plantillaCamposApi', () => ({
   plantillaVigente: { actual: () => [], cargar: async () => [], fijar: vi.fn() },
 }))
 
+vi.mock('./services/tiposDocumentoApi', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./services/tiposDocumentoApi')>()
+  const ec = { id: 'tipo-ec', nombre: 'Estado de cuenta', codigo: 'EC', color: '#2563eb', seccion: { nombre: 'Movimientos' }, campos: [], estructuras: [], contable: true, configurado: true, documentos: 0 }
+  return { ...real, tiposDocumentoApi: { ...real.tiposDocumentoApi, listar: vi.fn(async () => ({ tipos: [ec], umbral_confianza: 0.7 })), documentos: vi.fn(async () => ({ documentos: [], umbral_confianza: 0.7 })) } }
+})
+
 const { default: App } = await import('./App')
 
 const estadoBase = (cambios: Partial<EstadoAutomatico> = {}): EstadoAutomatico => ({
@@ -97,6 +103,9 @@ describe('Configuración por secciones', () => {
 
   it('cada tarjeta está en su sección; al cambiar de sección se conserva lo escrito', async () => {
     pintar('/configuracion/tipos-documento')
+    // Los campos del estado de cuenta están en Tipos y reglas → Estado de cuenta.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Tipos y reglas' }))
+    expect(await screen.findByText('Estás configurando el tipo Estado de cuenta · código EC')).toBeTruthy()
     expect(await screen.findByRole('list', { name: 'Campos que se capturan' })).toBeTruthy()
     fireEvent.click(enlace('SaveData'))
     const sucursal = screen.getByPlaceholderText('Ej. 3102') as HTMLInputElement

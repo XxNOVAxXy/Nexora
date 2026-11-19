@@ -1,5 +1,6 @@
 import type { CampoExtra, Resumen, SugerenciaCampo, Transaccion } from '../types'
 import type { FormatoNumerico, ValidacionContable } from './contabilidad'
+import type { TipoDocumentoDetectado } from './tiposDocumentoApi'
 
 const API_URL = import.meta.env.DEV ? '/api' : (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 
@@ -41,6 +42,8 @@ export type ExtraccionGuardada = {
   sugerencias_campos?: SugerenciaCampo[]
   validacion: ValidacionContable
   problemas: ProblemasRevision
+  /** Tipo de documento; ausente en documentos de antes de los tipos (son estados de cuenta). */
+  tipo_documento?: TipoDocumentoDetectado
 }
 
 /** no_existe: se actualizó un registro que alguien borró en SaveData. */
@@ -100,6 +103,8 @@ export type SolicitudGuardado = {
   attachmentId: string | null
   campos_extra?: CampoExtra[]
   sugerencias_campos?: SugerenciaCampo[]
+  /** Sin tipo, el backend conserva el que ya tenía el documento. */
+  tipo_documento?: TipoDocumentoDetectado
 }
 
 export class ErrorApi extends Error {
