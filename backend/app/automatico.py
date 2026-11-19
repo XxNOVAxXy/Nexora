@@ -55,13 +55,16 @@ from .extracciones import (
     ConflictoVersion,
     EnvioEnCurso,
     GuardarExtraccionRequest,
+    TipoDocumentoGuardado,
     cuenta_id,
+    es_contable,
     escribir_atomico,
 )
 from .gemini import GeminiRequestError, GeminiUnavailableError, clave_campo, normalizar_campos_solicitados
 from .gmail import GmailNotConnectedError, GmailRateLimitError
 from .orden_fechas import ordenar_por_fecha
 from .plantilla_campos import AlmacenPlantillas, deducir_campos
+from .tipos_documento import AlmacenTipos, deteccion_manual, direccion, detectar_tipo, para_clasificar, tipo_para_extraer
 
 logger = logging.getLogger("nexora.automatico")
 
@@ -86,7 +89,7 @@ MOTIVOS: dict[str, str] = {
     "id_invalido": "Identificador de Gmail no valido.",
     "sin_fecha": "Gmail no informo la fecha de recepcion.",
     "anterior_a_activacion": "Llego antes de activar la extraccion automatica.",
-    "asunto_no_coincide": "El asunto no parece un estado de cuenta.",
+    "asunto_no_coincide": "El asunto no parece un estado de cuenta ni una poliza, y el remitente no esta en las reglas.",
     "sin_adjunto_valido": "El correo no trae un PDF o imagen extraible.",
     "adjunto_no_extraible": "El adjunto no es PDF ni imagen.",
     "ya_tenia_extraccion": "Ya tenia una extraccion guardada; no se toca.",
@@ -182,10 +185,10 @@ class _DocumentoTocado(Exception):
     """El usuario guardó, editó o envió el documento: el envío automático ya no lo toca."""
 
 
-def motivos_sin_cuadrar(problemas: dict[str, Any]) -> list[str]:
-    """Por qué un documento no pasa la protección "Enviar solo si cuadra"."""
+def motivos_sin_cuadrar(problemas: dict[str, Any], contable: bool = True) -> list[str]:
+    """Por qué un documento no pasa la protección "Enviar solo si cuadra" (sin validación contable: solo los importes)."""
     motivos = []
-    if problemas.get("cuadra") is not True:
+    if contable and problemas.get("cuadra") is not True:
         motivos.append("La validacion contable no cuadra." if problemas.get("cuadra") is False else "La validacion contable esta incompleta.")
     if problemas.get("invalidos"):
         motivos.append(f"{problemas['invalidos']} importe(s) invalido(s).")
@@ -194,9 +197,9 @@ def motivos_sin_cuadrar(problemas: dict[str, Any]) -> list[str]:
     return motivos
 
 
-def problemas_encontrados(problemas: dict[str, Any]) -> list[str]:
+def problemas_encontrados(problemas: dict[str, Any], contable: bool = True) -> list[str]:
     """Todo lo que la revisión exigiría confirmar; se anota cuando se envía con la protección apagada."""
-    motivos = motivos_sin_cuadrar(problemas)
+    motivos = motivos_sin_cuadrar(problemas, contable)
     if problemas.get("diferencias"):
         motivos.append(f"{problemas['diferencias']} diferencia(s) en la validacion.")
     if problemas.get("en_revision"):
@@ -216,7 +219,8 @@ def _valor_unico(valores: list[dict[str, Any]]) -> str | None:
     return distintos.pop()[:MAX_VALOR_CAMPO] if len(distintos) == 1 else None
 
 
-def borrador_desde_extraccion(resultado: dict[str, Any], campos: list[dict[str, Any]], *, filename: str, attachment_id: str | None, lote: str) -> GuardarExtraccionRequest:
+def borrador_desde_extraccion(resultado: dict[str, Any], campos: list[dict[str, Any]], *, filename: str, attachment_id: str | None, lote: str,
+                              tipo_documento: dict[str, Any] | None = None) -> GuardarExtraccionRequest:
     """Documento nuevo (sin filas previas) a partir de la configuración de campos.
 
     Filas de la IA con ids únicos del lote y ordenadas por fecha; los campos configurados creados vinculados a la
@@ -276,6 +280,7 @@ def borrador_desde_extraccion(resultado: dict[str, Any], campos: list[dict[str, 
         "attachmentId": attachment_id,
         "campos_extra": columnas,
         "sugerencias_campos": list(resultado.get("sugerencias_campos") or [])[:MAX_SUGERENCIAS_CAMPOS],
+        "tipo_documento": tipo_documento,
     })
 
 
@@ -290,12 +295,15 @@ class ExtractorAutomatico:
         reloj: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         plantillas: AlmacenPlantillas | None = None,
         envios: Any = None,
+        tipos: AlmacenTipos | None = None,
     ) -> None:
         self.raiz = raiz
         # ServicioEnvio de savedata.py: el envío automático reutiliza exactamente el envío manual.
         self.envios = envios
         # Configuración de campos; sin ella, la lista efectiva es la deducida de las extracciones guardadas.
         self.plantillas = plantillas or AlmacenPlantillas(raiz / "_sin_configuracion", lambda email: deducir_campos(almacen, email))
+        # Tipos de documento: detección del tipo de cada adjunto y campos que se piden según el tipo.
+        self.tipos = tipos or AlmacenTipos(raiz / "_sin_tipos", self.plantillas)
         self.gmail = gmail
         self.gemini = gemini
         self.almacen = almacen
@@ -732,10 +740,10 @@ class ExtractorAutomatico:
         else:
             ctx["resumen"]["ya_revisados"] += 1
 
-    def _candidatos(self, estado: dict[str, Any], activado: datetime) -> list[str]:
+    def _candidatos(self, estado: dict[str, Any], activado: datetime, remitentes: list[str] | None = None) -> list[str]:
         ultimo = _fecha(self._mas_reciente((estado.get("ultimo_correo") or {}).get("recibido"), estado.get("revisado_hasta")))
         desde = activado if ultimo is None else max(activado, ultimo - MARGEN_BUSQUEDA)
-        query = f"{filtro_estados.construir_query('inbox')} after:{int(desde.timestamp())}"
+        query = f"{filtro_estados.construir_query('inbox', remitentes or [])} after:{int(desde.timestamp())}"
         ids = self.gmail.buscar_ids(query, MAX_CORREOS_POR_CICLO)
         # Los adjuntos con reintentos pendientes se vuelven a revisar aunque ya no entren en la búsqueda.
         pendientes = [clave.split("__", 1)[0] for clave, entrada in estado["adjuntos"].items() if entrada.get("estado") not in TERMINALES]
@@ -753,7 +761,8 @@ class ExtractorAutomatico:
 
     def _procesar(self, email: str, estado: dict[str, Any], activado: datetime, ctx: dict[str, Any]) -> None:
         campos = self.campos_configurados(email)
-        candidatos = self._candidatos(estado, activado)
+        remitentes = self.tipos.remitentes(email)
+        candidatos = self._candidatos(estado, activado, remitentes)
         ctx["resumen"]["correos_encontrados"] = len(candidatos)
         logger.info("Ciclo automatico correos encontrados=%d", len(candidatos))
         for message_id in candidatos:
@@ -771,7 +780,7 @@ class ExtractorAutomatico:
             if recibido <= activado:
                 self._descartar(email, ctx, message_id, "anterior_a_activacion", message_id=message_id, mensaje=mensaje)
                 continue
-            if filtro_estados.asunto_coincide(mensaje.get("subject", "")) is None:
+            if not filtro_estados.es_candidato(mensaje.get("subject", ""), mensaje.get("senderEmail", ""), remitentes):
                 self._descartar(email, ctx, message_id, "asunto_no_coincide", message_id=message_id, mensaje=mensaje)
                 self._avanzar(email, "revisado_hasta", _iso(recibido))
                 continue
@@ -828,7 +837,10 @@ class ExtractorAutomatico:
         attachment_id = str(adjunto.get("id") or "")
         try:
             data, media_type, nombre = self.gmail.attachment(message_id, attachment_id)
-            resultado = self.gemini.extract_document(data, media_type, nombre or filename, campos_solicitados=[campo["nombre"] for campo in campos])
+            deteccion, campos_tipo, extraer = self._detectar(email, data, media_type, nombre or filename, mensaje or {}, campos)
+            resultado = self.gemini.extract_document(data, media_type, nombre or filename, campos_solicitados=[campo["nombre"] for campo in campos_tipo], **extraer)
+            if not deteccion.get("aseguradora") and resultado.get("aseguradora"):
+                deteccion["aseguradora"] = resultado["aseguradora"]
         except (GmailRateLimitError, GmailNotConnectedError, GeminiUnavailableError) as error:
             # No es culpa del documento: el intento no cuenta y se sigue en el siguiente ciclo.
             self._anotar(email, clave, estado="pendiente", intentos=intentos, error=str(error))
@@ -844,7 +856,8 @@ class ExtractorAutomatico:
             return self._fallo(email, clave, intentos + 1, str(error) or error.__class__.__name__, ctx, error.__class__.__name__)
 
         try:
-            solicitud = borrador_desde_extraccion(resultado, campos, filename=nombre or filename, attachment_id=attachment_id or None, lote=uuid.uuid4().hex[:8])
+            solicitud = borrador_desde_extraccion(resultado, campos_tipo, filename=nombre or filename, attachment_id=attachment_id or None, lote=uuid.uuid4().hex[:8],
+                                                  tipo_documento=TipoDocumentoGuardado.model_validate(deteccion).model_dump())
             documento = self.almacen.guardar(email, message_id, part_id, solicitud)
         except (ConflictoVersion, EnvioEnCurso):
             # El usuario guardó este documento mientras Gemini extraía: lo suyo se conserva.
@@ -862,6 +875,17 @@ class ExtractorAutomatico:
         if enviar_auto:
             self._contar_envio(email, ctx, message_id, part_id, self._enviar_auto(email, message_id, part_id))
         return "extraido"
+
+    def _detectar(self, email: str, data: bytes, media_type: str, filename: str, mensaje: dict[str, Any], campos_ec: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        """Tipo del adjunto (reglas; si ninguna coincide, la IA), campos que se piden y argumentos de la extracción."""
+        tipos = self.tipos.leer(email)
+        deteccion = detectar_tipo(tipos, remitente=mensaje.get("senderEmail", ""), asunto=mensaje.get("subject", ""),
+                                  clasificar=lambda: self.gemini.clasificar_documento(data, media_type, filename, para_clasificar(tipos)))
+        tipo = next((item for item in tipos if item["id"] == deteccion.get("tipo_id")), None)
+        campos = campos_ec if tipo is not None and tipo.get("contable") else list((tipo or {}).get("campos") or [])
+        extraer = tipo_para_extraer(tipo)
+        logger.info("Ciclo automatico tipo detectado codigo=%s metodo=%s confianza=%s requiere_revision=%s", deteccion.get("codigo"), deteccion.get("metodo"), deteccion.get("confianza"), deteccion.get("requiere_revision"))
+        return deteccion, campos, ({} if extraer is None else {"tipo": extraer})
 
     def _fallo(self, email: str, clave: str, intentos: int, mensaje: str, ctx: dict[str, Any], causa: str = "error") -> str:
         estado = "error" if intentos >= MAX_INTENTOS else "pendiente"
@@ -990,15 +1014,21 @@ class ExtractorAutomatico:
             if documento.get("estado") != "borrador" or documento.get("version") != entrada.get("version"):
                 return self._terminar_envio(email, message_id, part_id, "omitido", error="El usuario edito el documento.")
             problemas = documento.get("problemas") or {}
-            motivos = motivos_sin_cuadrar(problemas)
+            tipo_documento = documento.get("tipo_documento") or {}
+            contable = es_contable(tipo_documento)
+            if tipo_documento.get("requiere_revision"):
+                # Tipo sin configurar, confianza baja o tipo sin campos: se extrajo lo posible, pero nunca se envía solo.
+                motivo = tipo_documento.get("motivo") or "El tipo de documento requiere revision."
+                return self._terminar_envio(email, message_id, part_id, "requiere_revision", error=None, motivos=[motivo], problemas=[motivo])
+            motivos = motivos_sin_cuadrar(problemas, contable)
             if motivos and cuenta.get("solo_si_cuadra") is not False:
-                return self._terminar_envio(email, message_id, part_id, "requiere_revision", error=None, motivos=motivos, problemas=problemas_encontrados(problemas))
+                return self._terminar_envio(email, message_id, part_id, "requiere_revision", error=None, motivos=motivos, problemas=problemas_encontrados(problemas, contable))
             try:
                 revisado = self.almacen.actualizar(email, message_id, part_id, self._marcar_revisado(documento.get("version")))
             except _DocumentoTocado:
                 return self._terminar_envio(email, message_id, part_id, "omitido", error="El usuario edito el documento.")
             version_revisada = revisado.get("version")
-            self._anotar_envio(email, clave, version=version_revisada, problemas=problemas_encontrados(problemas), motivos=[])
+            self._anotar_envio(email, clave, version=version_revisada, problemas=problemas_encontrados(problemas, contable), motivos=[])
         elif documento.get("estado") != "revisado" or documento.get("version") != version_revisada:
             return self._terminar_envio(email, message_id, part_id, "omitido", error="El usuario edito el documento.")
 
@@ -1006,6 +1036,70 @@ class ExtractorAutomatico:
         self._anotar_envio(email, clave, estado="en_curso", intentos=intentos + 1, error=None)
         logger.info("Ciclo automatico enviando a SaveData message_id=%s part_id=%s intento=%d/%d", message_id, part_id, intentos + 1, MAX_INTENTOS)
         return self._enviar_y_registrar(email, message_id, part_id, version_revisada, intentos + 1, propios)
+
+    # --- "Configurar con este documento": extraer (y enviar) con la configuración nueva ----------
+
+    def reprocesar(self, email: str, message_id: str, part_id: str, tipo_id: str, *, attachment_id: str | None = None, enviar: bool = False) -> dict[str, Any]:
+        """Vuelve a extraer el documento con el tipo elegido (reemplaza la extracción guardada) y, si se pide, lo
+        marca como revisado y lo envía a SaveData con el envío de siempre.
+
+        Si la extracción tiene problemas y "Enviar solo si cuadra" está encendido, o el tipo sigue sin campos, no se
+        envía: queda revisable. Devuelve {"documento", "envio": None | "enviado" | "requiere_revision" | "error" | "incierto",
+        "motivos", "mensaje"}.
+        """
+        from .savedata import EnvioRequest, NoSePuedeEnviar
+
+        tipos = self.tipos.leer(email)
+        tipo = next((item for item in tipos if item["id"] == tipo_id), None)
+        if tipo is None:
+            raise KeyError(tipo_id)
+        mensaje = self.gmail.get_message(message_id)
+        if not attachment_id:
+            adjunto = next((item for item in mensaje.get("attachments") or [] if str(item.get("partId")) == part_id), None)
+            attachment_id = str((adjunto or {}).get("id") or "")
+        if not attachment_id:
+            raise ValueError("No se encontró el adjunto en el correo.")
+        data, media_type, nombre = self.gmail.attachment(message_id, attachment_id)
+        actual = self.almacen.obtener(email, message_id, part_id)
+        aseguradora = ((actual or {}).get("tipo_documento") or {}).get("aseguradora") or ""
+        deteccion = {**deteccion_manual(tipo, aseguradora), "remitente": direccion(mensaje.get("senderEmail", ""))}
+        campos = self.campos_configurados(email) if tipo.get("contable") else list(tipo.get("campos") or [])
+        extraer = tipo_para_extraer(tipo)
+        resultado = self.gemini.extract_document(data, media_type, nombre, campos_solicitados=[campo["nombre"] for campo in campos], **({} if extraer is None else {"tipo": extraer}))
+        if not deteccion.get("aseguradora") and resultado.get("aseguradora"):
+            deteccion["aseguradora"] = resultado["aseguradora"]
+        solicitud = borrador_desde_extraccion(resultado, campos, filename=nombre or str((actual or {}).get("filename") or ""), attachment_id=attachment_id, lote=uuid.uuid4().hex[:8],
+                                              tipo_documento=TipoDocumentoGuardado.model_validate(deteccion).model_dump())
+        solicitud.version_base = None if actual is None else actual.get("version")
+        documento = self.almacen.guardar(email, message_id, part_id, solicitud)
+        salida: dict[str, Any] = {"documento": documento, "envio": None, "motivos": [], "mensaje": None}
+        if not enviar:
+            return salida
+        problemas = documento.get("problemas") or {}
+        motivos = [deteccion["motivo"]] if deteccion.get("requiere_revision") else []
+        if not motivos and self._leer(email).get("solo_si_cuadra") is not False:
+            motivos = motivos_sin_cuadrar(problemas, es_contable(deteccion))
+        if motivos:
+            return {**salida, "envio": "requiere_revision", "motivos": motivos}
+        version = documento.get("version")
+
+        def revisar(doc: dict[str, Any] | None) -> dict[str, Any]:
+            if doc is None or doc.get("version") != version:
+                raise _DocumentoTocado()
+            ahora = _iso(self.reloj())
+            return {**doc, "estado": "revisado", "version": int(version) + 1, "actualizado": ahora, "revisado_en": ahora,
+                    "revisado_con_problemas": bool(problemas.get("total"))}
+        try:
+            revisado = self.almacen.actualizar(email, message_id, part_id, revisar)
+        except _DocumentoTocado:
+            return {**salida, "envio": "error", "mensaje": "El documento cambió mientras se preparaba el envío."}
+        solicitud_envio = EnvioRequest.model_construct(version_base=revisado.get("version"), sucursal=None, articulo=None, carga_inicial=False, confirmar_reenvio=True, agregar_de_nuevo=False)
+        try:
+            respuesta, _intento, enviado = self.envios.enviar(email, message_id, part_id, solicitud_envio)
+        except NoSePuedeEnviar as error:
+            return {**salida, "documento": revisado, "envio": "error", "mensaje": str(error)}
+        estado = {"exito": "enviado", "incierto": "incierto"}.get(respuesta.resultado, "error")
+        return {**salida, "documento": enviado, "envio": estado, "mensaje": respuesta.mensaje}
 
     def _marcar_revisado(self, version: Any) -> Callable[[dict[str, Any] | None], dict[str, Any]]:
         def cambio(documento: dict[str, Any] | None) -> dict[str, Any]:

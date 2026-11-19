@@ -99,7 +99,7 @@ def firma_remitentes(reglas: Sequence[str]) -> str:
     return hashlib.sha256("\n".join(sorted(reglas)).encode("utf-8")).hexdigest()[:12]
 
 
-def _termino_from(regla: str) -> str:
+def termino_from(regla: str) -> str:
     valor = regla[1:] if regla.startswith("@") else regla
     if not _SEGURO_EN_QUERY.fullmatch(valor):
         # No debería ocurrir: las reglas ya están validadas. Se comprueba otra vez antes de tocar la query.
@@ -111,7 +111,7 @@ def construir_query(folder: str, reglas: Sequence[str]) -> str:
     """Consulta de Gmail: carpeta + ``has:attachment`` + uno o varios ``from:`` unidos con OR."""
     if not reglas:
         raise ReglaInvalida("No hay remitentes configurados.")
-    terminos = [_termino_from(regla) for regla in reglas]
+    terminos = [termino_from(regla) for regla in reglas]
     remitentes = terminos[0] if len(terminos) == 1 else f"({' OR '.join(terminos)})"
     return f"{CONSULTAS_CARPETA.get(folder, 'in:inbox')} has:attachment {remitentes}"
 

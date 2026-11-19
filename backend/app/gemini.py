@@ -49,6 +49,8 @@ MAX_OUTPUT_TOKENS_PREDETERMINADO = 65536
 CODIGOS_RESPUESTA_INCOMPLETA = {"invalid_response", "respuesta_truncada", "respuesta_incompleta"}
 # Campos adicionales sugeridos por la IA (botón "+ Campo"): como máximo estos, priorizando los que tienen valor en más filas.
 MAX_SUGERENCIAS_CAMPOS = 8
+# Al configurar un tipo nuevo con un documento se muestran más propuestas.
+MAX_SUGERENCIAS_GENERICAS = 30
 MAX_NOMBRE_CAMPO = 60
 MAX_VALOR_CAMPO = 500
 # Columnas manuales que el usuario pide buscar en el documento (al extraer o con "Llenar con IA").
@@ -153,6 +155,42 @@ class TransaccionExtraida(BaseModel):
     adicionales: list[ValorAdicional] = Field(default_factory=list)
 
 
+class DatoGenerico(BaseModel):
+    """Dato impreso una sola vez en un documento que no es estado de cuenta (póliza, endoso…)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    nombre: str = ""
+    valor: str = ""
+
+
+class FilaGenerica(BaseModel):
+    """Una fila de la sección repetible (un inciso, un asegurado, una cobertura…)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    valores: list[ValorAdicional] = Field(default_factory=list)
+
+
+class DocumentoGenerico(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    aseguradora: str = ""
+    datos: list[DatoGenerico] = Field(default_factory=list)
+    filas: list[FilaGenerica] = Field(default_factory=list)
+    campos_solicitados: list[CampoSolicitadoExtraido] = Field(default_factory=list)
+    notas: list[str] = Field(default_factory=list)
+
+
+class ClasificacionDocumento(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    codigo: str = ""
+    confianza: float = 0.0
+    aseguradora: str = ""
+    motivo: str = ""
+
+
 class StatementExtraction(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -193,8 +231,12 @@ class GeminiSettings:
         self._write(values)
         return self.status()
 
-    def extract_document(self, data: bytes, mime_type: str, filename: str, forzar: bool = False, campos_solicitados: list[str] | tuple[str, ...] = ()) -> dict[str, Any]:
+    def extract_document(self, data: bytes, mime_type: str, filename: str, forzar: bool = False, campos_solicitados: list[str] | tuple[str, ...] = (),
+                         tipo: dict[str, Any] | None = None) -> dict[str, Any]:
         """Extrae el documento con Gemini.
+
+        ``tipo`` None: estado de cuenta (prompt, esquema y caché de siempre). Con ``tipo`` ({codigo, nombre, seccion}):
+        extracción genérica de los campos del tipo y de su sección repetible (incisos, asegurados…).
 
         El resultado se guarda en caché por (documento, modelo configurado, PROMPT_VERSION, columnas pedidas). Con
         ``forzar`` se ignora la caché y el resultado nuevo reemplaza la entrada anterior. ``campos_solicitados`` son
@@ -217,7 +259,62 @@ class GeminiSettings:
         )
 
         model = values.get("model", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
+        if tipo is not None:
+            seccion = _limpiar_texto(str(tipo.get("seccion") or ""), 60)
+            nombre_tipo = _limpiar_texto(str(tipo.get("nombre") or "Documento"), 80)
+            clave = f"gen:{_cache_key(data, model, campos)}:{clave_campo(nombre_tipo)}:{clave_campo(seccion)}"
+
+            def producir() -> dict[str, Any]:
+                prompt = _prompt_generico(filename, nombre_tipo, seccion, campos)
+                extraido, usado = _con_reintentos(model, lambda candidato: _parse_generico(_call_gemini_sdk(api_key, candidato, data, mime_type, filename, prompt, DocumentoGenerico)))
+                return _build_result_generico(filename, extraido, usado, campos, seccion)
+            return self._con_cache(clave, forzar, producir)
         document_hash = _cache_key(data, model, campos)
+        return self._con_cache(document_hash, forzar, lambda: self._extraer_ec(data, mime_type, filename, api_key, model, campos))
+
+    def _extraer_ec(self, data: bytes, mime_type: str, filename: str, api_key: str, model: str, campos: list[str]) -> dict[str, Any]:
+        extracted, used_model = self._generate(data, mime_type, filename, api_key, model, campos)
+        return _build_result(filename, extracted, used_model, campos)
+
+    def clasificar_documento(self, data: bytes, mime_type: str, filename: str, tipos: list[dict[str, Any]]) -> dict[str, Any]:
+        """Clasifica el documento entre los tipos configurados: {codigo, confianza (0 a 1), aseguradora, motivo}.
+
+        Un código que no está en la lista se devuelve vacío. Se guarda en caché por documento y por la lista de tipos.
+        """
+        values = self._read()
+        api_key = values.get("apiKey", "")
+        if not api_key or not values.get("enabled", False):
+            raise GeminiUnavailableError("Gemini no esta conectado o habilitado en FastAPI.")
+        if not data:
+            raise GeminiRequestError("El documento adjunto esta vacio.", code="empty_document", status_code=400)
+        data, mime_type = _validate_document_input(data, mime_type, filename)
+        model = values.get("model", os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
+        descripcion = json.dumps(tipos, ensure_ascii=False, sort_keys=True)
+        clave = f"clas:{_cache_key(data, model)}:{hashlib.sha256(descripcion.encode('utf-8')).hexdigest()[:12]}"
+        codigos = {str(tipo.get("codigo") or "").upper() for tipo in tipos}
+
+        def producir() -> dict[str, Any]:
+            prompt = _prompt_clasificar(filename, tipos)
+
+            def llamar(candidato: str) -> ClasificacionDocumento:
+                texto = _call_gemini_sdk(api_key, candidato, data, mime_type, filename, prompt, ClasificacionDocumento)
+                try:
+                    return ClasificacionDocumento.model_validate_json(_strip_json_fences(texto))
+                except (ValueError, TypeError) as error:
+                    raise GeminiRequestError("Gemini no devolvio una clasificacion valida.", code="invalid_response") from error
+
+            respuesta = _con_reintentos(model, llamar)[0]
+            codigo = respuesta.codigo.strip().upper()
+            return {
+                "codigo": codigo if codigo in codigos else "",
+                "confianza": max(0.0, min(1.0, float(respuesta.confianza or 0))),
+                "aseguradora": _limpiar_texto(respuesta.aseguradora, 120),
+                "motivo": _limpiar_texto(respuesta.motivo, 300),
+            }
+        return self._con_cache(clave, False, producir)
+
+    def _con_cache(self, document_hash: str, forzar: bool, producir: Any) -> dict[str, Any]:
+        """Caché compartida: una petición en curso del mismo documento se reutiliza; ``forzar`` reemplaza la entrada."""
         with self._lock:
             cached = None if forzar else self._cache.get(document_hash)
             if cached is not None:
@@ -243,8 +340,7 @@ class GeminiSettings:
             raise GeminiRequestError("Gemini no produjo un resultado reutilizable.", code="invalid_response")
 
         try:
-            extracted, used_model = self._generate(data, mime_type, filename, api_key, model, campos)
-            result = _build_result(filename, extracted, used_model, campos)
+            result = producir()
             with self._lock:
                 # pop + asignación: la entrada reemplazada pasa a ser la más reciente.
                 self._cache.pop(document_hash, None)
@@ -478,6 +574,80 @@ def _parse_extraction(value: str) -> StatementExtraction:
         raise GeminiRequestError("Gemini no devolvio una extraccion bancaria estructurada valida.", code="invalid_response") from error
 
 
+def _prompt_clasificar(filename: str, tipos: list[dict[str, Any]]) -> str:
+    lista = "\n".join(json.dumps(tipo, ensure_ascii=False) for tipo in tipos)
+    return f"""Clasifica el documento adjunto llamado {filename!r} en uno de estos tipos de documento (uno por linea, en JSON):
+{lista}
+
+Devuelve unicamente un objeto JSON que cumpla el esquema recibido:
+- `codigo`: el `codigo` del tipo que corresponde, exactamente como aparece en la lista. Si no corresponde a ninguno, deja `codigo` vacio.
+- `confianza`: un numero de 0 a 1 que indica que tan seguro estas de la clasificacion (1 = seguro).
+- `aseguradora`: el nombre de la aseguradora, banco o empresa que emite el documento, tal como aparece impreso; vacio si no aparece.
+- `motivo`: una frase corta que explique la clasificacion.
+No inventes datos: usa solo lo que se ve en el documento."""
+
+
+def _prompt_generico(filename: str, nombre_tipo: str, seccion: str, campos: list[str]) -> str:
+    pedidos = "\n".join(f"- {json.dumps(nombre, ensure_ascii=False)}" for nombre in campos) or "- (ninguno: el tipo aun no tiene campos configurados)"
+    if seccion:
+        filas = (f"Seccion repetible `{seccion}`: el documento puede listar varias filas de {seccion!r} (por ejemplo cada vehiculo, persona o "
+                 "cobertura). Agrega en `filas` un elemento por cada fila, y en `valores` un elemento por dato de esa fila con `campo` (el "
+                 "encabezado o el nombre pedido) y `valor` (el texto impreso en esa fila).")
+    else:
+        filas = "Este tipo no tiene seccion repetible: deja `filas` vacia."
+    return f"""Analiza el documento adjunto llamado {filename!r}. Es un documento del tipo {nombre_tipo!r}.
+
+Devuelve unicamente un objeto JSON que cumpla el esquema recibido. No inventes datos, no completes texto con conocimiento externo y copia los valores EXACTAMENTE como estan impresos. Usa cadenas vacias para valores no visibles.
+
+`aseguradora`: el nombre de la aseguradora, banco o empresa que emite el documento, tal como aparece impreso.
+
+Campos pedidos por el usuario:
+{pedidos}
+Para cada uno agrega un elemento en `campos_solicitados` con `nombre` (exactamente como aparece en la lista) y `encontrado`. Si es un dato unico del documento, pon su valor en `valor_documento`. Si el dato aparece en cada fila de la seccion repetible, ponlo en `valores` de cada fila con `campo` igual al nombre de la lista. Si no aparece, usa `encontrado` = false.
+
+{filas}
+
+`datos`: ademas, agrega cada dato que el documento muestra una sola vez y que no este en la lista (por ejemplo numero de poliza, vigencia, contratante, prima total), con `nombre` y `valor` tal como estan impresos. En las filas incluye tambien las columnas visibles que no esten en la lista. Nunca inventes nombres ni valores.
+
+El documento puede tener varias paginas: cuenta cada fila una sola vez. Incluye en `notas` cualquier advertencia de lectura."""
+
+
+def _parse_generico(value: str) -> DocumentoGenerico:
+    try:
+        return DocumentoGenerico.model_validate_json(_strip_json_fences(value))
+    except (ValueError, TypeError) as error:
+        raise GeminiRequestError("Gemini no devolvio un JSON valido para el documento.", code="invalid_response") from error
+
+
+def _build_result_generico(filename: str, extraido: DocumentoGenerico, model: str, campos: list[str], seccion: str) -> dict[str, Any]:
+    """Resultado con la misma forma que el de un estado de cuenta: la sección repetible va en ``transacciones``
+    (sin columnas fijas: solo sus campos, como columnas adicionales) y no hay validación contable."""
+    transacciones: list[dict[str, Any]] = []
+    adicionales_por_fila: list[tuple[str, list[ValorAdicional]]] = []
+    for indice, fila in enumerate(extraido.filas if seccion else []):
+        if not any(_limpiar_texto(item.valor, MAX_VALOR_CAMPO) for item in fila.valores):
+            continue
+        huella = _huella("", f"fila {indice + 1}", "", "", "")
+        transacciones.append({"id": f"ia-{len(transacciones) + 1}", "fecha": "", "concepto": "", "referencia": "", "cargo": "", "abono": "", "saldo": "",
+                              "origen": "ia", "dudosos": [], "huella": huella})
+        adicionales_por_fila.append((huella, fila.valores))
+    documento = [CampoAdicional(nombre=dato.nombre, valor_documento=dato.valor) for dato in extraido.datos]
+    resumen: dict[str, Any] = {**ResumenExtraido().model_dump(), "dudosos": []}
+    return {
+        "filename": filename,
+        "model": model,
+        "prompt_version": PROMPT_VERSION,
+        "formato_numerico": None,
+        "resumen": resumen,
+        "transacciones": transacciones,
+        "validacion": {"cuadra": None, "aplica": False, "comprobaciones": [], "importes_invalidos": []},
+        "aseguradora": _limpiar_texto(extraido.aseguradora, 120),
+        "sugerencias_campos": _sugerencias_campos(adicionales_por_fila, documento, excluir={clave_campo(nombre) for nombre in campos}, estandar=False, limite=MAX_SUGERENCIAS_GENERICAS),
+        "resultados_campos": _resultados_campos(list(campos), adicionales_por_fila, extraido.campos_solicitados),
+        "warnings": _unique_text(list(extraido.notas)),
+    }
+
+
 def _cache_key(data: bytes, model: str, campos: list[str] | tuple[str, ...] = ()) -> str:
     digest = hashlib.sha256(data).hexdigest()
     # Las columnas pedidas cambian el prompt: otra combinación de columnas no reutiliza el resultado.
@@ -634,7 +804,8 @@ def resultado_llenado(nombre: str, respuesta: CampoLlenado, total_filas: int) ->
     return resultado
 
 
-def _sugerencias_campos(filas: list[tuple[str, list[ValorAdicional]]], documento: list[CampoAdicional], excluir: set[str] | None = None) -> list[dict[str, Any]]:
+def _sugerencias_campos(filas: list[tuple[str, list[ValorAdicional]]], documento: list[CampoAdicional], excluir: set[str] | None = None,
+                        estandar: bool = True, limite: int = MAX_SUGERENCIAS_CAMPOS) -> list[dict[str, Any]]:
     """Campos adicionales que la IA encontró en el documento, sin inventar ninguno.
 
     Se descartan los que no tienen ningún valor, los que repiten un campo estándar y los duplicados. Los valores por
@@ -649,7 +820,7 @@ def _sugerencias_campos(filas: list[tuple[str, list[ValorAdicional]]], documento
             nombre = _limpiar_texto(adicional.campo, MAX_NOMBRE_CAMPO)
             valor = _limpiar_texto(adicional.valor, MAX_VALOR_CAMPO)
             clave = clave_campo(nombre)
-            if not clave or not valor or clave in vistos or clave in (excluir or ()) or clave.replace("-", " ") in NOMBRES_ESTANDAR:
+            if not clave or not valor or clave in vistos or clave in (excluir or ()) or (estandar and clave.replace("-", " ") in NOMBRES_ESTANDAR):
                 continue
             vistos.add(clave)
             sugerencia = por_clave.setdefault(clave, {"clave": clave, "nombre": nombre, "valores": []})
@@ -660,11 +831,11 @@ def _sugerencias_campos(filas: list[tuple[str, list[ValorAdicional]]], documento
         nombre = _limpiar_texto(campo.nombre, MAX_NOMBRE_CAMPO)
         valor = _limpiar_texto(campo.valor_documento, MAX_VALOR_CAMPO)
         clave = clave_campo(nombre)
-        if not clave or not valor or clave in por_clave or clave in (excluir or ()) or clave.replace("-", " ") in NOMBRES_ESTANDAR:
+        if not clave or not valor or clave in por_clave or clave in (excluir or ()) or (estandar and clave.replace("-", " ") in NOMBRES_ESTANDAR):
             continue
         por_clave[clave] = {"clave": clave, "nombre": nombre, "valores": [], "valor_documento": valor}
         unicos.append(por_clave[clave])
-    return (por_fila + unicos)[:MAX_SUGERENCIAS_CAMPOS]
+    return (por_fila + unicos)[:limite]
 
 
 def _model_candidates(model: str) -> list[str]:

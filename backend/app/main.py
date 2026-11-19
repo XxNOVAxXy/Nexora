@@ -19,6 +19,20 @@ from .preferencias import AlmacenClasificaciones, ClasificacionRequest, Configur
 from .remitentes import CONSULTAS_CARPETA, ListaRemitentesInvalida, coincide, construir_query
 from . import filtro_estados
 from .savedata import EnvioRequest, NoSePuedeEnviar, SaveDataConfig, SaveDataConfigRequest, ServicioEnvio, eliminar_de_savedata, historial_envios
+from .tipos_documento import (
+    TIPO_EC_ID,
+    UMBRAL_CONFIANZA,
+    AlmacenTipos,
+    ConflictoTipos,
+    EstructuraRequest,
+    TipoRequest,
+    deteccion_manual,
+    detectar_tipo,
+    direccion,
+    para_clasificar,
+    tipo_para_extraer,
+)
+from .plantilla_campos import CampoPlantilla
 from .extracciones import ID_DOCUMENTO_SEGURO, AlmacenExtracciones, ConflictoVersion, EnvioEnCurso, ExtraccionDanada, GuardarExtraccionRequest, RevisionConProblemas, cuenta_id
 from .gemini import GeminiRequestError, GeminiSettings, GeminiUnavailableError
 from .gmail import GmailAttachmentError, GmailClient, GmailNotConfiguredError, GmailNotConnectedError, GmailRateLimitError
@@ -55,9 +69,28 @@ configuracion = ConfiguracionCuenta(settings.configuracion_path)
 clasificaciones = AlmacenClasificaciones(settings.clasificaciones_path)
 # Configuración de campos por cuenta; mientras no se guarde, se deduce de las extracciones guardadas.
 plantillas = AlmacenPlantillas(settings.plantilla_campos_path, lambda email: deducir_campos(almacen, email))
+# Tipos de documento; "Estado de cuenta" usa la configuración de campos de siempre.
+tipos = AlmacenTipos(settings.tipos_documento_path, plantillas)
+
+
+def tipo_del_documento(email: str, documento: dict[str, Any]) -> dict[str, Any] | None:
+    """Tipo actual de un documento guardado. Sin ``tipo_documento`` (documentos de antes de los tipos): Estado de cuenta."""
+    tipo_documento = documento.get("tipo_documento")
+    if not tipo_documento:
+        return tipos.obtener(email, TIPO_EC_ID)
+    return tipos.obtener(email, tipo_documento.get("tipo_id")) if tipo_documento.get("tipo_id") else None
+
+
+def campos_del_documento(email: str, documento: dict[str, Any]) -> list[dict[str, Any]]:
+    tipo = tipo_del_documento(email, documento)
+    if tipo is None:
+        return []
+    return plantillas.efectiva(email) if tipo.get("contable") else list(tipo.get("campos") or [])
+
+
 # La URL se lee en cada envío para que las pruebas puedan sustituirla.
-envios = ServicioEnvio(almacen, lambda: settings.savedata_url, configurados=lambda email: plantillas.efectiva(email))
-automatico = ExtractorAutomatico(settings.automatico_path, gmail, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos), plantillas=plantillas, envios=envios)
+envios = ServicioEnvio(almacen, lambda: settings.savedata_url, configurados=lambda email: plantillas.efectiva(email), tipo_de=lambda email, documento: tipo_del_documento(email, documento))
+automatico = ExtractorAutomatico(settings.automatico_path, gmail, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos), plantillas=plantillas, envios=envios, tipos=tipos)
 oauth_states: dict[str, datetime] = {}
 
 
@@ -81,6 +114,9 @@ class GeminiExtractionRequest(BaseModel):
     forzar: bool = False
     # Nombres de las columnas manuales que Gemini debe buscar en el documento.
     campos_solicitados: list[Annotated[str, Field(max_length=200)]] = Field(default_factory=list, max_length=30)
+    # Tipos de documento: ``detectar`` detecta el tipo (reglas o IA); ``tipo_id`` lo fija. Sin ninguno, estado de cuenta.
+    detectar: bool = False
+    tipo_id: str | None = Field(default=None, max_length=64)
 
 
 class FilaParaCampo(BaseModel):
@@ -199,7 +235,10 @@ def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
             media_type,
             data.startswith(b"%PDF-"),
         )
-        result = gemini.extract_document(data, media_type, filename, forzar=payload.forzar, campos_solicitados=payload.campos_solicitados)
+        if payload.detectar or payload.tipo_id:
+            result = _extraer_con_tipo(payload, data, media_type, filename)
+        else:
+            result = gemini.extract_document(data, media_type, filename, forzar=payload.forzar, campos_solicitados=payload.campos_solicitados)
         logger.info(
             "Gemini extraction result attachment_id=%s result=success transacciones=%d cuadra=%s",
             payload.attachmentId,
@@ -230,6 +269,30 @@ def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
     except Exception as error:
         logger.exception("Document extraction failed for message=%s attachment=%s", payload.messageId, payload.attachmentId)
         raise HTTPException(status_code=502, detail=f"No se pudo extraer el documento: {error}") from error
+
+
+def _extraer_con_tipo(payload: GeminiExtractionRequest, data: bytes, media_type: str, filename: str) -> dict[str, Any]:
+    """Extracción según el tipo de documento: el elegido (``tipo_id``) o el detectado. Estado de cuenta usa los
+    campos que pide el frontend (como siempre); los demás tipos, los campos de su configuración."""
+    email = _cuenta_actual()
+    lista = tipos.leer(email)
+    mensaje = gmail.get_message(payload.messageId)
+    if payload.tipo_id:
+        tipo = next((item for item in lista if item["id"] == payload.tipo_id), None)
+        if tipo is None:
+            raise HTTPException(status_code=404, detail="El tipo de documento no existe.")
+        deteccion = {**deteccion_manual(tipo), "remitente": direccion(mensaje.get("senderEmail", ""))}
+    else:
+        deteccion = detectar_tipo(lista, remitente=mensaje.get("senderEmail", ""), asunto=mensaje.get("subject", ""),
+                                  clasificar=lambda: gemini.clasificar_documento(data, media_type, filename, para_clasificar(lista)))
+        tipo = next((item for item in lista if item["id"] == deteccion.get("tipo_id")), None)
+    contable = tipo is not None and tipo.get("contable")
+    campos = list(payload.campos_solicitados) if contable else [campo["nombre"] for campo in (tipo or {}).get("campos") or []]
+    extraer = tipo_para_extraer(tipo)
+    result = gemini.extract_document(data, media_type, filename, forzar=payload.forzar, campos_solicitados=campos, **({} if extraer is None else {"tipo": extraer}))
+    if not deteccion.get("aseguradora") and result.get("aseguradora"):
+        deteccion["aseguradora"] = result["aseguradora"]
+    return {**result, "tipo_documento": deteccion, "campos_tipo": None if contable else list((tipo or {}).get("campos") or [])}
 
 
 @app.post("/api/gemini/campos")
@@ -272,13 +335,15 @@ def list_gmail_messages(
     email = _cuenta_actual()
     config = configuracion.leer(email)
     reglas = config["remitentes"]
-    firma = filtro_estados.FIRMA_FILTRO if filtro == "estados" else config["firma"]
+    # El filtro de documentos también toma lo que llega de los remitentes de las reglas de los tipos.
+    reglas_tipos = tipos.remitentes(email) if filtro == "estados" else []
+    firma = filtro_estados.firma_filtro(reglas_tipos) if filtro == "estados" else config["firma"]
     base = {"folder": folder, "filtro": filtro, "firmaFiltro": firma, "remitentes": len(reglas)}
     if filtro == "remitentes" and not reglas:
         # Sin remitentes no se consulta Gmail: la interfaz pide configurarlos o ver todos los correos.
         return {**base, "sinRemitentes": True, "messages": [], "nextPageToken": None, "descartados": 0, "count": 0}
     if filtro == "estados":
-        query = filtro_estados.construir_query(folder)
+        query = filtro_estados.construir_query(folder, reglas_tipos)
     elif filtro == "remitentes":
         query = construir_query(folder, reglas)
     else:
@@ -300,7 +365,8 @@ def list_gmail_messages(
         if filtro == "remitentes" and regla is None:
             descartados += 1  # Gmail lo devolvió (p. ej. por el nombre visible) pero la dirección no coincide.
             continue
-        if filtro == "estados" and (termino is None or not filtro_estados.tiene_documento(message.get("attachments", []))):
+        candidato = filtro_estados.es_candidato(message.get("subject", ""), message.get("senderEmail", ""), reglas_tipos)
+        if filtro == "estados" and (not candidato or not filtro_estados.tiene_documento(message.get("attachments", []))):
             descartados += 1  # Gmail coincide por palabras sueltas; aquí se exige la frase completa y un PDF o imagen.
             continue
         messages.append({**message, "remitenteCoincide": regla is not None, "reglaRemitente": regla, "asuntoCoincide": termino is not None, "terminoAsunto": termino})
@@ -386,7 +452,7 @@ def obtener_extraccion(message_id: str, part_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Este documento no tiene una extraccion guardada.")
     # Campos de la configuración: los vinculados toman su nombre actual y los que faltan llegan vacíos. No se escribe
     # en disco; queda así cuando el usuario guarde.
-    return aplicar_plantilla(documento, plantillas.efectiva(email))
+    return aplicar_plantilla(documento, campos_del_documento(email, documento))
 
 
 @app.put("/api/extracciones/{message_id}/{part_id}")
@@ -698,3 +764,219 @@ async def sugerir_campos(request: Request, filename: str = Query("ejemplo.pdf", 
         logger.exception("No se pudieron sugerir campos del archivo de ejemplo")
         raise HTTPException(status_code=502, detail=f"No se pudo leer el archivo de ejemplo: {error}") from error
     return {"sugerencias": sugerencias_para_configurar(resultado)}
+
+
+# --- Tipos de documento ---------------------------------------------------------------------------
+
+def _conteos(email: str) -> tuple[dict[str, int], dict[str, int]]:
+    por_tipo: dict[str, int] = {}
+    por_estructura: dict[str, int] = {}
+    for entrada in almacen.listar(email):
+        tipo_documento = entrada.get("tipo_documento") or {"tipo_id": TIPO_EC_ID}
+        if tipo_documento.get("tipo_id"):
+            por_tipo[tipo_documento["tipo_id"]] = por_tipo.get(tipo_documento["tipo_id"], 0) + 1
+        if tipo_documento.get("estructura_id"):
+            por_estructura[tipo_documento["estructura_id"]] = por_estructura.get(tipo_documento["estructura_id"], 0) + 1
+    return por_tipo, por_estructura
+
+
+def _tipos_publicos(email: str) -> dict[str, Any]:
+    por_tipo, por_estructura = _conteos(email)
+    lista = [{
+        **tipo,
+        "documentos": por_tipo.get(tipo["id"], 0),
+        "estructuras": [{**estructura, "documentos": por_estructura.get(estructura["id"], 0)} for estructura in tipo.get("estructuras") or []],
+    } for tipo in tipos.leer(email)]
+    return {"tipos": lista, "umbral_confianza": UMBRAL_CONFIANZA}
+
+
+def _error_tipos(error: Exception) -> HTTPException:
+    if isinstance(error, KeyError):
+        return HTTPException(status_code=404, detail="El tipo o la estructura no existe.")
+    return HTTPException(status_code=409, detail={"code": "conflicto_tipos", "message": str(error)})
+
+
+@app.get("/api/tipos")
+def listar_tipos() -> dict[str, Any]:
+    return _tipos_publicos(_cuenta_actual())
+
+
+@app.post("/api/tipos")
+def crear_tipo(payload: TipoRequest) -> dict[str, Any]:
+    email = _cuenta_actual()
+    try:
+        tipo = tipos.guardar_tipo(email, payload)
+    except ConflictoTipos as error:
+        raise _error_tipos(error) from error
+    return {"tipo": tipo, **_tipos_publicos(email)}
+
+
+@app.put("/api/tipos/{tipo_id}")
+def editar_tipo(tipo_id: str, payload: TipoRequest) -> dict[str, Any]:
+    email = _cuenta_actual()
+    try:
+        tipo = tipos.guardar_tipo(email, payload, tipo_id)
+    except (ConflictoTipos, KeyError) as error:
+        raise _error_tipos(error) from error
+    return {"tipo": tipo, **_tipos_publicos(email)}
+
+
+@app.post("/api/tipos/{tipo_id}/estructuras")
+def crear_estructura(tipo_id: str, payload: EstructuraRequest) -> dict[str, Any]:
+    email = _cuenta_actual()
+    try:
+        tipos.guardar_estructura(email, tipo_id, payload)
+    except (ConflictoTipos, KeyError) as error:
+        raise _error_tipos(error) from error
+    return _tipos_publicos(email)
+
+
+@app.put("/api/tipos/{tipo_id}/estructuras/{estructura_id}")
+def editar_estructura(tipo_id: str, estructura_id: str, payload: EstructuraRequest) -> dict[str, Any]:
+    email = _cuenta_actual()
+    try:
+        tipos.guardar_estructura(email, tipo_id, payload, estructura_id)
+    except (ConflictoTipos, KeyError) as error:
+        raise _error_tipos(error) from error
+    return _tipos_publicos(email)
+
+
+@app.get("/api/tipos/documentos")
+def documentos_recibidos(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
+    """Últimos documentos guardados con su tipo detectado, cómo se detectó y su estado (más recientes primero)."""
+    email = _cuenta_actual()
+    ec = tipos.obtener(email, TIPO_EC_ID) or {}
+    documentos = []
+    for entrada in almacen.listar(email):
+        tipo_documento = entrada.get("tipo_documento") or {
+            "tipo_id": TIPO_EC_ID, "codigo": ec.get("codigo"), "nombre": ec.get("nombre"), "color": ec.get("color"), "contable": True,
+            "metodo": None, "confianza": None, "requiere_revision": False, "motivo": None,
+        }
+        documentos.append({**entrada, "tipo_documento": tipo_documento})
+    documentos.sort(key=lambda item: item.get("creado") or item.get("actualizado") or "", reverse=True)
+    return {"documentos": documentos[:limit], "umbral_confianza": UMBRAL_CONFIANZA}
+
+
+class SugerirTipoRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    messageId: str = Field(min_length=1, max_length=200)
+    attachmentId: str = Field(min_length=1, max_length=4000)
+    nombre_tipo: str = Field(default="Documento", max_length=80)
+    seccion: str | None = Field(default=None, max_length=60)
+
+
+@app.post("/api/tipos/sugerir")
+def sugerir_campos_tipo(payload: SugerirTipoRequest) -> dict[str, Any]:
+    """La IA lee el documento y propone campos con un ejemplo de su valor y si van "Una vez" o en la sección."""
+    _cuenta_actual()
+    try:
+        data, media_type, filename = gmail.attachment(payload.messageId, payload.attachmentId)
+        resultado = gemini.extract_document(data, media_type, filename, tipo={"nombre": payload.nombre_tipo or "Documento", "seccion": payload.seccion or ""})
+    except GmailNotConnectedError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    except GmailRateLimitError as error:
+        raise _rate_limited(error) from error
+    except GmailAttachmentError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except GeminiUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except GeminiRequestError as error:
+        raise HTTPException(status_code=error.status_code, detail={"code": error.code, "message": str(error), "retryable": error.retryable}) from error
+    return {"sugerencias": sugerencias_para_configurar(resultado), "aseguradora": resultado.get("aseguradora") or None}
+
+
+class TipoNuevoRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    nombre: str = Field(min_length=1, max_length=80)
+    codigo: str = Field(min_length=1, max_length=5)
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    seccion: str | None = Field(default=None, max_length=60)
+
+
+class ReglasDocumentoRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    remitente: str | None = Field(default=None, max_length=254)
+    aseguradora: str | None = Field(default=None, max_length=120)
+
+
+class ConfigurarDocumentoRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    messageId: str = Field(min_length=1, max_length=200)
+    partId: str = Field(min_length=1, max_length=200)
+    attachmentId: str | None = Field(default=None, max_length=4000)
+    # Paso 1: un tipo existente o uno nuevo.
+    tipo_id: str | None = Field(default=None, max_length=64)
+    nuevo: TipoNuevoRequest | None = None
+    # Paso 2: reglas para reconocerlo la próxima vez; la estructura toma el nombre de la aseguradora.
+    reglas: ReglasDocumentoRequest = Field(default_factory=ReglasDocumentoRequest)
+    nombre_estructura: str | None = Field(default=None, max_length=120)
+    # Paso 3: la lista final de campos del tipo.
+    campos: list[CampoPlantilla] = Field(default_factory=list, max_length=30)
+    extraer_y_enviar: bool = False
+
+
+@app.post("/api/tipos/configurar-documento")
+def configurar_con_documento(payload: ConfigurarDocumentoRequest) -> dict[str, Any]:
+    """Crea o actualiza el tipo, agrega las reglas a su estructura y guarda los campos. Con ``extraer_y_enviar``
+    vuelve a extraer el documento con la configuración nueva y lo envía a SaveData; si no, solo le asigna el tipo."""
+    _ids_validos(payload.messageId, payload.partId)
+    email = _cuenta_actual()
+    try:
+        if payload.nuevo is not None:
+            seccion = {"nombre": payload.nuevo.seccion} if payload.nuevo.seccion and payload.nuevo.seccion.strip() else None
+            campos = payload.campos if seccion else [campo.model_copy(update={"alcance": "documento"}) for campo in payload.campos]
+            tipo = tipos.guardar_tipo(email, TipoRequest(nombre=payload.nuevo.nombre, codigo=payload.nuevo.codigo, color=payload.nuevo.color or tipos.color_libre(email), seccion=seccion, campos=campos))
+        else:
+            actual = tipos.obtener(email, payload.tipo_id)
+            if actual is None:
+                raise KeyError(payload.tipo_id)
+            tipo = tipos.guardar_tipo(email, TipoRequest(nombre=actual["nombre"], codigo=actual["codigo"], color=actual.get("color") or "#7c3aed", seccion=actual.get("seccion"), campos=payload.campos), actual["id"])
+        remitente = payload.reglas.remitente.strip().lower() if payload.reglas.remitente else None
+        aseguradora = (payload.reglas.aseguradora or "").strip() or None
+        nombre_estructura = (payload.nombre_estructura or aseguradora or (remitente.split("@", 1)[-1] if remitente else "") or "Predeterminada").strip()
+        estructura = tipos.agregar_reglas(email, tipo["id"], nombre_estructura=nombre_estructura, remitente=remitente, aseguradora=aseguradora)
+    except (ConflictoTipos, KeyError) as error:
+        raise _error_tipos(error) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    tipo = tipos.obtener(email, tipo["id"]) or tipo
+    resultado: dict[str, Any] = {"tipo": tipo, "estructura": estructura, "documento": None, "envio": None, "motivos": [], "mensaje": None}
+    if payload.extraer_y_enviar:
+        try:
+            resultado.update(automatico.reprocesar(email, payload.messageId, payload.partId, tipo["id"], attachment_id=payload.attachmentId, enviar=True))
+        except GmailNotConnectedError as error:
+            raise HTTPException(status_code=401, detail=str(error)) from error
+        except GmailRateLimitError as error:
+            raise _rate_limited(error) from error
+        except GeminiUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except GeminiRequestError as error:
+            raise HTTPException(status_code=error.status_code, detail={"code": error.code, "message": str(error), "retryable": error.retryable}) from error
+        except (ConflictoVersion, EnvioEnCurso) as error:
+            raise HTTPException(status_code=409, detail="El documento cambió o se está enviando; vuelve a intentarlo.") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+    else:
+        resultado["documento"] = _asignar_tipo(email, payload.messageId, payload.partId, tipo, estructura)
+    return {**resultado, **_tipos_publicos(email)}
+
+
+def _asignar_tipo(email: str, message_id: str, part_id: str, tipo: dict[str, Any], estructura: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Asigna el tipo elegido a la extracción guardada (sin volver a extraer): deja de pedir configuración."""
+    def cambio(documento: dict[str, Any] | None) -> dict[str, Any]:
+        if documento is None:
+            raise KeyError("sin_documento")
+        anterior = documento.get("tipo_documento") or {}
+        deteccion = deteccion_manual(tipo, anterior.get("aseguradora") or "")
+        if estructura is not None:
+            deteccion.update(estructura_id=estructura["id"], estructura=estructura["nombre"], estructura_version=estructura.get("version"))
+        deteccion["remitente"] = anterior.get("remitente")
+        return {**documento, "tipo_documento": deteccion, "version": int(documento.get("version") or 0) + 1, "actualizado": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    try:
+        return almacen.actualizar(email, message_id, part_id, cambio)
+    except KeyError:
+        return None

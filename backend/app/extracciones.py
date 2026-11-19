@@ -166,6 +166,43 @@ class ResumenGuardado(BaseModel):
     dudosos: list[CampoMontoResumen] = Field(default_factory=list)
 
 
+# Id fijo del tipo "Estado de cuenta" (ver tipos_documento.py): el único con columnas fijas y validación contable.
+TIPO_EC_ID = "tipo-ec"
+
+
+class TipoDocumentoGuardado(BaseModel):
+    """Tipo detectado (o elegido) para el documento. Sin él, el documento es un estado de cuenta (como siempre)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    tipo_id: str | None = Field(default=None, max_length=64)
+    codigo: str | None = Field(default=None, max_length=5)
+    nombre: str | None = Field(default=None, max_length=80)
+    color: str | None = Field(default=None, max_length=16)
+    contable: bool = False
+    estructura_id: str | None = Field(default=None, max_length=64)
+    estructura: str | None = Field(default=None, max_length=120)
+    estructura_version: int | None = None
+    metodo: Literal["remitente", "aseguradora", "asunto", "ia", "manual"] = "manual"
+    confianza: float | None = Field(default=None, ge=0, le=1)
+    aseguradora: str | None = Field(default=None, max_length=120)
+    regla: str | None = Field(default=None, max_length=254)
+    # Dirección del remitente del correo (para "todo lo que llegue de <remitente>").
+    remitente: str | None = Field(default=None, max_length=254)
+    requiere_revision: bool = False
+    motivo: str | None = Field(default=None, max_length=300)
+    detectado_en: str | None = Field(default=None, max_length=40)
+
+
+def es_contable(tipo_documento: dict[str, Any] | None) -> bool:
+    """Solo Estado de cuenta (o un documento sin tipo, de antes de los tipos) lleva validación contable."""
+    return not tipo_documento or tipo_documento.get("tipo_id") == TIPO_EC_ID
+
+
+def validacion_no_aplica() -> dict[str, Any]:
+    return {"cuadra": None, "aplica": False, "comprobaciones": [], "importes_invalidos": []}
+
+
 class GuardarExtraccionRequest(BaseModel):
     """Cuerpo del PUT. Campos desconocidos (p. ej. una ``validacion`` del cliente) se ignoran."""
 
@@ -184,6 +221,8 @@ class GuardarExtraccionRequest(BaseModel):
     attachmentId: str | None = Field(default=None, max_length=4000)
     campos_extra: list[CampoExtraGuardado] = Field(default_factory=list, max_length=MAX_CAMPOS_EXTRA)
     sugerencias_campos: list[SugerenciaGuardada] = Field(default_factory=list, max_length=MAX_SUGERENCIAS_CAMPOS)
+    # Sin tipo en la solicitud se conserva el que ya tenía el documento.
+    tipo_documento: TipoDocumentoGuardado | None = None
 
     @field_validator("transacciones")
     @classmethod
@@ -241,14 +280,16 @@ def cuenta_id(email: str) -> str:
     return hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:16]
 
 
-def contar_problemas(validacion: dict[str, Any], resumen: dict[str, Any], transacciones: list[dict[str, Any]]) -> dict[str, Any]:
-    """Problemas que exigen confirmación explícita para marcar como revisado (mismo cálculo en el frontend)."""
+def contar_problemas(validacion: dict[str, Any], resumen: dict[str, Any], transacciones: list[dict[str, Any]], contable: bool = True) -> dict[str, Any]:
+    """Problemas que exigen confirmación explícita para marcar como revisado (mismo cálculo en el frontend).
+
+    Sin validación contable (tipos que no son estado de cuenta) solo cuentan los importes dudosos y las filas en revisión."""
     diferencias = sum(1 for item in validacion["comprobaciones"] if item["estado"] == "diferencia")
     dudosos_por_fila = {(t["id"], campo) for t in transacciones for campo in t.get("dudosos", [])}
     dudosos = len(resumen.get("dudosos", [])) + len(dudosos_por_fila)
     invalidos = sum(1 for item in validacion["importes_invalidos"] if (item["id"], item["campo"]) not in dudosos_por_fila)
     en_revision = sum(1 for t in transacciones if t.get("revision"))
-    incompleta = validacion["cuadra"] is None
+    incompleta = contable and validacion["cuadra"] is None
     total = diferencias + dudosos + invalidos + en_revision + (1 if incompleta else 0)
     return {
         "cuadra": validacion["cuadra"],
@@ -385,6 +426,10 @@ class AlmacenExtracciones:
                 "actualizado": documento.get("actualizado"),
                 "cuadra": documento.get("validacion", {}).get("cuadra"),
                 "problemas": documento.get("problemas", {}).get("total", 0),
+                "creado": documento.get("creado"),
+                "tipo_documento": documento.get("tipo_documento"),
+                "attachmentId": documento.get("attachmentId"),
+                "envio_automatico": (documento.get("envio_automatico") or {}).get("estado"),
             })
         return resultado
 
@@ -401,9 +446,11 @@ class AlmacenExtracciones:
 
             resumen = solicitud.resumen.model_dump(exclude_none=True)
             transacciones = [item.model_dump(exclude_none=True) for item in solicitud.transacciones]
-            # Nunca se confía en la validación del cliente: se recalcula con los datos recibidos.
-            validacion = validar_contabilidad(resumen, transacciones, solicitud.formato_numerico)
-            problemas = contar_problemas(validacion, resumen, transacciones)
+            tipo_documento = solicitud.tipo_documento.model_dump() if solicitud.tipo_documento else (actual or {}).get("tipo_documento")
+            contable = es_contable(tipo_documento)
+            # Nunca se confía en la validación del cliente: se recalcula con los datos recibidos (solo en estados de cuenta).
+            validacion = validar_contabilidad(resumen, transacciones, solicitud.formato_numerico) if contable else validacion_no_aplica()
+            problemas = contar_problemas(validacion, resumen, transacciones, contable)
             if solicitud.estado == "revisado" and problemas["total"] > 0 and not solicitud.confirmar_problemas:
                 raise RevisionConProblemas(problemas)
 
@@ -435,6 +482,8 @@ class AlmacenExtracciones:
                 "validacion": validacion,
                 "problemas": problemas,
             }
+            if tipo_documento:
+                documento["tipo_documento"] = tipo_documento
             escribir_atomico(ruta, documento)
             return self._publica(documento)
 

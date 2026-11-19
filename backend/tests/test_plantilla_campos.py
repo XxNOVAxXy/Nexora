@@ -181,7 +181,7 @@ class SaveDataConCampos(Base):
         canal = {"id": "pl-canal", "nombre": "Canal", "origen": "manual", "alcance": "movimiento"}
         envio = preparar_envio(documento, sucursal=3102, articulo="10000453", carga_inicial=False, configurados=[RFC, FOLIO, plaza, canal])
         interno = envio["interno"]
-        self.assertEqual(list(interno), ["Id", "Actualizacion", "Archivo", "Resumen", "Datos", "Transacciones", "Validacion"])
+        self.assertEqual(list(interno), ["Id", "Actualizacion", "Tipo", "Archivo", "Resumen", "Datos", "Transacciones", "Validacion"])
         # "Plaza" está configurado y el documento no lo tiene: va como null.
         self.assertEqual(interno["Datos"], {"RFC": None, "Número de cliente": "CLI-0001", "Plaza": None})
         self.assertEqual([(f["Folio"], f["Canal"]) for f in interno["Transacciones"]], [("F-0001", None), (None, None)])

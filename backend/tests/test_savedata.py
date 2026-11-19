@@ -104,7 +104,7 @@ class EnvioTests(unittest.TestCase):
         self.assertEqual(list(externo), ["data"])
         self.assertIsInstance(externo["data"], str)
         interno = json.loads(externo["data"])
-        self.assertEqual(list(interno), ["Id", "Actualizacion", "Archivo", "Resumen", "Datos", "Transacciones", "Validacion"])
+        self.assertEqual(list(interno), ["Id", "Actualizacion", "Tipo", "Archivo", "Resumen", "Datos", "Transacciones", "Validacion"])
         self.assertEqual(interno["Datos"], {})
         self.assertEqual(interno["Archivo"], "estado.pdf")
         self.assertEqual(interno["Resumen"]["saldo_final"], RESUMEN["saldo_final"])

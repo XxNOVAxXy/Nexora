@@ -1,4 +1,4 @@
-"""Filtro automático de estados de cuenta: asunto + documento adjunto (PDF o imagen), de cualquier remitente.
+"""Filtro automático de documentos: asunto (estados de cuenta y pólizas) o remitente de una regla + documento adjunto.
 
 El usuario no configura nada. Gmail recibe una búsqueda amplia (carpeta + términos en el asunto) y después el
 backend vuelve a comprobar cada resultado con :func:`asunto_coincide`, porque la búsqueda de Gmail es por palabras
@@ -7,6 +7,9 @@ imagen insertada en el cuerpo, y hay bancos que mandan el estado de cuenta solo 
 
 Para cubrir un banco que use otra frase en el asunto, se agrega a ``TERMINOS_ASUNTO`` (y a ``TERMINOS_GMAIL``
 si Gmail no la encontraría con los términos actuales).
+
+Además del asunto, entra todo lo que llegue de los remitentes configurados en las reglas de los tipos de documento
+(Configuración → Tipos de documento): ``construir_query(folder, remitentes)`` y ``es_candidato``.
 """
 
 from __future__ import annotations
@@ -14,12 +17,12 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
-from .remitentes import CONSULTAS_CARPETA
+from .remitentes import CONSULTAS_CARPETA, coincide, firma_remitentes, termino_from
 
 # Frases que se buscan en el asunto ya normalizado (minúsculas, sin acentos, sin signos de puntuación).
-TERMINOS_ASUNTO: tuple[str, ...] = (
+TERMINOS_ESTADO_CUENTA: tuple[str, ...] = (
     "estado de cuenta",
     "estados de cuenta",
     "edo de cuenta",
@@ -31,6 +34,16 @@ TERMINOS_ASUNTO: tuple[str, ...] = (
     "extracto",
     "statement",
 )
+
+# Pólizas (autos, flotillas, gastos médicos, daños): entran al filtro, pero no se asignan a Estado de cuenta por asunto.
+TERMINOS_POLIZA: tuple[str, ...] = (
+    "poliza",
+    "polizas",
+    "renovacion",
+    "endoso",
+)
+
+TERMINOS_ASUNTO = (*TERMINOS_ESTADO_CUENTA, *TERMINOS_POLIZA)
 
 # Términos de la búsqueda en Gmail. Gmail ignora mayúsculas y signos ("Edo. Cta." coincide con "edo cta").
 TERMINOS_GMAIL: tuple[str, ...] = (
@@ -44,6 +57,11 @@ TERMINOS_GMAIL: tuple[str, ...] = (
     '"resumen de movimientos"',
     "extracto",
     "statement",
+    "póliza",
+    "poliza",
+    "renovación",
+    "renovacion",
+    "endoso",
 )
 
 # Tipos que Gemini puede extraer. Cambiar esta lista o los términos cambia la firma (y se reconsulta Gmail).
@@ -71,6 +89,21 @@ def asunto_coincide(asunto: str) -> str | None:
     return None
 
 
+def asunto_es_estado_de_cuenta(asunto: str) -> bool:
+    normalizado = normalizar_asunto(asunto)
+    return any(patron.search(normalizado) for termino, patron in _PATRONES if termino in TERMINOS_ESTADO_CUENTA)
+
+
+def asunto_menciona_poliza(asunto: str) -> bool:
+    normalizado = normalizar_asunto(asunto)
+    return any(patron.search(normalizado) for termino, patron in _PATRONES if termino in TERMINOS_POLIZA)
+
+
+def es_candidato(asunto: str, remitente: str, remitentes: Sequence[str] = ()) -> bool:
+    """El correo entra al filtro si el asunto coincide o si el remitente coincide con una regla (comparación exacta)."""
+    return asunto_coincide(asunto) is not None or (bool(remitentes) and coincide(remitente, remitentes) is not None)
+
+
 def tiene_pdf(adjuntos: Iterable[dict[str, Any]]) -> bool:
     return any(
         str(adjunto.get("mimeType", "")).lower() == "application/pdf" or str(adjunto.get("filename", "")).lower().endswith(".pdf")
@@ -88,6 +121,17 @@ def tiene_documento(adjuntos: Iterable[dict[str, Any]]) -> bool:
     return any(es_documento_extraible(adjunto) for adjunto in adjuntos or [])
 
 
-def construir_query(folder: str) -> str:
-    """Consulta de Gmail: carpeta + alguno de los términos en el asunto. El documento lo comprueba el backend."""
-    return f"{CONSULTAS_CARPETA.get(folder, 'in:inbox')} subject:({' OR '.join(TERMINOS_GMAIL)})"
+def construir_query(folder: str, remitentes: Sequence[str] = ()) -> str:
+    """Consulta de Gmail: carpeta + alguno de los términos en el asunto o (con reglas) alguno de los remitentes.
+
+    ``{a b}`` es un OR de Gmail. El documento y el remitente exacto los vuelve a comprobar el backend.
+    """
+    asunto = f"subject:({' OR '.join(TERMINOS_GMAIL)})"
+    if not remitentes:
+        return f"{CONSULTAS_CARPETA.get(folder, 'in:inbox')} {asunto}"
+    return f"{CONSULTAS_CARPETA.get(folder, 'in:inbox')} {{{asunto} {' '.join(termino_from(regla) for regla in remitentes)}}}"
+
+
+def firma_filtro(remitentes: Sequence[str] = ()) -> str:
+    """Firma del filtro (clave de caché del listado): cambia con los términos y con las reglas de remitente."""
+    return FIRMA_FILTRO if not remitentes else f"{FIRMA_FILTRO}-{firma_remitentes(remitentes)}"

@@ -29,7 +29,7 @@ from typing import Any, Callable, Literal, Sequence
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .contabilidad import formatear_decimal, validar_contabilidad
-from .extracciones import AlmacenExtracciones, ConflictoVersion, escribir_atomico, migrar_columnas_unicas
+from .extracciones import AlmacenExtracciones, ConflictoVersion, es_contable, escribir_atomico, migrar_columnas_unicas
 from .plantilla_campos import aplicar_plantilla
 
 logger = logging.getLogger("nexora.savedata")
@@ -284,8 +284,27 @@ def _texto_o_nulo(valor: Any) -> str | None:
     return texto or None
 
 
-def datos_documento(documento: dict[str, Any], totales: TotalesEnvio, configurados: Sequence[dict[str, Any]] = (), actualizacion: bool | None = None) -> dict[str, Any]:
+def _aseguradora(documento: dict[str, Any], contable: bool) -> str | None:
+    """Aseguradora (o banco) del documento: la detectada; si no, la de la estructura. En un estado de cuenta, el banco."""
+    tipo_documento = documento.get("tipo_documento") or {}
+    if contable:
+        banco = _texto_o_nulo((documento.get("resumen") or {}).get("banco"))
+        if banco:
+            return banco
+    estructura = tipo_documento.get("estructura")
+    return _texto_o_nulo(tipo_documento.get("aseguradora")) or (_texto_o_nulo(estructura) if estructura != "Predeterminada" else None)
+
+
+def datos_documento(documento: dict[str, Any], totales: TotalesEnvio, configurados: Sequence[dict[str, Any]] = (), actualizacion: bool | None = None,
+                    tipo: dict[str, Any] | None = None) -> dict[str, Any]:
     """ÚNICA función que arma el JSON interno de SaveData (formato provisional hasta que se confirme).
+
+    - "Tipo": código del tipo de documento (``tipo`` es su configuración actual; sin ella, el código guardado en el
+      documento; un documento de antes de los tipos es un estado de cuenta: "EC").
+    - "Aseguradora": la detectada en el documento o la de su estructura. En un estado de cuenta solo va si se conoce
+      el banco (o la aseguradora).
+    - Tipos que no son estado de cuenta (provisional, por confirmar): sin "Resumen", "Transacciones" ni "Validacion";
+      la sección repetible va con su nombre (p. ej. "Incisos": [{campo: valor}]).
 
     - "Resumen" y "Transacciones" como siempre: solo datos del estado de cuenta, sin campos internos de Nexora
       (id, huella, origen, dudosos, *_original) y sin filas vacías.
@@ -316,10 +335,28 @@ def datos_documento(documento: dict[str, Any], totales: TotalesEnvio, configurad
             continue
         extras = fila.get("extras") or {}
         transacciones.append({**fijos, **{str(campo["nombre"]): _texto_o_nulo(extras.get(campo["id"])) for campo in por_movimiento}})
+    tipo_documento = documento.get("tipo_documento") or {}
+    contable = es_contable(tipo_documento)
+    codigo = (tipo or {}).get("codigo") or tipo_documento.get("codigo") or ("EC" if contable else None)
+    aseguradora = _aseguradora(documento, contable)
+    cabecera: dict[str, Any] = {"Id": identificador, "Actualizacion": actualizacion, "Tipo": codigo}
+    if aseguradora or not contable:
+        cabecera["Aseguradora"] = aseguradora
+    if not contable:
+        nombre_seccion = ((tipo or {}).get("seccion") or {}).get("nombre")
+        interno = {**cabecera, "Archivo": documento.get("filename"), "Datos": {str(campo["nombre"]): _texto_o_nulo(campo.get("valor")) for campo in del_documento}}
+        if nombre_seccion or (tipo is None and por_movimiento):
+            filas = []
+            for fila in documento.get("transacciones") or []:
+                extras = fila.get("extras") or {}
+                valores = {str(campo["nombre"]): _texto_o_nulo(extras.get(campo["id"])) for campo in por_movimiento}
+                if any(valor is not None for valor in valores.values()):
+                    filas.append(valores)
+            interno[nombre_seccion or "Filas"] = filas
+        return interno
     validacion = documento.get("validacion") or {}
     return {
-        "Id": identificador,
-        "Actualizacion": actualizacion,
+        **cabecera,
         "Archivo": documento.get("filename"),
         "Resumen": {campo: resumen.get(campo, "") for campo in CAMPOS_RESUMEN},
         "Datos": {str(campo["nombre"]): _texto_o_nulo(campo.get("valor")) for campo in del_documento},
@@ -328,10 +365,11 @@ def datos_documento(documento: dict[str, Any], totales: TotalesEnvio, configurad
     }
 
 
-def preparar_envio(documento: dict[str, Any], *, sucursal: int, articulo: str, carga_inicial: bool, configurados: Sequence[dict[str, Any]] = (), actualizacion: bool | None = None) -> dict[str, Any]:
+def preparar_envio(documento: dict[str, Any], *, sucursal: int, articulo: str, carga_inicial: bool, configurados: Sequence[dict[str, Any]] = (), actualizacion: bool | None = None,
+                   tipo: dict[str, Any] | None = None) -> dict[str, Any]:
     # Se envía solo nuestra extracción. construir_saldos() (formato H/S de SaveData) queda disponible pero no se usa.
     totales = totales_de(documento)
-    interno = datos_documento(documento, totales, configurados, actualizacion)
+    interno = datos_documento(documento, totales, configurados, actualizacion, tipo)
     return {"interno": interno, "cuerpo": serializar_cuerpo(interno), "totales": {"abonos": formatear_decimal(totales.abonos), "cargos": formatear_decimal(totales.cargos)}}
 
 
@@ -345,20 +383,30 @@ def motivos_para_no_enviar(documento: dict[str, Any], sin_url: bool) -> list[str
 
 
 class ServicioEnvio:
-    def __init__(self, almacen: AlmacenExtracciones, url: Callable[[], str], timeout: float = SAVEDATA_TIMEOUT_SECONDS, cliente: Callable[[str, str, float], RespuestaSaveData] = enviar_a_savedata, configurados: Callable[[str], list[dict[str, Any]]] = lambda _email: []) -> None:
+    def __init__(self, almacen: AlmacenExtracciones, url: Callable[[], str], timeout: float = SAVEDATA_TIMEOUT_SECONDS, cliente: Callable[[str, str, float], RespuestaSaveData] = enviar_a_savedata, configurados: Callable[[str], list[dict[str, Any]]] = lambda _email: [],
+                 tipo_de: Callable[[str, dict[str, Any]], dict[str, Any] | None] = lambda _email, _documento: None) -> None:
         self.almacen = almacen
         # Configuración de campos de la cuenta: los campos configurados que falten en el documento van como null.
         self.configurados = configurados
+        # Tipo de documento actual de un documento (código, sección y campos); None: estado de cuenta de siempre.
+        self.tipo_de = tipo_de
         self.url = url
         self.timeout = timeout
         self.cliente = cliente
+
+    def _armado(self, email: str, documento: dict[str, Any]) -> dict[str, Any]:
+        """Campos configurados y tipo con que se arma el JSON: los del estado de cuenta, o los del tipo del documento."""
+        tipo = self.tipo_de(email, documento)
+        if tipo is None or tipo.get("contable"):
+            return {"configurados": self.configurados(email), "tipo": tipo}
+        return {"configurados": list(tipo.get("campos") or []), "tipo": tipo}
 
     def vista_previa(self, email: str, message_id: str, part_id: str, *, sucursal: int, articulo: str, carga_inicial: bool) -> dict[str, Any]:
         documento = self.almacen.leer_completo(email, message_id, part_id)
         if documento is None:
             raise NoSePuedeEnviar("sin_extraccion", "Guarda la extraccion antes de prepararla para SaveData.", 404)
         borrado = borrado_en_savedata(documento)
-        preparado = preparar_envio(documento, sucursal=sucursal, articulo=articulo, carga_inicial=carga_inicial, configurados=self.configurados(email), actualizacion=False if borrado else None)
+        preparado = preparar_envio(documento, sucursal=sucursal, articulo=articulo, carga_inicial=carga_inicial, **self._armado(email, documento), actualizacion=False if borrado else None)
         motivos = motivos_para_no_enviar(documento, not self.url())
         previo = _requiere_confirmar_reenvio(documento)
         return {
@@ -406,7 +454,7 @@ class ServicioEnvio:
                     raise NoSePuedeEnviar("savedata_no_existe", "SaveData ya no tiene este documento (lo borraron). Confirma si quieres agregarlo de nuevo.", 409, {"envio_previo": documento["envios"][-1]})
                 if previo is not None and not solicitud.confirmar_reenvio and not agregar:
                     raise NoSePuedeEnviar("requiere_confirmar_reenvio", "Este documento ya se envio (o su resultado es incierto). Confirma explicitamente para reenviarlo.", 409, {"envio_previo": previo})
-                preparado.update(preparar_envio(documento, sucursal=solicitud.sucursal, articulo=solicitud.articulo, carga_inicial=solicitud.carga_inicial, configurados=self.configurados(email), actualizacion=False if agregar else None))
+                preparado.update(preparar_envio(documento, sucursal=solicitud.sucursal, articulo=solicitud.articulo, carga_inicial=solicitud.carga_inicial, **self._armado(email, documento), actualizacion=False if agregar else None))
                 intento = {
                     "id": intento_id,
                     "accion": "enviar",
