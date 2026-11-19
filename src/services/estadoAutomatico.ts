@@ -108,3 +108,41 @@ export const avisosSinLeer = (estado: EstadoAutomatico | null): AvisoAutomatico[
 
 /** Cada cuánto se consulta el estado: rápido mientras hay un ciclo en curso o una revisión pedida. */
 export const intervaloConsulta = (estado: EstadoAutomatico | null) => (estado?.en_curso || estado?.revision_pendiente ? 3_000 : 60_000)
+
+/** El envío automático solo trabaja si también está activa la extracción automática. */
+export const envioAutomaticoEncendido = (estado: EstadoAutomatico | null): boolean => Boolean(estado?.activo && estado.envio_activo)
+
+/** Texto visible en Configuración cuando el envío automático está encendido. */
+export const TEXTO_ENVIO_AUTOMATICO_CONFIG = 'No necesitas hacer nada: cada 20 minutos Nexora revisa los correos nuevos, los extrae y los envía a SaveData. Si extraes o editas un documento a mano, ya no se enviará automáticamente.'
+
+/** Aviso de la bandeja (null si el envío automático está apagado). */
+export function textoAvisoEnvioAutomatico(estado: EstadoAutomatico | null): string | null {
+  if (!envioAutomaticoEncendido(estado)) return null
+  const proxima = hora(estado?.proxima_revision ?? null)
+  return `Envío automático activo · los estados de cuenta nuevos se envían solos en la próxima revisión${proxima ? ` (${proxima})` : ''}. No es necesario pulsar Extraer.`
+}
+
+/**
+ * Adjunto de un correo nuevo que el proceso todavía no revisó y que, por tanto, se enviará solo:
+ * mismos criterios que el backend (llegó después de activar, sin extracción guardada, sin descartar y sin resultado del proceso).
+ */
+export function pendienteEnvioAutomatico(estado: EstadoAutomatico | null, guardado: EntradaListado | undefined, messageId: string, partId: string | null, recibidoEn: string | null | undefined): boolean {
+  if (!estado || !envioAutomaticoEncendido(estado) || !partId || guardado) return false
+  const automatico = estado.adjuntos[`${messageId}__${partId}`]
+  if (automatico && automatico.estado !== 'pendiente' && automatico.estado !== 'en_curso') return false
+  if ((estado.descartados ?? []).some((descarte) => descarte.message_id === messageId && (!descarte.part_id || descarte.part_id === partId))) return false
+  const recibido = recibidoEn ? Date.parse(recibidoEn) : NaN
+  const activado = estado.activado_en ? Date.parse(estado.activado_en) : NaN
+  return Number.isFinite(recibido) && Number.isFinite(activado) && recibido > activado
+}
+
+const ENVIO_TERMINADO = new Set(['enviado', 'requiere_revision', 'error', 'incierto', 'sin_savedata', 'omitido'])
+
+/** Documento extraído automáticamente, pendiente de envío automático y todavía en la versión que dejó el proceso. */
+export function envioAutomaticoSinEnviar(estado: EstadoAutomatico | null, messageId: string | null, partId: string | null, versionGuardada: number | null): boolean {
+  if (!estado || !envioAutomaticoEncendido(estado) || !messageId || !partId || versionGuardada === null) return false
+  const automatico = estado.adjuntos[`${messageId}__${partId}`]
+  if (!automatico || automatico.estado !== 'extraido' || !automatico.enviar_auto) return false
+  if (automatico.envio && ENVIO_TERMINADO.has(automatico.envio.estado)) return false
+  return automatico.version !== null && versionGuardada === (automatico.envio?.version ?? automatico.version)
+}

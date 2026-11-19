@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { AdjuntoAutomatico, EstadoAutomatico } from './automaticoApi'
 import type { EntradaListado } from './extraccionesApi'
-import { estadoDocumento, textoCamposAutomaticos, textoIndicador } from './estadoAutomatico'
+import { envioAutomaticoEncendido, envioAutomaticoSinEnviar, estadoDocumento, pendienteEnvioAutomatico, textoAvisoEnvioAutomatico, textoCamposAutomaticos, textoIndicador } from './estadoAutomatico'
 
 const guardado = (cambios: Partial<EntradaListado> = {}): EntradaListado => ({ messageId: 'm1', partId: '1', filename: 'e.pdf', estado: 'borrador', version: 1, actualizado: '2026-11-13T10:00:00Z', cuadra: true, problemas: 0, ...cambios })
 const auto = (cambios: Partial<AdjuntoAutomatico> = {}): AdjuntoAutomatico => ({ estado: 'extraido', intentos: 1, error: null, version: 1, actualizado: null, ...cambios })
@@ -60,5 +60,51 @@ describe('estado del envío automático en la bandeja', () => {
   it('pendiente, omitido o sin SaveData no tienen etiqueta propia', () => {
     expect(estadoDocumento(guardado(), auto({ envio: envio('omitido', null) }))).toBe('automatico')
     expect(estadoDocumento(guardado({ estado: 'revisado', version: 2 }), auto({ envio: envio('pendiente', 2) }))).toBe('revisado')
+  })
+})
+
+describe('avisos del envío automático', () => {
+  const encendido = (cambios: Partial<EstadoAutomatico> = {}) => proceso({ envio_activo: true, ...cambios })
+  const nuevo = '2026-11-13T09:30:00Z'
+
+  it('solo cuenta como encendido con la extracción activa y el envío activo', () => {
+    expect(envioAutomaticoEncendido(encendido())).toBe(true)
+    expect(envioAutomaticoEncendido(encendido({ activo: false }))).toBe(false)
+    expect(envioAutomaticoEncendido(proceso())).toBe(false)
+    expect(envioAutomaticoEncendido(null)).toBe(false)
+  })
+
+  it('el aviso de la bandeja lleva la hora de la próxima revisión y desaparece con el envío apagado', () => {
+    expect(textoAvisoEnvioAutomatico(encendido())).toMatch(/^Envío automático activo · los estados de cuenta nuevos se envían solos en la próxima revisión \([^)]+\)\. No es necesario pulsar Extraer\.$/)
+    expect(textoAvisoEnvioAutomatico(encendido({ proxima_revision: null }))).toBe('Envío automático activo · los estados de cuenta nuevos se envían solos en la próxima revisión. No es necesario pulsar Extraer.')
+    expect(textoAvisoEnvioAutomatico(proceso())).toBeNull()
+  })
+
+  it('pendiente: correo posterior a la activación, sin guardar, sin descartar y sin resultado del proceso', () => {
+    expect(pendienteEnvioAutomatico(encendido(), undefined, 'm1', '1', nuevo)).toBe(true)
+    expect(pendienteEnvioAutomatico(encendido({ adjuntos: { m1__1: auto({ estado: 'pendiente', version: null }) } }), undefined, 'm1', '1', nuevo)).toBe(true)
+    expect(pendienteEnvioAutomatico(encendido({ adjuntos: { m1__1: auto({ estado: 'en_curso', version: null }) } }), undefined, 'm1', '1', nuevo)).toBe(true)
+  })
+
+  it('no pendiente: envío apagado, ya guardado, ya revisado, descartado o anterior a la activación', () => {
+    expect(pendienteEnvioAutomatico(proceso(), undefined, 'm1', '1', nuevo)).toBe(false)
+    expect(pendienteEnvioAutomatico(encendido({ activo: false }), undefined, 'm1', '1', nuevo)).toBe(false)
+    expect(pendienteEnvioAutomatico(encendido(), guardado(), 'm1', '1', nuevo)).toBe(false)
+    expect(pendienteEnvioAutomatico(encendido({ adjuntos: { m1__1: auto() } }), undefined, 'm1', '1', nuevo)).toBe(false)
+    expect(pendienteEnvioAutomatico(encendido({ adjuntos: { m1__1: auto({ estado: 'error', version: null }) } }), undefined, 'm1', '1', nuevo)).toBe(false)
+    const descartado = { clave: 'm1', message_id: 'm1', part_id: null, motivo: 'sin_adjunto_valido', detalle: null, asunto: null, recibido: null, primera_vez: null, ultima_vez: null, veces: 1 }
+    expect(pendienteEnvioAutomatico(encendido({ descartados: [descartado] }), undefined, 'm1', '1', nuevo)).toBe(false)
+    expect(pendienteEnvioAutomatico(encendido(), undefined, 'm1', '1', '2026-11-13T08:59:00Z')).toBe(false)
+    expect(pendienteEnvioAutomatico(encendido(), undefined, 'm1', '1', null)).toBe(false)
+  })
+
+  it('extraído automáticamente sin enviar: solo mientras siga en la versión del proceso y el envío no haya terminado', () => {
+    const conEnvio = (envio: AdjuntoAutomatico['envio']) => encendido({ adjuntos: { m1__1: auto({ enviar_auto: true, envio }) } })
+    expect(envioAutomaticoSinEnviar(conEnvio(null), 'm1', '1', 1)).toBe(true)
+    expect(envioAutomaticoSinEnviar(conEnvio({ estado: 'pendiente', intentos: 1, error: null, motivos: null, problemas: null, version: null, actualizado: null }), 'm1', '1', 1)).toBe(true)
+    expect(envioAutomaticoSinEnviar(conEnvio(null), 'm1', '1', 2)).toBe(false)
+    expect(envioAutomaticoSinEnviar(conEnvio({ estado: 'enviado', intentos: 1, error: null, motivos: null, problemas: null, version: 2, actualizado: null }), 'm1', '1', 2)).toBe(false)
+    expect(envioAutomaticoSinEnviar(encendido({ adjuntos: { m1__1: auto({ enviar_auto: false }) } }), 'm1', '1', 1)).toBe(false)
+    expect(envioAutomaticoSinEnviar(proceso({ adjuntos: { m1__1: auto({ enviar_auto: true }) } }), 'm1', '1', 1)).toBe(false)
   })
 })
