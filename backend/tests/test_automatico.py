@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import patch
 
 from backend.app import automatico as modulo
@@ -366,7 +367,23 @@ class Programacion(Base):
                 break
             threading.Event().wait(0.05)
         self.assertEqual(self.adjunto().get("estado"), "extraido")
-        self.assertIsNotNone(self.extractor.estado(EMAIL)["proxima_revision"])
+
+        # El adjunto queda "extraido" antes de que el ciclo se cierre, y la próxima revisión se programa
+        # en el bucle después de cerrarlo: hay que esperar a ambas cosas en vez de revisar en seguida.
+        def esperar(condicion: Callable[[], bool], segundos: float = 5.0) -> bool:
+            limite = time.monotonic() + segundos
+            while time.monotonic() < limite:
+                if condicion():
+                    return True
+                threading.Event().wait(0.02)
+            return condicion()
+
+        def ciclo_cerrado() -> bool:
+            estado = self.extractor.estado(EMAIL)
+            return not estado["en_curso"] and bool((estado.get("ultimo_ciclo") or {}).get("fin"))
+
+        self.assertTrue(esperar(ciclo_cerrado), "El ciclo no terminó de cerrarse")
+        self.assertTrue(esperar(lambda: self.extractor.estado(EMAIL)["proxima_revision"] is not None), "No se programó la próxima revisión")
         self.extractor.detener(espera=2)
         self.assertFalse(self.extractor.corriendo())
 
