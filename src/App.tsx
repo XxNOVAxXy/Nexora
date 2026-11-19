@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type SetStateAction } from 'react'
-import { Link, NavLink, Route, Routes, useBlocker, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, Navigate, NavLink, Route, Routes, useBlocker, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import type { AlcanceCampo, CampoExtra, CampoMonto, CampoMontoResumen, Resumen, SugerenciaCampo, Transaccion } from './types'
 import { agregarCampoManual, aplicarSugerencia, cambiarAlcance, camposParaSolicitar, editarExtra, editarValorDocumento, eliminarCampo, errorNombreCampo, esBuscable, esCeldaDeIa, esDelDocumento, filasConValor, fuenteDeLlenado, llenarColumnaManual, MAX_CAMPOS_EXTRA, mensajeLlenado, nombreComparable, puedeSerDelDocumento, renombrarCampo, sugerenciasDisponibles, type ColumnasDocumento, type ResultadoLlenado } from './services/camposExtra'
 import { contarCorrecciones, editarCampo, etiquetaOrigen, moverTransaccion, nuevaTransaccion, type CampoEditable } from './services/transacciones'
@@ -10,7 +10,7 @@ import { geminiApi, type GeminiExtractionResponse, type GeminiStatus } from './s
 import { ejecutarEliminacion, ejecutarEnvio, savedataApi, type ConfigSaveData, type VistaPreviaEnvio } from './services/savedataApi'
 import { claveEstado, inboxStore, type EstadosExtraccion, type Listado, type MailFolder } from './services/inboxStore'
 import { automaticoApi, type EstadoAutomatico } from './services/automaticoApi'
-import { publicarEstadoAutomatico } from './services/eventosAutomatico'
+import { EVENTO_ESTADO_AUTOMATICO, publicarEstadoAutomatico } from './services/eventosAutomatico'
 import { AvisosAutomatico, CampanaAvisos, ListaDescartes, ResumenUltimoCiclo } from './DiagnosticoAutomatico'
 import { plantillaCamposApi, plantillaVigente } from './services/plantillaCamposApi'
 import { agregarAPlantilla, aplicarPlantilla, CAMPOS_FIJOS, cambiarTipoEnPlantilla, errorNombrePlantilla, etiquetaAlcance, nuevoIdPlantilla, quitarDePlantilla, renombrarEnPlantilla, sugerenciasNuevas, type CampoPlantilla, type SugerenciaPlantilla } from './services/plantillaCampos'
@@ -39,6 +39,7 @@ import {
   Copy,
   FileCheck2,
   FileImage,
+  FileStack,
   FileSearch,
   FileText,
   Gem,
@@ -47,6 +48,8 @@ import {
   Landmark,
   Mail,
   Pencil,
+  Plug,
+  Workflow,
   Menu,
   Paperclip,
   Plus,
@@ -67,7 +70,7 @@ type ExtractionMode = 'manual' | 'gemini'
 
 const navSections: { label: string; items: { to: string; label: string; icon: Icon }[] }[] = [
   { label: 'Operación', items: [{ to: '/emails', label: 'Correos', icon: Mail }, { to: '/extraction', label: 'Extracción', icon: FileSearch }, { to: '/envios', label: 'Envíos', icon: Send }] },
-  { label: 'Sistema', items: [{ to: '/settings', label: 'Configuración', icon: SettingsIcon }] },
+  { label: 'Sistema', items: [{ to: '/configuracion', label: 'Configuración', icon: SettingsIcon }] },
 ]
 
 function App() {
@@ -84,7 +87,9 @@ function App() {
             <Route path="/emails" element={<FilteredGmailInboxPage />} />
             <Route path="/extraction" element={<ExtractionWorkspace />} />
             <Route path="/envios" element={<HistorialEnviosPage />} />
-            <Route path="/settings" element={<SettingsPageV3 />} />
+            <Route path="/settings" element={<Navigate to="/configuracion/conexiones" replace />} />
+            <Route path="/configuracion" element={<Navigate to="/configuracion/conexiones" replace />} />
+            <Route path="/configuracion/:seccion" element={<SettingsPageV3 />} />
           </Routes>
         </main>
       </div>
@@ -117,7 +122,7 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
         <nav className="mt-8 flex-1">
           {navSections.map((section) => <div key={section.label} className="mb-7"><div className="mb-2 px-3 text-[10px] font-bold uppercase tracking-[0.17em] text-slate-600">{section.label}</div>{section.items.map(({ to, label, icon: NavIcon }) => <NavLink key={to} to={to} onClick={onClose} className={({ isActive }) => `group mb-1 flex items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] font-medium transition ${isActive ? 'bg-white/10 text-white' : 'text-slate-400 hover:bg-white/[.05] hover:text-slate-200'}`}><NavIcon size={17} strokeWidth={1.8} /><span>{label}</span>{label === 'Correos' && unreadCount > 0 && <span className="ml-auto rounded-full bg-coral px-1.5 py-0.5 text-[10px] font-bold text-white" title="Sin leer en la bandeja de entrada">{unreadCount}</span>}</NavLink>)}</div>)}
         </nav>
-        <div className="border-t border-white/10 pt-4"><div className="mb-4 flex items-center gap-3 px-2"><div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-coral text-xs font-bold text-white">{initials}</div><div className="min-w-0"><div className="truncate text-xs font-semibold text-white">{accountEmail}</div><div className="text-[10px] text-slate-500">Cuenta conectada</div></div></div>{connected ? <div className="rounded-lg bg-emerald-400/10 px-3 py-2 text-[10px] text-emerald-300"><span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-emerald-400" />Gmail conectado</div> : <Link to="/settings" onClick={onClose} className="block rounded-lg bg-amber-400/10 px-3 py-2 text-[10px] text-amber-300 hover:bg-amber-400/15"><span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-amber-400" />Conectar Gmail en Configuración</Link>}</div>
+        <div className="border-t border-white/10 pt-4"><div className="mb-4 flex items-center gap-3 px-2"><div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-coral text-xs font-bold text-white">{initials}</div><div className="min-w-0"><div className="truncate text-xs font-semibold text-white">{accountEmail}</div><div className="text-[10px] text-slate-500">Cuenta conectada</div></div></div>{connected ? <div className="rounded-lg bg-emerald-400/10 px-3 py-2 text-[10px] text-emerald-300"><span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-emerald-400" />Gmail conectado</div> : <Link to="/configuracion" onClick={onClose} className="block rounded-lg bg-amber-400/10 px-3 py-2 text-[10px] text-amber-300 hover:bg-amber-400/15"><span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-amber-400" />Conectar Gmail en Configuración</Link>}</div>
       </aside>
     </>
   )
@@ -125,8 +130,8 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
 
 function Topbar({ onMenu }: { onMenu: () => void }) {
   const location = useLocation()
-  const titles: Record<string, string> = { '/': 'Correos', '/emails': 'Correos', '/extraction': 'Extracción', '/settings': 'Configuración' }
-  return <header className="flex h-[76px] items-center justify-between border-b border-slate-200/70 bg-paper px-5 sm:px-8 lg:px-10"><div className="flex items-center gap-3"><button onClick={onMenu} className="rounded-lg p-2 text-slate-500 hover:bg-white lg:hidden"><Menu size={21} /></button><div><div className="eyebrow">Workspace / {titles[location.pathname] ?? 'Nexora'}</div><h1 className="font-display text-xl font-extrabold tracking-tight text-ink sm:text-[22px]">{titles[location.pathname] ?? 'Nexora'}</h1></div></div><div className="flex items-center gap-2 sm:gap-4"><div className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-400 md:flex"><Search size={15} /><span>Buscar en Nexora</span><kbd className="ml-8 rounded border border-slate-200 px-1.5 py-0.5 text-[10px] text-slate-400">⌘ K</kbd></div><CampanaAvisos /><div className="hidden h-7 w-px bg-slate-200 sm:block" /><button className="flex items-center gap-2 text-sm font-semibold text-slate-600"><span className="flex h-8 w-8 items-center justify-center rounded-full bg-coral/10 text-xs font-bold text-coral">JD</span><ChevronDown size={14} className="hidden sm:block" /></button></div></header>
+  const titles: Record<string, string> = { '/': 'Correos', '/emails': 'Correos', '/extraction': 'Extracción' }
+  return <header className="flex h-[76px] items-center justify-between border-b border-slate-200/70 bg-paper px-5 sm:px-8 lg:px-10"><div className="flex items-center gap-3"><button onClick={onMenu} className="rounded-lg p-2 text-slate-500 hover:bg-white lg:hidden"><Menu size={21} /></button><div><div className="eyebrow">Workspace / {titles[location.pathname] ?? (location.pathname.startsWith('/configuracion') ? 'Configuración' : 'Nexora')}</div><h1 className="font-display text-xl font-extrabold tracking-tight text-ink sm:text-[22px]">{titles[location.pathname] ?? (location.pathname.startsWith('/configuracion') ? 'Configuración' : 'Nexora')}</h1></div></div><div className="flex items-center gap-2 sm:gap-4"><div className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-400 md:flex"><Search size={15} /><span>Buscar en Nexora</span><kbd className="ml-8 rounded border border-slate-200 px-1.5 py-0.5 text-[10px] text-slate-400">⌘ K</kbd></div><CampanaAvisos /><div className="hidden h-7 w-px bg-slate-200 sm:block" /><button className="flex items-center gap-2 text-sm font-semibold text-slate-600"><span className="flex h-8 w-8 items-center justify-center rounded-full bg-coral/10 text-xs font-bold text-coral">JD</span><ChevronDown size={14} className="hidden sm:block" /></button></div></header>
 }
 
 function PageHeading({ eyebrow, title, description, children }: { eyebrow: string; title: string; description: string; children?: React.ReactNode }) {
@@ -1653,7 +1658,9 @@ function GmailDocumentPreview({ messageId, attachmentId, filename, page, setPage
   return <div className="panel flex h-full flex-col overflow-hidden"><div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3"><div className="flex min-w-0 items-center gap-2 text-xs font-semibold text-ink"><FileText size={16} className="shrink-0 text-coral" /><span className="truncate">{filename}</span></div><a href={previewUrl ?? undefined} target="_blank" rel="noreferrer" className={`shrink-0 rounded-full bg-blue-50 px-2.5 py-1 text-[10px] font-bold text-blue-700 hover:bg-blue-100 ${previewUrl ? '' : 'pointer-events-none opacity-50'}`}>Abrir en otra pestaña</a></div>{previewUrl && verificacion?.panel}{previewUrl && verificacion?.estado === 'error' && <div role="note" className="shrink-0 border-b border-amber-200 bg-amber-50 px-4 py-2 text-[11px] text-amber-800">No se pudo preparar la verificación visual de este PDF; se muestra con el visor del navegador.</div>}<div className={`flex min-h-0 flex-1 items-center justify-center overflow-auto bg-slate-100/80 ${previewUrl && isPdf ? '' : 'p-5 sm:p-8'}`}>{loading && <div className="flex items-center gap-2 text-sm text-slate-400"><RefreshCw size={16} className="animate-spin" />Cargando documento...</div>}{error && <div className="text-sm text-red-600">{error}</div>}{previewUrl && isPdf && <iframe src={`${previewUrl}#navpanes=0&view=FitH`} title={filename} className="h-full w-full bg-white" />}{previewUrl && isImage && <img src={previewUrl} alt={filename} className="max-h-full max-w-full rounded-lg object-contain shadow-lg" />}{!loading && !error && !isPdf && !isImage && <div className="text-center text-sm text-slate-500">Este formato no tiene visor integrado.</div>}</div></div>
 }
 
-function SettingsPageV3() {
+export function SettingsPageV3() {
+  const { seccion } = useParams()
+  const navigate = useNavigate()
   const [gmailStatus, setGmailStatus] = useState<GmailStatus | null>(null)
   const [geminiStatus, setGeminiStatus] = useState<GeminiStatus | null>(null)
   const [apiKey, setApiKey] = useState('')
@@ -1689,7 +1696,70 @@ function SettingsPageV3() {
   const disableGemini = async () => {
     try { setGeminiStatus(await geminiApi.disable()); setNotice('Gemini quedó desactivado.'); setError(null) } catch (requestError) { setError(requestError instanceof Error ? requestError.message : 'No se pudo desactivar Gemini.') }
   }
-  return <><PageHeading eyebrow="Integraciones y preferencias" title="Configuración" description="Administra Gmail y Gemini desde Nexora sin editar el archivo .env."><span className="flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700"><ShieldCheck size={14} />Configuración en backend</span></PageHeading>{error && <ErrorNotice text={error} onClose={() => setError(null)} />}{notice && <Notice text={notice} onClose={() => setNotice(null)} />}<div className="mb-7 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500"><div className="flex items-center gap-2"><ShieldCheck size={16} className="text-emerald-600" /><span>Las claves se guardan en FastAPI y nunca se muestran completas ni se almacenan en el navegador.</span></div></div><div className="space-y-5"><IntegrationCard icon={Globe2} iconClass="bg-blue-50 text-blue-600" title="Gmail" description="Conexión real mediante OAuth 2.0." connected={Boolean(gmailStatus?.connected)} onToggle={() => void handleGmail()}><div className="grid gap-4 sm:grid-cols-2"><SettingField label="Cuenta asociada" value={gmailStatus?.email ?? 'No conectada'} /><SettingField label="Estado" value={gmailStatus?.connected ? 'OAuth activo · Gmail API' : 'Esperando autorización'} /></div></IntegrationCard><IntegrationCard icon={Gem} iconClass="bg-violet-50 text-violet-600" title="Gemini" description="Guarda tu API key y activa la extracción desde esta pantalla." connected={Boolean(geminiStatus?.enabled)} onToggle={() => void (geminiStatus?.enabled ? disableGemini() : saveGemini())}><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">API key de Gemini</span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} className="input" placeholder={geminiStatus?.maskedKey ?? 'Pega aquí tu API key'} autoComplete="new-password" /></label><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Modelo</span><select value={model} onChange={(event) => setModel(event.target.value)} className="input"><option value="gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option><option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite · respaldo</option><option value="gemini-3.8-flash">Gemini 3.8 Flash · documentos complejos</option></select></label></div><div className="mt-4 flex flex-wrap items-center gap-2"><button onClick={() => void saveGemini()} className="btn-primary"><Check size={14} />Guardar y activar</button><button onClick={() => void disableGemini()} className="btn-soft" disabled={!geminiStatus?.configured}><X size={14} />Desactivar</button>{geminiStatus?.configured && <span className="text-xs text-slate-500">Key guardada: {geminiStatus.maskedKey}</span>}</div></IntegrationCard><section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-savedata"><div className="mb-5 flex items-start gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600"><Send size={19} /></div><div><h3 id="titulo-config-savedata" className="font-display text-base font-bold text-ink">SaveData</h3><p className="mt-1 text-xs text-slate-500">Envío de extracciones revisadas. La URL se define en el backend con SAVEDATA_URL; el navegador nunca la llama directamente.</p></div></div><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Sucursal predeterminada</span><input type="text" inputMode="numeric" value={sucursalPredeterminada} onChange={(event) => setSucursalPredeterminada(event.target.value)} className="input" placeholder="Ej. 3102" /></label><SettingField label="URL de SaveData" value={savedata ? savedata.url ?? 'Sin configurar (SAVEDATA_URL)' : 'Consultando…'} /></div><div className="mt-4"><button type="button" onClick={() => void guardarSucursal()} className="btn-primary"><Check size={14} />Guardar sucursal</button></div></section>{gmailStatus?.connected && <TarjetaCamposConfigurados onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} />}{gmailStatus?.connected && <TarjetaExtraccionAutomatica onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} />}</div><div className="mt-8 grid gap-4 md:grid-cols-3"><SmallSetting icon={ShieldCheck} title="Privacidad" description="Key protegida en el servidor" /><SmallSetting icon={Sparkles} title="Modelo activo" description={geminiStatus?.model ?? model} /><SmallSetting icon={Code2} title="API FastAPI" description="Configuración persistente" /></div></>
+  // Estado de la extracción automática para el punto del menú: una consulta al abrir y, después, el evento que publica la tarjeta.
+  const [estadoAuto, setEstadoAuto] = useState<EstadoAutomatico | null>(null)
+  useEffect(() => {
+    let vivo = true
+    let recibioEvento = false
+    const escuchar = (evento: Event) => { recibioEvento = true; setEstadoAuto((evento as CustomEvent<EstadoAutomatico>).detail) }
+    window.addEventListener(EVENTO_ESTADO_AUTOMATICO, escuchar)
+    Promise.resolve().then(() => automaticoApi.estado()).then((valor) => { if (vivo && !recibioEvento && valor) setEstadoAuto(valor) }).catch(() => undefined)
+    return () => { vivo = false; window.removeEventListener(EVENTO_ESTADO_AUTOMATICO, escuchar) }
+  }, [])
+  const activa = SECCIONES_CONFIG.find((item) => item.id === seccion)
+  if (!activa) return <Navigate to="/configuracion/conexiones" replace />
+  const gmailConectado = Boolean(gmailStatus?.connected)
+  const indicadores: Record<SeccionConfig, IndicadorSeccion | null> = {
+    conexiones: gmailStatus && geminiStatus ? (gmailConectado && geminiStatus.enabled ? { ok: true, texto: 'Gmail y Gemini conectados' } : { ok: false, texto: 'Falta conectar Gmail o Gemini' }) : { ok: null, texto: 'Consultando' },
+    savedata: savedata ? (savedata.url ? { ok: true, texto: 'URL configurada' } : { ok: false, texto: 'URL sin configurar' }) : { ok: null, texto: 'Consultando' },
+    'tipos-documento': null,
+    automatizacion: estadoAuto ? (estadoAuto.activo ? { ok: true, texto: 'Activa' } : { ok: false, texto: 'En pausa' }) : { ok: null, texto: 'Consultando' },
+  }
+  const sinGmail = gmailStatus !== null && !gmailConectado
+  const avisoSinGmail = <div className="panel flex flex-col items-start gap-3 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6"><div className="flex items-center gap-2.5 text-sm text-slate-600"><CircleHelp size={17} className="shrink-0 text-amber-600" /><span>Conecta Gmail en Conexiones para ver esta sección</span></div><button type="button" onClick={() => navigate('/configuracion/conexiones')} className="btn-primary shrink-0"><Plug size={14} />Ir a Conexiones</button></div>
+  const contenido: Record<SeccionConfig, React.ReactNode> = {
+    conexiones: <><div className="mb-5 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-500"><div className="flex items-center gap-2"><ShieldCheck size={16} className="text-emerald-600" /><span>Las claves se guardan en FastAPI y nunca se muestran completas ni se almacenan en el navegador.</span></div></div><div className="grid gap-5 2xl:grid-cols-2 2xl:items-start"><IntegrationCard icon={Globe2} iconClass="bg-blue-50 text-blue-600" title="Gmail" description="Conexión real mediante OAuth 2.0." connected={Boolean(gmailStatus?.connected)} onToggle={() => void handleGmail()}><div className="grid gap-4 sm:grid-cols-2"><SettingField label="Cuenta asociada" value={gmailStatus?.email ?? 'No conectada'} /><SettingField label="Estado" value={gmailStatus?.connected ? 'OAuth activo · Gmail API' : 'Esperando autorización'} /></div></IntegrationCard><IntegrationCard icon={Gem} iconClass="bg-violet-50 text-violet-600" title="Gemini" description="Guarda tu API key y activa la extracción desde esta pantalla." connected={Boolean(geminiStatus?.enabled)} onToggle={() => void (geminiStatus?.enabled ? disableGemini() : saveGemini())}><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">API key de Gemini</span><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} className="input" placeholder={geminiStatus?.maskedKey ?? 'Pega aquí tu API key'} autoComplete="new-password" /></label><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Modelo</span><select value={model} onChange={(event) => setModel(event.target.value)} className="input"><option value="gemini-3.5-flash-lite">Gemini 3.5 Flash Lite</option><option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite · respaldo</option><option value="gemini-3.8-flash">Gemini 3.8 Flash · documentos complejos</option></select></label></div><div className="mt-4 flex flex-wrap items-center gap-2"><button onClick={() => void saveGemini()} className="btn-primary"><Check size={14} />Guardar y activar</button><button onClick={() => void disableGemini()} className="btn-soft" disabled={!geminiStatus?.configured}><X size={14} />Desactivar</button>{geminiStatus?.configured && <span className="text-xs text-slate-500">Key guardada: {geminiStatus.maskedKey}</span>}</div></IntegrationCard></div><div className="mt-5 grid gap-4 sm:grid-cols-2"><SmallSetting icon={ShieldCheck} title="Privacidad" description="Key protegida en el servidor" /><SmallSetting icon={Sparkles} title="Modelo activo" description={geminiStatus?.model ?? model} /><div className="sm:col-span-2"><SmallSetting icon={Code2} title="API FastAPI" description="Configuración persistente" /></div></div></>,
+    savedata: <section className="panel p-5 sm:p-6" aria-labelledby="titulo-config-savedata"><div className="mb-5 flex items-start gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600"><Send size={19} /></div><div><h3 id="titulo-config-savedata" className="font-display text-base font-bold text-ink">SaveData</h3><p className="mt-1 text-xs text-slate-500">Envío de extracciones revisadas. La URL se define en el backend con SAVEDATA_URL; el navegador nunca la llama directamente.</p></div></div><div className="grid gap-4 sm:grid-cols-2"><label><span className="mb-1.5 block text-[11px] font-bold text-slate-500">Sucursal predeterminada</span><input type="text" inputMode="numeric" value={sucursalPredeterminada} onChange={(event) => setSucursalPredeterminada(event.target.value)} className="input" placeholder="Ej. 3102" /></label><SettingField label="URL de SaveData" value={savedata ? savedata.url ?? 'Sin configurar (SAVEDATA_URL)' : 'Consultando…'} /></div><div className="mt-4"><button type="button" onClick={() => void guardarSucursal()} className="btn-primary"><Check size={14} />Guardar sucursal</button></div></section>,
+    'tipos-documento': gmailConectado ? <TarjetaCamposConfigurados onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} /> : sinGmail ? avisoSinGmail : null,
+    automatizacion: gmailConectado ? <TarjetaExtraccionAutomatica onNotice={(texto) => { setNotice(texto); setError(null) }} onError={setError} /> : sinGmail ? avisoSinGmail : null,
+  }
+  return <><PageHeading eyebrow="Integraciones y preferencias" title="Configuración" description="Administra Gmail y Gemini desde Nexora sin editar el archivo .env."><span className="flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700"><ShieldCheck size={14} />Configuración en backend</span></PageHeading>{error && <ErrorNotice text={error} onClose={() => setError(null)} />}{notice && <Notice text={notice} onClose={() => setNotice(null)} />}<div className="xl:grid xl:grid-cols-[260px_minmax(0,1fr)] xl:items-start xl:gap-8">
+    <MenuSeccionesConfig indicadores={indicadores} />
+    <div className="min-w-0">{SECCIONES_CONFIG.map((item) => (
+      // Las secciones no se desmontan al cambiar: se ocultan, para conservar lo escrito y las consultas de cada tarjeta.
+      <section key={item.id} hidden={item.id !== activa.id} aria-labelledby={`titulo-seccion-${item.id}`}>
+        <div className="mb-5"><h3 id={`titulo-seccion-${item.id}`} className="font-display text-xl font-bold tracking-tight text-ink">{item.label}</h3><p className="mt-1 text-sm text-slate-500">{item.detalle}</p></div>
+        {contenido[item.id]}
+      </section>
+    ))}</div>
+  </div></>
+}
+
+type SeccionConfig = 'conexiones' | 'savedata' | 'tipos-documento' | 'automatizacion'
+type IndicadorSeccion = { ok: boolean | null; texto: string }
+const SECCIONES_CONFIG: { id: SeccionConfig; label: string; descripcion: string; detalle: string; icon: Icon }[] = [
+  { id: 'conexiones', label: 'Conexiones', descripcion: 'Gmail y Gemini', detalle: 'Cuentas y servicios que Nexora usa para leer los correos y extraer los datos.', icon: Plug },
+  { id: 'savedata', label: 'SaveData', descripcion: 'URL y sucursal predeterminada', detalle: 'Destino de las extracciones revisadas.', icon: Send },
+  { id: 'tipos-documento', label: 'Tipos de documento', descripcion: 'Campos que se capturan', detalle: 'Qué datos se capturan de cada estado de cuenta.', icon: FileStack },
+  { id: 'automatizacion', label: 'Automatización', descripcion: 'Extracción y envío automáticos', detalle: 'Extracción y envío automáticos, estado del proceso, último ciclo, avisos y descartados.', icon: Workflow },
+]
+
+/** Menú de secciones de Configuración: columna a la izquierda en pantallas anchas; pestañas desplazables arriba en angostas. */
+function MenuSeccionesConfig({ indicadores }: { indicadores: Record<SeccionConfig, IndicadorSeccion | null> }) {
+  return <nav aria-label="Secciones de configuración" className="-mx-5 mb-6 overflow-x-auto px-5 pb-1 sm:-mx-8 sm:px-8 xl:sticky xl:top-6 xl:mx-0 xl:mb-0 xl:overflow-visible xl:px-0 xl:pb-0">
+    <ul className="flex gap-2 xl:flex-col xl:gap-1">{SECCIONES_CONFIG.map(({ id, label, descripcion, icon: SeccionIcon }) => {
+      const indicador = indicadores[id]
+      return <li key={id} className="shrink-0">
+        <NavLink to={`/configuracion/${id}`} className={({ isActive }) => `group flex items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition ${isActive ? 'border-coral/30 bg-white shadow-sm' : 'border-transparent hover:border-slate-200 hover:bg-white/70'}`}>
+          {({ isActive }) => <>
+            <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg transition ${isActive ? 'bg-coral text-white shadow-md shadow-coral/20' : 'bg-slate-100 text-slate-500 group-hover:text-ink'}`}><SeccionIcon size={17} /></span>
+            <span className="min-w-0 xl:flex-1"><span className={`block whitespace-nowrap text-[13px] font-bold ${isActive ? 'text-ink' : 'text-slate-600'}`}>{label}</span><span className="hidden text-[11px] leading-4 text-slate-400 xl:block">{descripcion}</span></span>
+            {indicador && <span data-testid={`indicador-${id}`} data-estado={indicador.ok === null ? 'consultando' : indicador.ok ? 'ok' : 'error'} title={indicador.texto} className={`ml-1 h-2 w-2 shrink-0 rounded-full ${indicador.ok === null ? 'bg-slate-300' : indicador.ok ? 'bg-emerald-500' : 'bg-red-500'}`}><span className="sr-only">{indicador.texto}</span></span>}
+          </>}
+        </NavLink>
+      </li>
+    })}</ul>
+  </nav>
 }
 
 /**
@@ -1814,7 +1884,7 @@ export function TarjetaExtraccionAutomatica({ onNotice, onError }: { onNotice: (
     if (!estado || ocupado) return
     setOcupado(true)
     try {
-      const valor = await automaticoApi.configurar(!estado.activo)
+      const valor = publicarEstadoAutomatico(await automaticoApi.configurar(!estado.activo))
       setEstado(valor)
       onNotice(valor.activo ? 'Extracción automática activada: solo se procesarán los correos que lleguen a partir de su activación.' : 'Extracción automática en pausa.')
     } catch (requestError) { onError(mensaje(requestError, 'No se pudo cambiar la extracción automática.')) } finally { setOcupado(false) }

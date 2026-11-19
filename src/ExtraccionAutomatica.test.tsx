@@ -35,6 +35,7 @@ vi.mock('./services/inboxStore', async (importOriginal) => {
 })
 
 const { ExtractionTabsWorkspace, TarjetaExtraccionAutomatica } = await import('./App')
+const { EVENTO_ESTADO_AUTOMATICO } = await import('./services/eventosAutomatico')
 
 const fila = (id: string, huella: string): Transaccion => ({ id, fecha: '02/11/2026', concepto: `PAGO ${id}`, referencia: '', cargo: '100.00', abono: '', saldo: '', origen: 'ia', dudosos: [], huella })
 const estadoBase = (cambios: Partial<EstadoAutomatico> = {}): EstadoAutomatico => ({
@@ -68,6 +69,21 @@ describe('Configuración: extracción automática', () => {
     await waitFor(() => expect(interruptor.getAttribute('aria-checked')).toBe('true'))
     expect(configurarMock).toHaveBeenCalledWith(true)
     expect(onNotice).toHaveBeenCalled()
+  })
+
+  it('al pulsar el interruptor publica el nuevo estado (campanita y punto del menú al instante)', async () => {
+    configurarMock.mockImplementation(async (activo: boolean) => ({ ...estadoAuto, activo, activado_en: '2026-11-13T09:00:00Z' }))
+    const publicados: boolean[] = []
+    const escuchar = (evento: Event) => publicados.push((evento as CustomEvent<EstadoAutomatico>).detail.activo)
+    window.addEventListener(EVENTO_ESTADO_AUTOMATICO, escuchar)
+    try {
+      render(<TarjetaExtraccionAutomatica onNotice={vi.fn()} onError={vi.fn()} />)
+      const interruptor = await screen.findByRole('switch', { name: 'Extracción automática' })
+      await waitFor(() => expect((interruptor as HTMLButtonElement).disabled).toBe(false))
+      publicados.length = 0
+      fireEvent.click(interruptor)
+      await waitFor(() => expect(publicados).toEqual([true]))
+    } finally { window.removeEventListener(EVENTO_ESTADO_AUTOMATICO, escuchar) }
   })
 
   it('"Revisar ahora" pide la revisión y nunca envía a SaveData', async () => {
