@@ -14,11 +14,11 @@ import { publicarEstadoAutomatico } from './services/eventosAutomatico'
 import { AvisosAutomatico, CampanaAvisos, ListaDescartes, ResumenUltimoCiclo } from './DiagnosticoAutomatico'
 import { plantillaCamposApi, plantillaVigente } from './services/plantillaCamposApi'
 import { agregarAPlantilla, aplicarPlantilla, CAMPOS_FIJOS, cambiarTipoEnPlantilla, errorNombrePlantilla, etiquetaAlcance, nuevoIdPlantilla, quitarDePlantilla, renombrarEnPlantilla, sugerenciasNuevas, type CampoPlantilla, type SugerenciaPlantilla } from './services/plantillaCampos'
-import { envioAutomaticoEncendido, envioAutomaticoSinEnviar, estadoDocumento, intervaloConsulta, pendienteEnvioAutomatico, textoAvisoEnvioAutomatico, textoCamposAutomaticos, textoIndicador, TEXTO_ENVIO_AUTOMATICO_CONFIG, type EstadoDocumento } from './services/estadoAutomatico'
+import { confirmacionExtraer, envioAutomaticoEncendido, envioAutomaticoSinEnviar, estadoDocumento, grupoEnvioAutomatico, intervaloConsulta, pendienteEnvioAutomatico, textoAvisoEnviadoAuto, textoAvisoEnvioAutomatico, ultimoEnvioAutomatico, type AdjuntoAExtraer, textoCamposAutomaticos, textoIndicador, TEXTO_ENVIO_AUTOMATICO_CONFIG, type EstadoDocumento } from './services/estadoAutomatico'
 import { extraccionesApi, type EstadoExtraccion, type ExtraccionGuardada, type IntentoEnvio, type ProblemasRevision } from './services/extraccionesApi'
 import { crearColaExtraccion, type ColaExtraccion } from './services/colaExtraccion'
 import { estadoPestana, leerArchivos, urlExtraccionLote, type ArchivoExtraccion, type EstadoCola, type EstadoPestana } from './services/pestanasExtraccion'
-import { esSeleccionable, LIMITE_LOTE, seleccionAdjuntos } from './services/seleccionAdjuntos'
+import { claveArchivo, esSeleccionable, LIMITE_LOTE, seleccionAdjuntos, type ArchivoSeleccionado } from './services/seleccionAdjuntos'
 import { borradoresLocales, claveBorrador, contarProblemas, documentoDesdeExtraccion, documentoDesdeGuardado, documentoVacio, ejecutarGuardado, firmaContenido, hayCambios, type BorradorLocal, type DocumentoEditable } from './services/guardado'
 import { detectarDatos } from './services/deteccionDocumento'
 import { tieneCapaDeTexto, type PaginaTexto } from './services/textoPdf'
@@ -157,18 +157,26 @@ export function FilteredGmailInboxPage() {
   const totalMarcados = seleccionAdjuntos.total()
   const alternarMarcado = (message: GmailMessage, attachment: GmailAttachment) => setAvisoLimite(seleccionAdjuntos.alternar(message.id, attachment) === 'limite')
   const limpiarSeleccion = () => { seleccionAdjuntos.limpiar(); setAvisoLimite(false) }
-  const [confirmandoExtraccion, setConfirmandoExtraccion] = useState(false)
-  const irAExtraer = () => { setConfirmandoExtraccion(false); if (totalMarcados > 0) navigate(urlExtraccionLote(seleccionAdjuntos.lista())) }
-  // Si algún marcado se enviará solo en la próxima revisión, se avisa antes de extraerlo a mano.
+  // Con el envío automático encendido, "Extraer" siempre confirma antes, según el estado de lo marcado.
+  const [confirmandoExtraccion, setConfirmandoExtraccion] = useState<{ adjuntos: (AdjuntoAExtraer & { clave: string })[] } | null>(null)
+  const abrirEnLote = (archivos: ArchivoSeleccionado[]) => { setConfirmandoExtraccion(null); if (archivos.length > 0) navigate(urlExtraccionLote(archivos)) }
+  const irAExtraer = () => abrirEnLote(seleccionAdjuntos.lista())
+  const abrirSinPendientes = () => {
+    const pendientes = (confirmandoExtraccion?.adjuntos ?? []).filter((adjunto) => adjunto.grupo === 'pendiente').map((adjunto) => adjunto.clave)
+    const resto = seleccionAdjuntos.lista().filter((archivo) => !pendientes.includes(claveArchivo(archivo.messageId, archivo.partId)))
+    if (resto.length === 0) { setConfirmandoExtraccion(null); return }
+    seleccionAdjuntos.quitar(pendientes)
+    abrirEnLote(resto)
+  }
   const extraerMarcados = () => {
     if (totalMarcados === 0) return
-    const pendientes = seleccionAdjuntos.lista().some((archivo) => {
+    if (!envioAutomaticoEncendido(automatico)) { irAExtraer(); return }
+    setConfirmandoExtraccion({ adjuntos: seleccionAdjuntos.lista().map((archivo) => {
       const mensaje = messages.find((message) => message.id === archivo.messageId)
-      return Boolean(mensaje) && pendienteEnvioAutomatico(automatico, estadosExtraccion[claveEstado(archivo.messageId, archivo.partId)], archivo.messageId, archivo.partId, mensaje?.receivedAt)
-    })
-    if (pendientes) setConfirmandoExtraccion(true)
-    else irAExtraer()
+      return { clave: claveArchivo(archivo.messageId, archivo.partId), ...grupoEnvioAutomatico(automatico, estadosExtraccion[claveEstado(archivo.messageId, archivo.partId)], archivo.messageId, archivo.partId, mensaje?.receivedAt) }
+    }) })
   }
+  const confirmacion = confirmandoExtraccion ? confirmacionExtraer(confirmandoExtraccion.adjuntos) : null
 
   const setFolder = (nextFolder: MailFolder) => {
     inboxStore.setLastFolder(nextFolder)
@@ -281,7 +289,11 @@ export function FilteredGmailInboxPage() {
           <button type="button" className="btn-primary px-3 py-2" onClick={extraerMarcados} disabled={totalMarcados === 0}><Sparkles size={15} />{totalMarcados > 0 ? `Extraer (${totalMarcados})` : 'Extraer'}</button>
         </div>
       </div>
-      {confirmandoExtraccion && <div role="alertdialog" aria-labelledby="confirmar-extraer-pendientes" className="mb-6 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900"><div id="confirmar-extraer-pendientes" className="leading-5">Estos documentos se enviarán solos en la próxima revisión. Si los extraes ahora, ya no se enviarán automáticamente y tendrás que enviarlos a mano. ¿Continuar?</div><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={() => setConfirmandoExtraccion(false)} className="btn-primary px-3 py-1.5 text-xs">Esperar al envío automático</button><button type="button" onClick={irAExtraer} className="btn-soft px-3 py-1.5 text-xs">Extraer de todos modos</button></div></div>}
+      {confirmacion && <div role="alertdialog" aria-labelledby="confirmar-extraer" className="mb-6 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900"><div id="confirmar-extraer" className={`leading-5 ${confirmacion.lineas.length > 0 ? 'font-bold' : ''}`}>{confirmacion.texto}</div>{confirmacion.lineas.length > 0 && <ul className="mt-1 space-y-0.5 leading-5">{confirmacion.lineas.map((linea) => <li key={linea}>{linea}</li>)}</ul>}<div className="mt-2.5 flex flex-wrap gap-2">
+        {confirmacion.tipo === 'pendiente' && <><button type="button" onClick={() => setConfirmandoExtraccion(null)} className="btn-primary px-3 py-1.5 text-xs">Esperar al envío automático</button><button type="button" onClick={irAExtraer} className="btn-soft px-3 py-1.5 text-xs">Extraer de todos modos</button></>}
+        {confirmacion.tipo === 'mixto_con_pendientes' && <><button type="button" onClick={() => setConfirmandoExtraccion(null)} className="btn-soft px-3 py-1.5 text-xs">Cancelar</button><button type="button" onClick={abrirSinPendientes} className="btn-primary px-3 py-1.5 text-xs">Abrir sin los pendientes</button><button type="button" onClick={irAExtraer} className="btn-soft px-3 py-1.5 text-xs">Continuar con todos</button></>}
+        {(confirmacion.tipo === 'enviado_auto' || confirmacion.tipo === 'manual' || confirmacion.tipo === 'mixto') && <><button type="button" onClick={() => setConfirmandoExtraccion(null)} className="btn-soft px-3 py-1.5 text-xs">Cancelar</button><button type="button" onClick={irAExtraer} className="btn-primary px-3 py-1.5 text-xs">{confirmacion.tipo === 'enviado_auto' ? 'Abrir en modo manual' : 'Continuar en modo manual'}</button></>}
+      </div></div>}
       <div className="panel grid min-h-[580px] grid-cols-1 overflow-hidden lg:grid-cols-[255px_minmax(350px,1fr)_minmax(390px,1.1fr)]">
         <GmailFoldersReadOnly folder={folder} setFolder={setFolder} status={status} />
         <EmailMessageList messages={messages} selected={visibleSelected} loading={loading} folder={folder} estadoCorreo={estadoCorreo} marcadosEn={(message) => seleccionAdjuntos.contarEnCorreo(message.id)} onSelect={setSelected} puedeCargarMas={Boolean(listado?.nextPageToken)} cargandoMas={cargandoMas} onCargarMas={() => void cargarMas()} />
@@ -1131,6 +1143,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const puedeExtraer = cargaLista && !extracting && !colaActiva && !confirmandoReextraccion && geminiStatus?.enabled === true
   const estadoVisible = versionGuardada ? etiquetaEstado[versionGuardada.estado] : 'Sin guardar'
   const ultimoEnvioExitoso = versionGuardada?.envios.filter((intento) => intento.accion !== 'eliminar' && intento.resultado === 'exito').slice(-1)[0]
+  const envioAuto = envioAutomaticoEncendido(estadoAuto) && versionGuardada ? ultimoEnvioAutomatico(versionGuardada.envios) : null
   const modificadoTrasEnvio = Boolean(ultimoEnvioExitoso) && (sinGuardar || (versionGuardada?.version ?? 0) > (ultimoEnvioExitoso?.version_extraccion ?? 0))
 
   return <div className="space-y-4">
@@ -1150,6 +1163,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
           <button type="button" onClick={marcarRevisado} disabled={!puedeGuardar || transactions.length === 0 || (versionGuardada !== null && versionGuardada.estado !== 'borrador' && !sinGuardar)} className="btn-primary px-3 py-2"><FileCheck2 size={14} />Marcar como revisado</button>
         </div>
       </div>
+      {envioAuto && <div role="status" className="mt-3 rounded-lg border border-violet-200 bg-violet-50 px-3 py-2.5 text-xs font-medium text-violet-800">{textoAvisoEnviadoAuto(envioAuto)}</div>}
       {!partId && <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">Este enlace no identifica el adjunto de forma estable, así que no se puede guardar. Vuelve a abrir el documento desde Correos.</div>}
       {mode === 'gemini' && !geminiStatus?.enabled && <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">{geminiError ?? 'Consultando disponibilidad de Gemini en FastAPI. La extracción no generará datos hasta que esté habilitado.'}</div>}
       {geminiError && geminiStatus?.enabled === true && <div className="mt-3"><ErrorNotice text={geminiError} onClose={() => setGeminiError(null)} /></div>}

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { AdjuntoAutomatico, EstadoAutomatico } from './automaticoApi'
 import type { EntradaListado } from './extraccionesApi'
-import { envioAutomaticoEncendido, envioAutomaticoSinEnviar, estadoDocumento, pendienteEnvioAutomatico, textoAvisoEnvioAutomatico, textoCamposAutomaticos, textoIndicador } from './estadoAutomatico'
+import { confirmacionExtraer, envioAutomaticoEncendido, envioAutomaticoSinEnviar, estadoDocumento, fechaHoraEnvio, grupoEnvioAutomatico, pendienteEnvioAutomatico, respuestaSaveData, textoAvisoEnviadoAuto, textoAvisoEnvioAutomatico, textoCamposAutomaticos, textoIndicador, ultimoEnvioAutomatico, type AdjuntoAExtraer } from './estadoAutomatico'
 
 const guardado = (cambios: Partial<EntradaListado> = {}): EntradaListado => ({ messageId: 'm1', partId: '1', filename: 'e.pdf', estado: 'borrador', version: 1, actualizado: '2026-11-13T10:00:00Z', cuadra: true, problemas: 0, ...cambios })
 const auto = (cambios: Partial<AdjuntoAutomatico> = {}): AdjuntoAutomatico => ({ estado: 'extraido', intentos: 1, error: null, version: 1, actualizado: null, ...cambios })
@@ -106,5 +106,59 @@ describe('avisos del envío automático', () => {
     expect(envioAutomaticoSinEnviar(conEnvio({ estado: 'enviado', intentos: 1, error: null, motivos: null, problemas: null, version: 2, actualizado: null }), 'm1', '1', 2)).toBe(false)
     expect(envioAutomaticoSinEnviar(encendido({ adjuntos: { m1__1: auto({ enviar_auto: false }) } }), 'm1', '1', 1)).toBe(false)
     expect(envioAutomaticoSinEnviar(proceso({ adjuntos: { m1__1: auto({ enviar_auto: true }) } }), 'm1', '1', 1)).toBe(false)
+  })
+})
+
+describe('confirmación al extraer a mano con el envío automático encendido', () => {
+  const encendido = (cambios: Partial<EstadoAutomatico> = {}) => proceso({ envio_activo: true, ...cambios })
+  const enviado = auto({ enviar_auto: true, envio: { estado: 'enviado', intentos: 1, error: null, motivos: null, problemas: null, version: 2, actualizado: '2026-11-13T09:50:00Z' } })
+  const p: AdjuntoAExtraer = { grupo: 'pendiente', enviadoEn: null }
+  const e = (enviadoEn = '2026-11-13T09:50:00Z'): AdjuntoAExtraer => ({ grupo: 'enviado_auto', enviadoEn })
+  const m: AdjuntoAExtraer = { grupo: 'manual', enviadoEn: null }
+
+  it('clasifica cada adjunto: ya enviado, pendiente o manual', () => {
+    expect(grupoEnvioAutomatico(encendido({ adjuntos: { m1__1: enviado } }), guardado(), 'm1', '1', '2026-11-13T09:30:00Z')).toEqual({ grupo: 'enviado_auto', enviadoEn: '2026-11-13T09:50:00Z' })
+    expect(grupoEnvioAutomatico(encendido(), undefined, 'm1', '1', '2026-11-13T09:30:00Z').grupo).toBe('pendiente')
+    expect(grupoEnvioAutomatico(encendido(), undefined, 'm1', '1', '2026-11-13T08:00:00Z').grupo).toBe('manual')
+    expect(grupoEnvioAutomatico(encendido(), guardado(), 'm1', '1', '2026-11-13T09:30:00Z').grupo).toBe('manual')
+    expect(grupoEnvioAutomatico(encendido({ adjuntos: { m1__1: auto({ estado: 'error', version: null }) } }), undefined, 'm1', '1', '2026-11-13T09:30:00Z').grupo).toBe('manual')
+    const requiere = auto({ enviar_auto: true, envio: { estado: 'requiere_revision', intentos: 1, error: null, motivos: [], problemas: [], version: 1, actualizado: null } })
+    expect(grupoEnvioAutomatico(encendido({ adjuntos: { m1__1: requiere } }), guardado(), 'm1', '1', '2026-11-13T09:30:00Z').grupo).toBe('manual')
+  })
+
+  it('un solo grupo: texto propio, en singular o plural', () => {
+    expect(confirmacionExtraer([p])).toMatchObject({ tipo: 'pendiente', texto: expect.stringContaining('Estos documentos se enviarán solos') })
+    expect(confirmacionExtraer([e()]).texto).toBe(`Este documento ya se envió automáticamente a SaveData el ${fechaHoraEnvio('2026-11-13T09:50:00Z')}. Vas a abrirlo en modo manual: si cambias algo, tendrás que reenviarlo a mano como actualización. ¿Continuar?`)
+    expect(confirmacionExtraer([e('2026-11-13T09:10:00Z'), e()]).texto).toContain(`Estos 2 documentos ya se enviaron automáticamente a SaveData (el último el ${fechaHoraEnvio('2026-11-13T09:50:00Z')})`)
+    expect(confirmacionExtraer([m])).toEqual({ tipo: 'manual', texto: 'Vas a trabajar este documento en modo manual. Recuerda enviarlo a SaveData a mano cuando termines. ¿Continuar?', lineas: [] })
+    expect(confirmacionExtraer([m, m]).texto).toBe('Vas a trabajar estos 2 documentos en modo manual. Recuerda enviarlos a SaveData a mano cuando termines. ¿Continuar?')
+  })
+
+  it('mixto: una línea resumen y una por grupo; con pendientes cambia de botones', () => {
+    const conPendientes = confirmacionExtraer([p, e(), m, m])
+    expect(conPendientes.tipo).toBe('mixto_con_pendientes')
+    expect(conPendientes.texto).toBe('1 se enviará solo · 1 ya se envió automáticamente · 2 son manuales')
+    expect(conPendientes.lineas).toHaveLength(4)
+    const sinPendientes = confirmacionExtraer([e(), e(), m])
+    expect(sinPendientes.tipo).toBe('mixto')
+    expect(sinPendientes.texto).toBe('2 ya se enviaron automáticamente · 1 es manual')
+    expect(confirmacionExtraer([p, p, m]).texto).toBe('2 se enviarán solos · 1 es manual')
+  })
+
+  it('lee message y code de la respuesta de SaveData', () => {
+    expect(respuestaSaveData('{"code":200,"message":"Exito"}')).toEqual({ message: 'Exito', code: '200' })
+    expect(respuestaSaveData('{"code":200}')).toEqual({ message: null, code: '200' })
+    expect(respuestaSaveData('no es json')).toBeNull()
+    expect(respuestaSaveData('[1]')).toBeNull()
+    expect(respuestaSaveData(null)).toBeNull()
+  })
+
+  it('aviso fijo: último envío automático exitoso con su respuesta', () => {
+    const base = { iniciado_en: '2026-11-13T09:49:00Z', terminado_en: '2026-11-13T09:50:00Z', respuesta: '{"code":200,"message":"Exito"}' }
+    const envios = [{ ...base, resultado: 'exito', automatico: true }, { ...base, resultado: 'exito', automatico: false }, { ...base, resultado: 'error', automatico: true }]
+    expect(ultimoEnvioAutomatico(envios)).toBe(envios[0])
+    expect(ultimoEnvioAutomatico([envios[1]])).toBeNull()
+    expect(textoAvisoEnviadoAuto(envios[0])).toBe(`Enviado automáticamente a SaveData el ${fechaHoraEnvio('2026-11-13T09:50:00Z')} · respuesta: Exito (code 200). Si lo modificas, reenvíalo a mano como actualización.`)
+    expect(textoAvisoEnviadoAuto({ ...base, resultado: 'exito', respuesta: 'texto' })).toContain('respuesta: sin mensaje (code —)')
   })
 })

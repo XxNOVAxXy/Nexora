@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { createMemoryRouter, MemoryRouter, Route, Routes, RouterProvider, useLocation } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AdjuntoAutomatico, EstadoAutomatico } from './services/automaticoApi'
-import type { ExtraccionGuardada } from './services/extraccionesApi'
+import type { ExtraccionGuardada, IntentoEnvio } from './services/extraccionesApi'
 import type { GmailMessage } from './services/gmailApi'
 import type { ArchivoExtraccion } from './services/pestanasExtraccion'
 import type { Transaccion } from './types'
@@ -38,6 +38,7 @@ vi.mock('./services/inboxStore', async (importOriginal) => {
 
 const { FilteredGmailInboxPage, TarjetaExtraccionAutomatica, ExtractionTabsWorkspace } = await import('./App')
 const { seleccionAdjuntos } = await import('./services/seleccionAdjuntos')
+const { fechaHoraEnvio } = await import('./services/estadoAutomatico')
 
 const estadoBase = (cambios: Partial<EstadoAutomatico> = {}): EstadoAutomatico => ({
   activo: true, activado_en: '2026-11-13T09:00:00Z', ultima_revision: '2026-11-13T09:24:00Z', proxima_revision: '2026-11-13T09:44:00Z', en_curso: false, intervalo_minutos: 20,
@@ -86,7 +87,7 @@ describe('Configuración: aviso del envío automático', () => {
 })
 
 describe('Correos: avisos y confirmación del envío automático', () => {
-  const Ruta = () => <div data-testid="ruta">{useLocation().pathname}</div>
+  const Ruta = () => { const ubicacion = useLocation(); return <><div data-testid="ruta">{ubicacion.pathname}</div><div data-testid="busqueda">{ubicacion.search}</div></> }
   const pintar = () => {
     render(<MemoryRouter initialEntries={['/emails']}><Ruta /><Routes><Route path="/emails" element={<FilteredGmailInboxPage />} /><Route path="/extraction" element={<div>Página de extracción</div>} /></Routes></MemoryRouter>)
     return { state: { get location() { return { pathname: screen.getByTestId('ruta').textContent } } } }
@@ -142,6 +143,107 @@ describe('Correos: avisos y confirmación del envío automático', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Extraer de todos modos' }))
     await waitFor(() => expect(router.state.location.pathname).toBe('/extraction'))
   })
+
+  const ENVIADO_EN = '2026-11-13T09:50:00Z'
+  const enviadoAuto = (): AdjuntoAutomatico => ({ estado: 'extraido', intentos: 1, error: null, version: 1, actualizado: null, enviar_auto: true,
+    envio: { estado: 'enviado', intentos: 1, error: null, motivos: null, problemas: null, version: 2, actualizado: ENVIADO_EN } })
+  const marcar = (...ids: string[]) => { for (const id of ids) seleccionAdjuntos.alternar(id, correo(id, '2026-11-13T09:30:00Z').attachments[0]) }
+  const documentosAbiertos = () => new URLSearchParams(screen.getByTestId('busqueda').textContent ?? '').getAll('doc').map((doc) => (JSON.parse(doc) as string[])[0])
+
+  it('adjunto ya enviado automáticamente: confirma con la fecha; Cancelar no navega y "Abrir en modo manual" sí', async () => {
+    mensajes = [correo('env', '2026-11-13T09:30:00Z')]
+    estadoAuto = estadoBase({ adjuntos: { env__1: enviadoAuto() } })
+    const router = pintar()
+    await screen.findByText(/Envío automático activo/)
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Marcar env.pdf para extraer' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Extraer (1)' }))
+    const dialogo = await screen.findByRole('alertdialog')
+    expect(dialogo.textContent).toContain(`Este documento ya se envió automáticamente a SaveData el ${fechaHoraEnvio(ENVIADO_EN)}. Vas a abrirlo en modo manual: si cambias algo, tendrás que reenviarlo a mano como actualización. ¿Continuar?`)
+    fireEvent.click(screen.getByRole('button', { name: 'Cancelar' }))
+    expect(screen.queryByRole('alertdialog')).toBeNull()
+    expect(router.state.location.pathname).toBe('/emails')
+    expect(seleccionAdjuntos.total()).toBe(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Extraer (1)' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Abrir en modo manual' }))
+    await waitFor(() => expect(router.state.location.pathname).toBe('/extraction'))
+  })
+
+  it('adjunto manual (anterior a la activación o con error): confirma que se trabaja en modo manual', async () => {
+    mensajes = [correo('viejo', '2026-11-13T08:00:00Z')]
+    const router = pintar()
+    await screen.findByText(/Envío automático activo/)
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Marcar viejo.pdf para extraer' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Extraer (1)' }))
+    expect((await screen.findByRole('alertdialog')).textContent).toContain('Vas a trabajar este documento en modo manual. Recuerda enviarlo a SaveData a mano cuando termines. ¿Continuar?')
+    fireEvent.click(screen.getByRole('button', { name: 'Continuar en modo manual' }))
+    await waitFor(() => expect(router.state.location.pathname).toBe('/extraction'))
+    cleanup()
+    seleccionAdjuntos.limpiar()
+    mensajes = [correo('fallo', '2026-11-13T09:30:00Z')]
+    estadoAuto = estadoBase({ adjuntos: { fallo__1: { estado: 'error', intentos: 3, error: 'x', version: null, actualizado: null } } })
+    pintar()
+    await screen.findByText(/Envío automático activo/)
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Marcar fallo.pdf para extraer' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Extraer (1)' }))
+    expect((await screen.findByRole('alertdialog')).textContent).toContain('Vas a trabajar este documento en modo manual.')
+  })
+
+  it('selección mixta sin pendientes: un solo aviso con una línea por grupo y "Continuar en modo manual"', async () => {
+    mensajes = [correo('env', '2026-11-13T09:30:00Z'), correo('viejo1', '2026-11-13T08:00:00Z'), correo('viejo2', '2026-11-13T08:10:00Z')]
+    estadoAuto = estadoBase({ adjuntos: { env__1: enviadoAuto() } })
+    marcar('env', 'viejo1', 'viejo2')
+    pintar()
+    await screen.findByText(/Envío automático activo/)
+    fireEvent.click(await screen.findByRole('button', { name: 'Extraer (3)' }))
+    expect(screen.getAllByRole('alertdialog')).toHaveLength(1)
+    const dialogo = screen.getByRole('alertdialog')
+    expect(dialogo.textContent).toContain('1 ya se envió automáticamente · 2 son manuales')
+    expect(dialogo.textContent).toContain('Los ya enviados se abrirán en modo manual')
+    expect(dialogo.textContent).toContain('Los manuales tendrás que enviarlos a SaveData a mano cuando termines.')
+    expect(screen.getByRole('button', { name: 'Continuar en modo manual' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Abrir sin los pendientes' })).toBeNull()
+  })
+
+  it('selección mixta con pendientes: tres botones; "Abrir sin los pendientes" quita los pendientes y abre el resto', async () => {
+    mensajes = [correo('nuevo', '2026-11-13T09:30:00Z'), correo('env', '2026-11-13T09:31:00Z'), correo('viejo', '2026-11-13T08:00:00Z')]
+    estadoAuto = estadoBase({ adjuntos: { env__1: enviadoAuto() } })
+    marcar('nuevo', 'env', 'viejo')
+    const router = pintar()
+    await screen.findByText(/Envío automático activo/)
+    fireEvent.click(await screen.findByRole('button', { name: 'Extraer (3)' }))
+    const dialogo = await screen.findByRole('alertdialog')
+    expect(dialogo.textContent).toContain('1 se enviará solo · 1 ya se envió automáticamente · 1 es manual')
+    expect(screen.getByRole('button', { name: 'Cancelar' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Continuar con todos' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Abrir sin los pendientes' }))
+    await waitFor(() => expect(router.state.location.pathname).toBe('/extraction'))
+    expect(documentosAbiertos()).toEqual(['env', 'viejo'])
+    expect(seleccionAdjuntos.estaMarcado('nuevo', '1')).toBe(false)
+    expect(seleccionAdjuntos.total()).toBe(2)
+  })
+
+  it('si todos son pendientes se usa el aviso de pendientes, sin "Abrir sin los pendientes"', async () => {
+    mensajes = [correo('nuevo', '2026-11-13T09:30:00Z'), correo('nuevo2', '2026-11-13T09:31:00Z')]
+    marcar('nuevo', 'nuevo2')
+    const router = pintar()
+    await screen.findByText(/Envío automático activo/)
+    fireEvent.click(await screen.findByRole('button', { name: 'Extraer (2)' }))
+    // Todos pendientes: es el aviso de pendientes (no el mixto).
+    expect(screen.queryByRole('button', { name: 'Abrir sin los pendientes' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Esperar al envío automático' })).toBeTruthy()
+    expect(router.state.location.pathname).toBe('/emails')
+  })
+
+  it('"Continuar con todos" abre también los pendientes', async () => {
+    mensajes = [correo('nuevo', '2026-11-13T09:30:00Z'), correo('viejo', '2026-11-13T08:00:00Z')]
+    marcar('nuevo', 'viejo')
+    const router = pintar()
+    await screen.findByText(/Envío automático activo/)
+    fireEvent.click(await screen.findByRole('button', { name: 'Extraer (2)' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Continuar con todos' }))
+    await waitFor(() => expect(router.state.location.pathname).toBe('/extraction'))
+    expect(documentosAbiertos()).toEqual(['nuevo', 'viejo'])
+  })
 })
 
 describe('Extracción: confirmación al guardar un documento pendiente de envío automático', () => {
@@ -194,5 +296,49 @@ describe('Extracción: confirmación al guardar un documento pendiente de envío
     fireEvent.click(await pintar())
     await waitFor(() => expect(siguioAdelante()).toBe(true))
     expect(screen.queryByText(TEXTO)).toBeNull()
+  })
+})
+
+describe('Extracción: aviso fijo de un documento enviado automáticamente', () => {
+  const intento = (cambios: Partial<IntentoEnvio> = {}): IntentoEnvio => ({
+    id: 'i1', accion: 'enviar', iniciado_en: '2026-11-13T09:49:59Z', terminado_en: '2026-11-13T09:50:00Z', resultado: 'exito', url: 'https://savedata.example/api', cuerpo: '{}',
+    http_status: 200, respuesta: '{"code":200,"message":"Registro guardado"}', error: null, sucursal: 1, articulo: 'A', carga_inicial: false, totales: null,
+    version_extraccion: 2, reenvio: false, automatico: true, ...cambios,
+  })
+  const pintar = (envios: IntentoEnvio[]) => {
+    guardado = {
+      schema: 1, messageId: 'm-a', partId: 'a', attachmentId: 'att-a', filename: 'estado.png', estado: 'enviado', version: 2, creado: '2026-11-13T09:40:00Z', actualizado: '2026-11-13T09:50:00Z',
+      revisado_en: '2026-11-13T09:49:00Z', revisado_con_problemas: false, enviado_en: '2026-11-13T09:50:00Z', envios, modelo: 'gemini-prueba', prompt_version: 'v', formato_numerico: 'us',
+      resumen: { banco: 'BANCO', titular: '', cuenta: '', periodo: '', moneda: 'MXN', saldo_inicial: '', total_cargos: '', total_abonos: '', saldo_final: '', dudosos: [] },
+      transacciones: [], campos_extra: [], sugerencias_campos: [],
+      validacion: {} as ExtraccionGuardada['validacion'], problemas: {} as ExtraccionGuardada['problemas'],
+    }
+    const archivo: ArchivoExtraccion = { clave: 'm-a:a', messageId: 'm-a', attachmentId: 'att-a', partId: 'a', filename: 'estado.png' }
+    const router = createMemoryRouter([{ path: '*', element: <ExtractionTabsWorkspace archivos={[archivo]} lote={false} mode="gemini" onModeChange={() => undefined} /> }], { initialEntries: ['/extraction'] })
+    render(<RouterProvider router={router} />)
+  }
+  const esperarCarga = async () => {
+    await screen.findByText('Historial de envíos')
+    await waitFor(() => expect(estadoMock).toHaveBeenCalled())
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+
+  it('muestra fecha, message y code de la respuesta de SaveData', async () => {
+    pintar([intento()])
+    const texto = `Enviado automáticamente a SaveData el ${fechaHoraEnvio('2026-11-13T09:50:00Z')} · respuesta: Registro guardado (code 200). Si lo modificas, reenvíalo a mano como actualización.`
+    expect(await screen.findByText(texto)).toBeTruthy()
+  })
+
+  it('no se muestra con el envío automático apagado', async () => {
+    estadoAuto = estadoBase({ envio_activo: false })
+    pintar([intento()])
+    await esperarCarga()
+    expect(screen.queryByText(/Enviado automáticamente a SaveData el/)).toBeNull()
+  })
+
+  it('no se muestra si el envío fue manual', async () => {
+    pintar([intento({ automatico: false })])
+    await esperarCarga()
+    expect(screen.queryByText(/Enviado automáticamente a SaveData el/)).toBeNull()
   })
 })

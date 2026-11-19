@@ -48,6 +48,12 @@ export function crearSeleccion(limite = LIMITE_LOTE) {
     contarEnCorreo: (messageId: string) => [...marcados.values()].filter((archivo) => archivo.messageId === messageId).length,
     total: () => marcados.size,
     lista: (): ArchivoSeleccionado[] => [...marcados.values()],
+    /** Desmarca varios adjuntos a la vez (por `claveArchivo`). */
+    quitar(claves: string[]) {
+      let cambio = false
+      for (const clave of claves) cambio = marcados.delete(clave) || cambio
+      if (cambio) notificar()
+    },
     limpiar() {
       if (marcados.size === 0) return
       marcados.clear()
