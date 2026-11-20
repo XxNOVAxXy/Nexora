@@ -74,6 +74,8 @@ export type UltimoCiclo = {
   ya_revisados: number
   descartes: DescarteCiclo[]
   descartes_total: number
+  /** "Se enviaron 2 (1 Fianzas, 1 Autos individuales) · 1 requiere revisión (Gastos médicos mayores)". */
+  texto_envios?: string | null
 }
 
 export type TipoAviso = 'enviado' | 'requiere_revision' | 'error' | 'incierto' | 'error_ciclo'

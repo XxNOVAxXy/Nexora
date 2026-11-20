@@ -349,9 +349,9 @@ class CuerpoSinSucursalNiArticulo(BaseEnvio):
         captura: dict[str, str] = {}
         original = self.extractor.envios.enviar
 
-        def antes_de_enviar(email: str, message_id: str, part_id: str, solicitud: Any) -> Any:
+        def antes_de_enviar(email: str, message_id: str, part_id: str, solicitud: Any, **opciones: Any) -> Any:
             captura["vista"] = self.extractor.envios.vista_previa(email, message_id, part_id, sucursal=3102, articulo="10000453", carga_inicial=False)["cuerpo"]
-            return original(email, message_id, part_id, solicitud)
+            return original(email, message_id, part_id, solicitud, **opciones)
         with patch.object(self.extractor.envios, "enviar", side_effect=antes_de_enviar):
             self.extractor.ejecutar_ciclo()
         self.assertEqual(self.savedata.recibidos, [captura["vista"]])

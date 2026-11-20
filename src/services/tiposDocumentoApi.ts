@@ -34,6 +34,46 @@ export type TipoDocumento = {
   sugerencias_estructura?: SugerenciaEstructura[]
   /** Campos del tipo que salieron vacíos en los últimos documentos seguidos de una aseguradora. */
   campos_ausentes?: CampoAusente[]
+  /** Últimos 30 días: recibidos, enviados (por origen), pendientes, no enviados y con error. */
+  resumen_envios?: ResumenEnvios
+}
+
+export type ResumenEnvios = { dias: number; recibidos: number; enviados_automatico: number; enviados_configurar: number; enviados_manual: number; pendientes: number; no_enviados: number; con_error: number }
+
+export type FiltroEnvio = 'todos' | 'enviados' | 'pendientes' | 'no_enviados' | 'con_error'
+
+/** Estado de envío de un documento con su etiqueta ("Enviado automáticamente", "No se envió: …") y su motivo. */
+export type EstadoEnvio = {
+  estado: 'enviado' | 'pendiente' | 'en_curso' | 'no_enviado' | 'error' | 'incierto'
+  filtro: Exclude<FiltroEnvio, 'todos'>
+  etiqueta: string
+  motivo: string | null
+  fecha: string | null
+  code: number | null
+  respuesta: string | null
+  origen: 'automatico' | 'configurar' | 'manual' | null
+}
+
+/** "Últimos 30 días: 12 recibidos · 10 enviados automáticamente · 1 pendiente · 1 requiere revisión". */
+export function textoResumenEnvios(resumen: ResumenEnvios): string {
+  const n = (valor: number, uno: string, varios: string) => `${valor} ${valor === 1 ? uno : varios}`
+  const partes = [n(resumen.recibidos, 'recibido', 'recibidos'), n(resumen.enviados_automatico, 'enviado automáticamente', 'enviados automáticamente')]
+  if (resumen.enviados_configurar) partes.push(n(resumen.enviados_configurar, 'enviado al configurar', 'enviados al configurar'))
+  if (resumen.enviados_manual) partes.push(n(resumen.enviados_manual, 'enviado a mano', 'enviados a mano'))
+  partes.push(n(resumen.pendientes, 'pendiente', 'pendientes'), n(resumen.no_enviados, 'requiere revisión', 'requieren revisión'))
+  if (resumen.con_error) partes.push(n(resumen.con_error, 'con error', 'con error'))
+  return `Últimos ${resumen.dias} días: ${partes.join(' · ')}`
+}
+
+/** Mensaje al guardar "Configurar con este documento", con el resultado real del envío. */
+export function mensajeConfigurar(resultado: ResultadoConfigurar): { texto: string; error: boolean } {
+  const base = `Tipo «${resultado.tipo.nombre}» (código ${resultado.tipo.codigo}) guardado`
+  if (resultado.envio === 'enviado') return { texto: `Tipo guardado y documento enviado a SaveData${resultado.code !== null && resultado.code !== undefined ? ` (code ${resultado.code})` : ''}.`, error: false }
+  if (resultado.envio === 'requiere_revision') return { texto: `Tipo guardado; no se envió: ${resultado.motivos.join(' ')}`, error: false }
+  if (resultado.envio === 'pendiente') return { texto: `Tipo guardado; no se pudo enviar: ${(resultado.mensaje ?? 'sin detalle').replace(/\.$/, '')}. Se reintentará en la próxima revisión.`, error: true }
+  if (resultado.envio === 'incierto') return { texto: `Tipo guardado; el envío quedó incierto: ${resultado.mensaje ?? 'sin detalle'} Verifica en SaveData si llegó; no se reintentará solo.`, error: true }
+  if (resultado.envio) return { texto: `Tipo guardado; no se pudo enviar: ${resultado.mensaje ?? 'sin detalle'}`, error: true }
+  return { texto: `${base}. La próxima vez se reconocerá con las reglas elegidas.`, error: false }
 }
 
 export type SugerenciaEstructura = { aseguradora: string; clave: string; nombre: string; alcance: CampoPlantilla['alcance']; veces: number; documentos: number; ejemplo: string }
@@ -66,6 +106,8 @@ export type DocumentoRecibido = EntradaListado & {
   attachmentId?: string | null
   envio_automatico?: string | null
   tipo_documento: TipoDocumentoDetectado
+  /** Estado de envío calculado por el backend (no viene en respuestas anteriores a esta versión). */
+  estado_envio?: EstadoEnvio
 }
 
 export type ListaTipos = { tipos: TipoDocumento[]; umbral_confianza: number }
@@ -87,9 +129,13 @@ export type SolicitudConfigurarDocumento = {
 export type ResultadoConfigurar = ListaTipos & {
   tipo: TipoDocumento
   estructura: Estructura | null
-  envio: 'enviado' | 'requiere_revision' | 'error' | 'incierto' | null
+  envio: 'enviado' | 'requiere_revision' | 'error' | 'incierto' | 'pendiente' | null
   motivos: string[]
   mensaje: string | null
+  /** code de la respuesta de SaveData (200 si se envió). */
+  code?: number | null
+  /** No se pudo conectar: el proceso automático lo reintenta en las siguientes revisiones. */
+  reintentara?: boolean
 }
 
 const json = (cuerpo: unknown) => JSON.stringify(cuerpo)

@@ -10,6 +10,10 @@ import {
   tiposVigentes,
   type DocumentoRecibido,
   type Estructura,
+  mensajeConfigurar,
+  textoResumenEnvios,
+  type EstadoEnvio,
+  type FiltroEnvio,
   type ResultadoConfigurar,
   type SugerenciaEstructura,
   type TipoDocumento,
@@ -30,6 +34,9 @@ export function TiposDocumentoSeccion({ onNotice, onError, editorEstadoDeCuenta 
   const [documentos, setDocumentos] = useState<DocumentoRecibido[] | null>(null)
   const [cargando, setCargando] = useState(false)
   const [configurando, setConfigurando] = useState<DocumentoRecibido | null>(null)
+  const [filtroEnvio, setFiltroEnvio] = useState<FiltroEnvio>('todos')
+  const [filtroTipo, setFiltroTipo] = useState<string | null>(null)
+  const verDocumentosDe = (tipoId: string) => { setFiltroTipo(tipoId); setFiltroEnvio('todos'); setPestana('documentos') }
   const fijarTipos = (lista: TipoDocumento[]) => { setTipos(lista); tiposVigentes.fijar(lista) }
   const recargar = async () => {
     setCargando(true)
@@ -45,11 +52,10 @@ export function TiposDocumentoSeccion({ onNotice, onError, editorEstadoDeCuenta 
   const alConfigurar = (resultado: ResultadoConfigurar) => {
     fijarTipos(resultado.tipos)
     setConfigurando(null)
-    const base = `Tipo «${resultado.tipo.nombre}» (código ${resultado.tipo.codigo}) guardado.`
-    if (resultado.envio === 'enviado') onNotice(`${base} El documento se extrajo con la nueva configuración y se envió a SaveData.`)
-    else if (resultado.envio === 'requiere_revision') onNotice(`${base} El documento se extrajo, pero no se envió: ${resultado.motivos.join(' ')}`)
-    else if (resultado.envio) onError(`${base} El documento se extrajo, pero el envío a SaveData falló: ${resultado.mensaje ?? 'sin detalle'}`)
-    else onNotice(`${base} La próxima vez se reconocerá con las reglas elegidas.`)
+    // El mensaje dice el resultado real del envío (code de SaveData, o el motivo y si se reintentará).
+    const { texto, error } = mensajeConfigurar(resultado)
+    if (error) onError(texto)
+    else onNotice(texto)
     void recargar()
   }
 
@@ -61,8 +67,9 @@ export function TiposDocumentoSeccion({ onNotice, onError, editorEstadoDeCuenta 
     </div>
     {configurando && tipos && <PanelConfigurar documento={configurando} tipos={tipos} onCerrar={() => setConfigurando(null)} onListo={alConfigurar} onError={onError} />}
     {pestana === 'documentos'
-      ? <DocumentosRecibidos documentos={documentos} onConfigurar={(documento) => setConfigurando(documento)} />
-      : <TiposYReglas tipos={tipos} onTipos={fijarTipos} onNotice={onNotice} onError={onError} editorEstadoDeCuenta={editorEstadoDeCuenta} />}
+      ? <DocumentosRecibidos documentos={documentos} onConfigurar={(documento) => setConfigurando(documento)} filtro={filtroEnvio} onFiltro={setFiltroEnvio}
+          tipo={filtroTipo ? tipos?.find((item) => item.id === filtroTipo) ?? null : null} onQuitarTipo={() => setFiltroTipo(null)} />
+      : <TiposYReglas tipos={tipos} onTipos={fijarTipos} onNotice={onNotice} onError={onError} editorEstadoDeCuenta={editorEstadoDeCuenta} onVerDocumentos={verDocumentosDe} />}
   </div>
 }
 
@@ -77,14 +84,29 @@ export function EtiquetaTipo({ nombre, codigo, color }: { nombre: string; codigo
 
 // --- Documentos que llegaron -----------------------------------------------------------------------
 
-function DocumentosRecibidos({ documentos, onConfigurar }: { documentos: DocumentoRecibido[] | null; onConfigurar: (documento: DocumentoRecibido) => void }) {
+const FILTROS_ENVIO: { valor: FiltroEnvio; texto: string }[] = [
+  { valor: 'todos', texto: 'Todos' }, { valor: 'enviados', texto: 'Enviados' }, { valor: 'pendientes', texto: 'Pendientes' }, { valor: 'no_enviados', texto: 'No enviados' }, { valor: 'con_error', texto: 'Con error' },
+]
+const TONO_ENVIO: Record<EstadoEnvio['estado'], string> = {
+  enviado: 'bg-emerald-50 text-emerald-700', pendiente: 'bg-blue-50 text-blue-700', en_curso: 'bg-blue-50 text-blue-700', no_enviado: 'bg-slate-100 text-slate-700', error: 'bg-red-50 text-red-700', incierto: 'bg-amber-100 text-amber-800',
+}
+
+function DocumentosRecibidos({ documentos, onConfigurar, filtro, onFiltro, tipo, onQuitarTipo }: { documentos: DocumentoRecibido[] | null; onConfigurar: (documento: DocumentoRecibido) => void; filtro: FiltroEnvio; onFiltro: (filtro: FiltroEnvio) => void; tipo: TipoDocumento | null; onQuitarTipo: () => void }) {
   if (documentos === null) return <div className="panel flex items-center gap-2 p-5 text-xs text-slate-400"><RefreshCw size={14} className="animate-spin" />Cargando documentos…</div>
   if (documentos.length === 0) return <div className="panel p-5 text-xs text-slate-500">Todavía no llegó ningún documento con extracción. Aparecerán aquí cuando el proceso automático (o tú) extraiga alguno.</div>
   const fecha = (valor: string | null | undefined) => (valor ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
+  const delTipo = tipo ? documentos.filter((documento) => documento.tipo_documento.tipo_id === tipo.id) : documentos
+  const visibles = filtro === 'todos' ? delTipo : delTipo.filter((documento) => documento.estado_envio?.filtro === filtro)
   return <section className="panel overflow-hidden" aria-labelledby="titulo-documentos-recibidos">
-    <div className="border-b border-slate-200 px-5 py-4"><h4 id="titulo-documentos-recibidos" className="text-sm font-bold text-ink">Documentos que llegaron</h4><p className="mt-0.5 text-[11px] text-slate-500">Los más recientes primero, con el tipo detectado y cómo se detectó. Los que requieren configuración no se envían solos.</p></div>
+    <div className="border-b border-slate-200 px-5 py-4"><h4 id="titulo-documentos-recibidos" className="text-sm font-bold text-ink">Documentos que llegaron</h4><p className="mt-0.5 text-[11px] text-slate-500">Los más recientes primero, con el tipo detectado, cómo se detectó y si se envió a SaveData. Los que requieren configuración no se envían solos.</p>
+      <div className="mt-3 flex flex-wrap items-center gap-1.5" role="group" aria-label="Filtrar por envío">
+        {FILTROS_ENVIO.map((opcion) => <button key={opcion.valor} type="button" aria-pressed={filtro === opcion.valor} onClick={() => onFiltro(opcion.valor)} className={`rounded-full border px-2.5 py-1 text-[11px] font-bold ${filtro === opcion.valor ? 'border-coral/40 bg-white text-ink shadow-sm' : 'border-slate-200 text-slate-500 hover:bg-white'}`}>{opcion.texto}<span className="ml-1 text-slate-400">{opcion.valor === 'todos' ? delTipo.length : delTipo.filter((documento) => documento.estado_envio?.filtro === opcion.valor).length}</span></button>)}
+        {tipo && <span className="ml-1 inline-flex items-center gap-1 text-[11px] text-slate-500">Solo <EtiquetaTipo nombre={tipo.nombre} codigo={tipo.codigo} color={tipo.color} /><button type="button" onClick={onQuitarTipo} aria-label="Quitar filtro de tipo" className="rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-ink"><X size={12} /></button></span>}
+      </div>
+    </div>
+    {visibles.length === 0 && <p className="px-5 py-4 text-[11px] text-slate-500">Ningún documento con este filtro.</p>}
     <ul className="divide-y divide-slate-100" aria-label="Documentos que llegaron">
-      {documentos.map((documento) => {
+      {visibles.map((documento) => {
         const tipo = documento.tipo_documento
         const requiere = tipo.requiere_revision
         return <li key={`${documento.messageId}:${documento.partId}`} data-requiere={requiere || undefined} className={`flex flex-col gap-2 px-5 py-3 sm:flex-row sm:items-center ${requiere ? 'bg-amber-50/70' : ''}`}>
@@ -97,15 +119,27 @@ function DocumentosRecibidos({ documentos, onConfigurar }: { documentos: Documen
               <span>· {fecha(documento.creado ?? documento.actualizado)}</span>
             </div>
             {requiere && <div className="mt-1 text-[11px] font-semibold text-amber-800">Sin configurar / Requiere revisión: {tipo.motivo}</div>}
+            {documento.estado_envio && <EstadoEnvioDocumento envio={documento.estado_envio} fecha={fecha} />}
           </div>
           <div className="flex shrink-0 flex-wrap items-center gap-2">
-            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-600">{etiquetaEstado[documento.estado] ?? documento.estado}{documento.envio_automatico && etiquetaEnvioAuto[documento.envio_automatico] ? ` · ${etiquetaEnvioAuto[documento.envio_automatico]}` : ''}</span>
+            {documento.estado_envio
+              ? <span data-testid="estado-envio" className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${TONO_ENVIO[documento.estado_envio.estado]}`}>{documento.estado_envio.etiqueta}</span>
+              : <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-600">{etiquetaEstado[documento.estado] ?? documento.estado}{documento.envio_automatico && etiquetaEnvioAuto[documento.envio_automatico] ? ` · ${etiquetaEnvioAuto[documento.envio_automatico]}` : ''}</span>}
             {requiere && <button type="button" onClick={() => onConfigurar(documento)} className="btn-primary px-3 py-1.5 text-xs"><Wand2 size={13} />Configurar con este documento</button>}
           </div>
         </li>
       })}
     </ul>
   </section>
+}
+
+/** Motivo, fecha y respuesta de SaveData del estado de envío (la etiqueta va a la derecha de la fila). */
+function EstadoEnvioDocumento({ envio, fecha }: { envio: EstadoEnvio; fecha: (valor: string | null | undefined) => string }) {
+  const detalle = envio.estado === 'enviado'
+    ? [envio.fecha && `el ${fecha(envio.fecha)}`, envio.respuesta && `SaveData: ${envio.respuesta}`].filter(Boolean).join(' · ')
+    : envio.etiqueta.startsWith('No se envió') && envio.motivo && envio.etiqueta.endsWith(envio.motivo) ? '' : envio.motivo ?? ''
+  if (!detalle) return null
+  return <div className={`mt-1 text-[11px] ${envio.estado === 'error' ? 'text-red-700' : envio.estado === 'incierto' ? 'text-amber-800' : 'text-slate-500'}`}>{envio.estado === 'enviado' ? 'Enviado' : 'Motivo'}: {detalle}</div>
 }
 
 // --- Panel "Configurar con este documento" (3 pasos) ----------------------------------------------
@@ -276,7 +310,7 @@ function ListaCamposEditable({ campos, onCampos, seccion, etiqueta, permitirFijo
 
 // --- Tipos y reglas --------------------------------------------------------------------------------
 
-function TiposYReglas({ tipos, onTipos, onNotice, onError, editorEstadoDeCuenta }: Avisos & { tipos: TipoDocumento[] | null; onTipos: (tipos: TipoDocumento[]) => void; editorEstadoDeCuenta?: ReactNode }) {
+function TiposYReglas({ tipos, onTipos, onNotice, onError, editorEstadoDeCuenta, onVerDocumentos }: Avisos & { tipos: TipoDocumento[] | null; onTipos: (tipos: TipoDocumento[]) => void; editorEstadoDeCuenta?: ReactNode; onVerDocumentos?: (tipoId: string) => void }) {
   const [elegido, setElegido] = useState<string | 'nuevo' | null>(null)
   if (tipos === null) return <div className="panel flex items-center gap-2 p-5 text-xs text-slate-400"><RefreshCw size={14} className="animate-spin" />Cargando tipos…</div>
   const actual = elegido === 'nuevo' ? null : tipos.find((tipo) => tipo.id === elegido) ?? tipos[0] ?? null
@@ -292,16 +326,20 @@ function TiposYReglas({ tipos, onTipos, onNotice, onError, editorEstadoDeCuenta 
     </div>
     {elegido === 'nuevo'
       ? <FormularioTipo key="nuevo" tipos={tipos} onGuardado={(lista, tipo) => { onTipos(lista); setElegido(tipo.id); onNotice(`Tipo «${tipo.nombre}» creado.`) }} onError={onError} />
-      : actual && <DetalleTipo key={actual.id} tipo={actual} tipos={tipos} onTipos={onTipos} onNotice={onNotice} onError={onError} editorEstadoDeCuenta={editorEstadoDeCuenta} />}
+      : actual && <DetalleTipo key={actual.id} tipo={actual} tipos={tipos} onTipos={onTipos} onNotice={onNotice} onError={onError} editorEstadoDeCuenta={editorEstadoDeCuenta} onVerDocumentos={onVerDocumentos} />}
   </div>
 }
 
-function DetalleTipo({ tipo, tipos, onTipos, onNotice, onError, editorEstadoDeCuenta }: Avisos & { tipo: TipoDocumento; tipos: TipoDocumento[]; onTipos: (tipos: TipoDocumento[]) => void; editorEstadoDeCuenta?: ReactNode }) {
+function DetalleTipo({ tipo, tipos, onTipos, onNotice, onError, editorEstadoDeCuenta, onVerDocumentos }: Avisos & { tipo: TipoDocumento; tipos: TipoDocumento[]; onTipos: (tipos: TipoDocumento[]) => void; editorEstadoDeCuenta?: ReactNode; onVerDocumentos?: (tipoId: string) => void }) {
   return <div className="space-y-4">
     <div role="status" data-testid="tipo-configurando" className="rounded-xl border-l-4 px-4 py-3 text-sm font-bold" style={{ borderColor: tipo.color, backgroundColor: `${tipo.color}14`, color: tipo.color }}>
       Estás configurando el tipo {tipo.nombre} · código {tipo.codigo}
       <div className="mt-0.5 text-[11px] font-medium text-slate-500">{tipo.seccion ? `Sección repetible: ${tipo.seccion.nombre}` : 'Sin sección repetible'} · {tipo.documentos ?? 0} documento{tipo.documentos === 1 ? '' : 's'}{tipo.contable ? ' · con validación contable' : ''}</div>
       {tipo.plantilla && <div className="mt-1.5"><span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700">Plantilla predeterminada</span></div>}
+      {tipo.resumen_envios && <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] font-medium text-slate-600">
+        <span data-testid="resumen-envios">{textoResumenEnvios(tipo.resumen_envios)}</span>
+        {onVerDocumentos && <button type="button" onClick={() => onVerDocumentos(tipo.id)} className="font-bold text-coral underline-offset-2 hover:underline">Ver en Documentos que llegaron</button>}
+      </div>}
     </div>
     {tipo.plantilla && <RestaurarPlantilla tipo={tipo} onTipos={onTipos} onNotice={onNotice} onError={onError} />}
     {!tipo.contable && <AvisosEstructura tipo={tipo} onTipos={onTipos} onNotice={onNotice} onError={onError} />}

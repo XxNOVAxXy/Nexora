@@ -468,8 +468,9 @@ class ServicioEnvio:
             "puede_eliminar": estado_en_savedata(documento) == "presente",
         }
 
-    def enviar(self, email: str, message_id: str, part_id: str, solicitud: EnvioRequest) -> tuple[RespuestaSaveData, dict[str, Any], dict[str, Any]]:
-        """Devuelve (respuesta de SaveData, intento registrado, documento actualizado)."""
+    def enviar(self, email: str, message_id: str, part_id: str, solicitud: EnvioRequest, origen: str = "manual") -> tuple[RespuestaSaveData, dict[str, Any], dict[str, Any]]:
+        """Devuelve (respuesta de SaveData, intento registrado, documento actualizado). ``origen``: ``manual`` (botón
+        Enviar), ``automatico`` (proceso automático) o ``configurar`` ("extraer y enviar" al configurar)."""
         url = self.url().strip()
         if not url:
             raise NoSePuedeEnviar("savedata_sin_configurar", "SAVEDATA_URL no esta configurada en el backend.", 503)
@@ -517,6 +518,7 @@ class ServicioEnvio:
                     "reenvio": previo is not None,
                     "actualizacion": preparado["interno"]["Actualizacion"],
                     "agregado_de_nuevo": agregar,
+                    "origen": origen,
                 }
                 return {**documento, "envios": [*documento.get("envios", []), intento]}
 

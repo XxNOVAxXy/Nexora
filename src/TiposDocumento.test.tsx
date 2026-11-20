@@ -86,7 +86,7 @@ describe('Configuración → Tipos de documento: documentos que llegaron', () =>
       { clave: 'asegurado', nombre: 'Asegurado', ejemplo: 'Ana López', alcance: 'movimiento', filas: 3 },
       { clave: 'vigencia', nombre: 'Vigencia', ejemplo: '2026-2027', alcance: 'documento', filas: 0 },
     ] }))
-    const resultado: ResultadoConfigurar = { tipos: [EC, FLOTILLA], umbral_confianza: 0.7, tipo: { ...FLOTILLA, id: 'tipo-g', nombre: 'Gastos médicos', codigo: 'G' }, estructura: null, envio: 'enviado', motivos: [], mensaje: null }
+    const resultado: ResultadoConfigurar = { tipos: [EC, FLOTILLA], umbral_confianza: 0.7, tipo: { ...FLOTILLA, id: 'tipo-g', nombre: 'Gastos médicos', codigo: 'G' }, estructura: null, envio: 'enviado', motivos: [], mensaje: null, code: 200 }
     configurarMock.mockImplementation(async () => resultado)
     const onNotice = vi.fn()
     render(<TiposDocumentoSeccion onNotice={onNotice} onError={vi.fn()} />)
@@ -129,7 +129,7 @@ describe('Configuración → Tipos de documento: documentos que llegaron', () =>
       extraer_y_enviar: true,
     })
     expect(solicitud.campos.map((campo: { nombre: string; alcance: string }) => [campo.nombre, campo.alcance])).toEqual([['Póliza', 'documento'], ['Asegurado', 'movimiento']])
-    await waitFor(() => expect(onNotice).toHaveBeenCalledWith(expect.stringContaining('se envió a SaveData')))
+    await waitFor(() => expect(onNotice).toHaveBeenCalledWith('Tipo guardado y documento enviado a SaveData (code 200).'))
   })
 })
 
@@ -400,5 +400,66 @@ describe('Plantillas predeterminadas', () => {
     expect(screen.queryByText('Ese campo ya es una columna de la tabla.')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Agregar a mano' }))
     expect(within(screen.getByRole('list', { name: 'Campos de Fianzas' })).getByText('Fecha')).toBeTruthy()
+  })
+})
+
+
+describe('Que se vea si se envió o no', () => {
+  const envio = (cambios: Partial<NonNullable<DocumentoRecibido['estado_envio']>>): NonNullable<DocumentoRecibido['estado_envio']> => ({
+    estado: 'enviado', filtro: 'enviados', etiqueta: 'Enviado automáticamente', motivo: null, fecha: '2026-11-19T10:00:00Z', code: 200, respuesta: 'code 200: Exito', origen: 'automatico', ...cambios,
+  })
+  const FZ = { tipo_id: 'tipo-f', codigo: 'F', nombre: 'Fianzas', color: '#059669', metodo: 'ia' as const, confianza: 0.92, requiere_revision: false, motivo: null }
+  const lista = () => [
+    recibido({ messageId: 'a', filename: 'auto.pdf', tipo_documento: detectado(FZ), estado_envio: envio({}) }),
+    recibido({ messageId: 'b', filename: 'configurar.pdf', tipo_documento: detectado(FZ), estado_envio: envio({ etiqueta: 'Enviado al configurar', origen: 'configurar' }) }),
+    recibido({ messageId: 'c', filename: 'pendiente.pdf', tipo_documento: detectado(FZ), estado_envio: envio({ estado: 'pendiente', filtro: 'pendientes', etiqueta: 'Pendiente de envío (pedido al configurar)', motivo: 'No se pudo conectar con SaveData; no se envió nada. Se reintentará en la próxima revisión.', code: null, respuesta: null, origen: 'configurar' }) }),
+    recibido({ messageId: 'd', filename: 'revision.pdf', estado_envio: envio({ estado: 'no_enviado', filtro: 'no_enviados', etiqueta: 'No se envió: no cuadra', motivo: 'no cuadra', code: null, respuesta: null, origen: null }) }),
+    recibido({ messageId: 'e', filename: 'incierto.pdf', tipo_documento: detectado(FZ), estado_envio: envio({ estado: 'incierto', filtro: 'con_error', etiqueta: 'Incierto, verificar', motivo: 'SaveData no respondió.', code: null, respuesta: null }) }),
+  ]
+  const TIPO_F: TipoDocumento = { id: 'tipo-f', nombre: 'Fianzas', codigo: 'F', color: '#059669', seccion: null, contable: false, configurado: true, estructuras: [], campos: [],
+    resumen_envios: { dias: 30, recibidos: 12, enviados_automatico: 10, enviados_configurar: 0, enviados_manual: 0, pendientes: 1, no_enviados: 1, con_error: 0 } }
+
+  it('cada documento muestra su estado de envío con su motivo, y los filtros separan Enviados, Pendientes, No enviados y Con error', async () => {
+    documentosMock.mockImplementation(async () => ({ documentos: lista(), umbral_confianza: 0.7 }))
+    render(<TiposDocumentoSeccion onNotice={vi.fn()} onError={vi.fn()} />)
+    const documentos = await screen.findByRole('list', { name: 'Documentos que llegaron' })
+    const filas = within(documentos).getAllByRole('listitem')
+    expect(filas.map((fila) => within(fila).getByTestId('estado-envio').textContent)).toEqual(['Enviado automáticamente', 'Enviado al configurar', 'Pendiente de envío (pedido al configurar)', 'No se envió: no cuadra', 'Incierto, verificar'])
+    expect(filas[0].textContent).toContain('SaveData: code 200: Exito')
+    expect(filas[2].textContent).toContain('Motivo: No se pudo conectar con SaveData; no se envió nada. Se reintentará en la próxima revisión.')
+    const filtros = screen.getByRole('group', { name: 'Filtrar por envío' })
+    const nombres = (texto: string) => { fireEvent.click(within(filtros).getByRole('button', { name: new RegExp(`^${texto}`) })); return within(screen.getByRole('list', { name: 'Documentos que llegaron' })).queryAllByRole('listitem').map((fila) => fila.querySelector('div > div')?.textContent) }
+    expect(nombres('Enviados')).toEqual(['auto.pdf', 'configurar.pdf'])
+    expect(nombres('Pendientes')).toEqual(['pendiente.pdf'])
+    expect(nombres('No enviados')).toEqual(['revision.pdf'])
+    expect(nombres('Con error')).toEqual(['incierto.pdf'])
+    expect(nombres('Todos')).toHaveLength(5)
+  })
+
+  it('el resumen de Tipos y reglas lleva a Documentos que llegaron filtrado por ese tipo', async () => {
+    listarMock.mockImplementation(async () => ({ tipos: [EC, TIPO_F], umbral_confianza: 0.7 }))
+    documentosMock.mockImplementation(async () => ({ documentos: lista(), umbral_confianza: 0.7 }))
+    render(<TiposDocumentoSeccion onNotice={vi.fn()} onError={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Tipos y reglas' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Fianzas/ }))
+    expect(screen.getByTestId('resumen-envios').textContent).toBe('Últimos 30 días: 12 recibidos · 10 enviados automáticamente · 1 pendiente · 1 requiere revisión')
+    fireEvent.click(screen.getByRole('button', { name: 'Ver en Documentos que llegaron' }))
+    const documentos = await screen.findByRole('list', { name: 'Documentos que llegaron' })
+    expect(within(documentos).getAllByRole('listitem')).toHaveLength(4)  // sin el que no es Fianzas
+    fireEvent.click(screen.getByRole('button', { name: 'Quitar filtro de tipo' }))
+    expect(within(screen.getByRole('list', { name: 'Documentos que llegaron' })).getAllByRole('listitem')).toHaveLength(5)
+  })
+
+  it('"Configurar con este documento" dice el resultado real: no se pudo enviar y se reintentará', async () => {
+    configurarMock.mockImplementation(async () => ({ tipos: [EC, FLOTILLA], umbral_confianza: 0.7, tipo: FLOTILLA, estructura: null, envio: 'pendiente', motivos: [], reintentara: true, code: null,
+      mensaje: 'No se pudo conectar con SaveData; no se envió nada.' }))
+    const onError = vi.fn()
+    render(<TiposDocumentoSeccion onNotice={vi.fn()} onError={onError} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Configurar con este documento' }))
+    const panel = screen.getByRole('dialog', { name: 'poliza-axa.pdf' })
+    fireEvent.click(within(panel).getByRole('radio', { name: 'Usar un tipo que ya existe' }))
+    fireEvent.change(within(panel).getByLabelText('Tipo de documento'), { target: { value: 'tipo-ac' } })
+    fireEvent.click(within(panel).getByRole('button', { name: 'Guardar configuración' }))
+    await waitFor(() => expect(onError).toHaveBeenCalledWith('Tipo guardado; no se pudo enviar: No se pudo conectar con SaveData; no se envió nada. Se reintentará en la próxima revisión.'))
   })
 })

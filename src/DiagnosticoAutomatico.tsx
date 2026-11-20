@@ -34,6 +34,7 @@ export function ResumenUltimoCiclo({ estado }: { estado: EstadoAutomatico }) {
         <span className="font-normal text-slate-400"> · {ciclo.origen === 'manual' ? 'manual' : 'programado'} · {fechaHora(ciclo.fin ?? ciclo.detectado_en ?? ciclo.inicio)}</span>
       </div>
       <div className="mt-1">{resumenCiclo(ciclo)}</div>
+      {ciclo.texto_envios && <div className="mt-1 font-semibold text-ink" data-testid="envios-por-tipo">{ciclo.texto_envios}</div>}
       {ciclo.descartes.length > 0 && <div className="mt-1 text-slate-500">Omitidos: {motivosAgrupados(ciclo)}{ciclo.descartes_total > ciclo.descartes.length ? ` y ${ciclo.descartes_total - ciclo.descartes.length} más` : ''}</div>}
       {ciclo.error && <div className="mt-1 text-red-700">{ciclo.error}</div>}
       {estado.revision_pendiente && <div className="mt-1 text-blue-700">Revisión solicitada; empezará en unos segundos.</div>}

@@ -14,7 +14,7 @@ vi.mock('./services/automaticoApi', async (importOriginal) => {
 })
 
 const { TarjetaExtraccionAutomatica } = await import('./App')
-const { CampanaAvisos } = await import('./DiagnosticoAutomatico')
+const { CampanaAvisos, ResumenUltimoCiclo } = await import('./DiagnosticoAutomatico')
 const { publicarEstadoAutomatico } = await import('./services/eventosAutomatico')
 
 const ciclo = (cambios: Partial<UltimoCiclo> = {}): UltimoCiclo => ({
@@ -128,5 +128,18 @@ describe('Campanita de avisos', () => {
     render(<CampanaAvisos />)
     await screen.findByRole('button', { name: 'Avisos (1 sin leer)' })
     expect(screen.queryByRole('status', { name: 'Nuevo aviso' })).toBeNull()
+  })
+})
+
+describe('Aviso del ciclo por tipo', () => {
+  it('Automatización dice cuántos se enviaron y cuántos no, por tipo', () => {
+    const texto = 'Se enviaron 2 (1 Fianzas, 1 Autos individuales) · 1 requiere revisión (Gastos médicos mayores)'
+    render(<ResumenUltimoCiclo estado={estadoBase({ ultimo_ciclo: ciclo({ texto_envios: texto }) })} />)
+    expect(screen.getByTestId('envios-por-tipo').textContent).toBe(texto)
+  })
+
+  it('sin envíos en el ciclo no muestra la línea por tipo', () => {
+    render(<ResumenUltimoCiclo estado={estadoBase({ ultimo_ciclo: ciclo({ texto_envios: null }) })} />)
+    expect(screen.queryByTestId('envios-por-tipo')).toBeNull()
   })
 })

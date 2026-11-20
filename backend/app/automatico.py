@@ -652,6 +652,7 @@ class ExtractorAutomatico:
         estado = self._leer(email)
         activado = _fecha(estado.get("activado_en"))
         if not estado["activo"] or activado is None:
+            self._reintentar_pedidos_al_configurar(email)
             return self._salida_temprana(email, inicio, origen, "pausado", None)
         logger.info("Ciclo automatico cuenta=%s", cuenta_id(email))
         self._mutar(email, lambda e: e.__setitem__("ciclo_en_curso", {"inicio": _iso(inicio), "origen": origen, "pid": os.getpid(), "instancia": self._instancia}))
@@ -681,21 +682,44 @@ class ExtractorAutomatico:
     def _aviso(self, tipo: str, texto: str, claves: list[str] | None = None) -> dict[str, Any]:
         return {"id": uuid.uuid4().hex[:12], "fecha": _iso(self.reloj()), "tipo": tipo, "texto": texto, "claves": list(claves or [])[:20], "leido": False}
 
-    def _avisos_del_ciclo(self, resultado: str, error: str | None, ctx: dict[str, Any]) -> list[dict[str, Any]]:
-        claves = ctx["claves"]
-        avisos = []
+    @staticmethod
+    def _por_tipo(claves: list[str], tipo_de: dict[str, str]) -> str:
+        """"1 Fianzas, 1 Autos individuales": cuántos de cada tipo (los más frecuentes primero); con un solo tipo, solo su nombre."""
+        conteo: dict[str, int] = {}
+        for clave in claves:
+            nombre = tipo_de.get(clave) or "Sin tipo"
+            conteo[nombre] = conteo.get(nombre, 0) + 1
+        if len(conteo) == 1:
+            return next(iter(conteo))  # todos del mismo tipo: "1 requiere revisión (Gastos médicos mayores)"
+        return ", ".join(f"{n} {nombre}" for nombre, n in sorted(conteo.items(), key=lambda item: (-item[1], item[0])))
+
+    @classmethod
+    def texto_envios(cls, ctx: dict[str, Any]) -> str | None:
+        """"Se enviaron 2 (1 Fianzas, 1 Autos individuales) · 1 requiere revisión (Gastos médicos mayores)"."""
+        claves, tipo_de = ctx["claves"], ctx.get("tipo_de") or {}
+        partes = []
         if claves["enviado"]:
             n = len(claves["enviado"])
-            avisos.append(self._aviso("enviado", f"Se {'envio' if n == 1 else 'enviaron'} {n} documento{'' if n == 1 else 's'} a SaveData automaticamente.", claves["enviado"]))
+            partes.append(f"Se {'envió' if n == 1 else 'enviaron'} {n} ({cls._por_tipo(claves['enviado'], tipo_de)})")
         if claves["requiere_revision"]:
             n = len(claves["requiere_revision"])
-            avisos.append(self._aviso("requiere_revision", f"{n} documento{' requiere' if n == 1 else 's requieren'} revision antes de enviarse a SaveData.", claves["requiere_revision"]))
+            partes.append(f"{n} {'requiere' if n == 1 else 'requieren'} revisión ({cls._por_tipo(claves['requiere_revision'], tipo_de)})")
+        return " · ".join(partes) or None
+
+    def _avisos_del_ciclo(self, resultado: str, error: str | None, ctx: dict[str, Any]) -> list[dict[str, Any]]:
+        claves = ctx["claves"]
+        tipo_de = ctx.get("tipo_de") or {}
+        avisos = []
+        # Un solo aviso con lo que se envió y lo que no, por tipo.
+        resumen_envios = self.texto_envios(ctx)
+        if resumen_envios:
+            avisos.append(self._aviso("enviado" if claves["enviado"] else "requiere_revision", f"{resumen_envios}.", [*claves["enviado"], *claves["requiere_revision"]]))
         if claves["incierto"]:
             n = len(claves["incierto"])
-            avisos.append(self._aviso("incierto", f"{n} envio{'' if n == 1 else 's'} incierto{'' if n == 1 else 's'}: verifica en SaveData si {'llego' if n == 1 else 'llegaron'}.", claves["incierto"]))
+            avisos.append(self._aviso("incierto", f"{n} envío{'' if n == 1 else 's'} incierto{'' if n == 1 else 's'} ({self._por_tipo(claves['incierto'], tipo_de)}): verifica en SaveData si {'llegó' if n == 1 else 'llegaron'}.", claves["incierto"]))
         if claves["error"]:
             n = len(claves["error"])
-            avisos.append(self._aviso("error", f"{n} documento{'' if n == 1 else 's'} con error al extraer o enviar.", claves["error"]))
+            avisos.append(self._aviso("error", f"{n} documento{'' if n == 1 else 's'} con error al extraer o enviar ({self._por_tipo(claves['error'], tipo_de)}).", claves["error"]))
         if resultado in ("error", "interrumpido_reinicio"):
             texto = INTERRUMPIDO_REINICIO if resultado == "interrumpido_reinicio" else f"El ciclo de la extraccion automatica fallo: {(error or '')[:200]}"
             avisos.append(self._aviso("error_ciclo", texto))
@@ -706,7 +730,8 @@ class ExtractorAutomatico:
         fin = _iso(self.reloj())
         resumen = ctx["resumen"]
         ciclo = {"inicio": _iso(inicio) or fin, "fin": fin, "origen": origen, "resultado": resultado, "error": error, **resumen,
-                 "descartes": ctx["descartes"][:MAX_DESCARTES_CICLO], "descartes_total": len(ctx["descartes"])}
+                 "descartes": ctx["descartes"][:MAX_DESCARTES_CICLO], "descartes_total": len(ctx["descartes"]),
+                 "texto_envios": self.texto_envios(ctx) if "claves" in ctx else None}
         avisos = self._avisos_del_ciclo(resultado, error, ctx)
 
         def cambio(estado: dict[str, Any]) -> None:
@@ -925,6 +950,7 @@ class ExtractorAutomatico:
         clave = f"{message_id}__{part_id}"
         resumen, claves = ctx["resumen"], ctx["claves"]
         logger.info("Ciclo automatico envio message_id=%s part_id=%s estado=%s", message_id, part_id, estado)
+        ctx.setdefault("tipo_de", {})[clave] = self._nombre_tipo(email, message_id, part_id)
         if estado == "enviado":
             resumen["enviados"] += 1
             claves["enviado"].append(clave)
@@ -943,18 +969,47 @@ class ExtractorAutomatico:
             detalle = f"{MOTIVOS[motivo]} {envio.get('error') or ''}".strip()
             self._descartar(email, ctx, clave, motivo, message_id=message_id, part_id=part_id, detalle=detalle)
 
-    def _procesar_envios(self, email: str, ctx: dict[str, Any]) -> None:
-        """Reintenta los envíos automáticos que quedaron pendientes (o interrumpidos) en ciclos anteriores."""
+    def registro_adjuntos(self, email: str) -> dict[str, Any]:
+        """Registro del proceso por adjunto (``messageId__partId``): estado, envío automático y su origen."""
+        return dict(self._leer(email).get("adjuntos") or {})
+
+    def _nombre_tipo(self, email: str, message_id: str, part_id: str) -> str:
+        """Nombre del tipo del documento, para los avisos por tipo (los documentos sin tipo son estados de cuenta)."""
+        try:
+            documento = self.almacen.obtener(email, message_id, part_id) or {}
+        except Exception:
+            return "Sin tipo"
+        tipo = documento.get("tipo_documento")
+        return str((tipo or {}).get("nombre") or ("Estado de cuenta" if tipo is None else "Sin tipo"))
+
+    def _procesar_envios(self, email: str, ctx: dict[str, Any], solo_configurar: bool = False) -> None:
+        """Reintenta los envíos automáticos que quedaron pendientes (o interrumpidos) en ciclos anteriores.
+
+        Los pedidos con "extraer y enviar" al configurar se reintentan aunque el envío automático general esté apagado.
+        """
         estado = self._leer(email)
-        if not estado.get("envio_activo"):
-            return
         for clave, entrada in estado["adjuntos"].items():
             if entrada.get("estado") != "extraido" or not entrada.get("enviar_auto"):
                 continue
             if (entrada.get("envio") or {}).get("estado") in TERMINALES_ENVIO:
                 continue
+            al_configurar = entrada.get("origen_envio") == "configurar"
+            if solo_configurar and not al_configurar or not (al_configurar or estado.get("envio_activo")):
+                continue
             message_id, _, part_id = clave.partition("__")
             self._contar_envio(email, ctx, message_id, part_id, self._enviar_auto(email, message_id, part_id))
+
+    def _reintentar_pedidos_al_configurar(self, email: str) -> None:
+        """Con la extracción automática en pausa, igual se reintentan los envíos pedidos al configurar."""
+        ctx: dict[str, Any] = {"resumen": _resumen_vacio(), "descartes": [], "claves": {"enviado": [], "requiere_revision": [], "error": [], "incierto": []}}
+        try:
+            self._procesar_envios(email, ctx, solo_configurar=True)
+        except Exception:
+            logger.exception("No se pudieron reintentar los envios pedidos al configurar")
+            return
+        avisos = self._avisos_del_ciclo("ok", None, ctx)
+        if avisos:
+            self._mutar(email, lambda estado: estado.__setitem__("avisos", [*reversed(avisos), *estado["avisos"]][:MAX_AVISOS]))
 
     def _anotar_envio(self, email: str, clave: str, **valores: Any) -> dict[str, Any]:
         def cambio(estado: dict[str, Any]) -> None:
@@ -971,7 +1026,8 @@ class ExtractorAutomatico:
             if documento is None:
                 raise _DocumentoTocado()
             envios = [{**item, "automatico": True} if intento_id and item.get("id") == intento_id else item for item in documento.get("envios", [])]
-            return {**documento, "envios": envios, "envio_automatico": {k: envio.get(k) for k in ("estado", "intentos", "error", "motivos", "problemas", "actualizado")}}
+            # "origen": "configurar" si lo pidió "extraer y enviar" al configurar (se reintenta aunque el envío automático esté apagado).
+            return {**documento, "envios": envios, "envio_automatico": {k: envio.get(k) for k in ("estado", "intentos", "error", "motivos", "problemas", "actualizado", "origen")}}
         try:
             self.almacen.actualizar(email, message_id, part_id, cambio)
         except _DocumentoTocado:
@@ -995,7 +1051,8 @@ class ExtractorAutomatico:
         clave = f"{message_id}__{part_id}"
         cuenta = self._leer(email)
         entrada = cuenta["adjuntos"].get(clave) or {}
-        if self.envios is None or not cuenta.get("envio_activo") or not entrada.get("enviar_auto") or entrada.get("estado") != "extraido":
+        al_configurar = entrada.get("origen_envio") == "configurar"
+        if self.envios is None or not (cuenta.get("envio_activo") or al_configurar) or not entrada.get("enviar_auto") or entrada.get("estado") != "extraido":
             return None
         envio = dict(entrada.get("envio") or {})
         if envio.get("estado") in TERMINALES_ENVIO:
@@ -1069,7 +1126,7 @@ class ExtractorAutomatico:
         envía: queda revisable. Devuelve {"documento", "envio": None | "enviado" | "requiere_revision" | "error" | "incierto",
         "motivos", "mensaje"}.
         """
-        from .savedata import EnvioRequest, NoSePuedeEnviar
+        from .savedata import MENSAJE_SIN_CONEXION, EnvioRequest, NoSePuedeEnviar, _code_de
 
         tipos = self.tipos.leer(email)
         tipo = next((item for item in tipos if item["id"] == tipo_id), None)
@@ -1103,6 +1160,7 @@ class ExtractorAutomatico:
         if not motivos and self._leer(email).get("solo_si_cuadra") is not False:
             motivos = motivos_sin_cuadrar(problemas, es_contable(deteccion))
         if motivos:
+            self._anotar_pedido_al_configurar(email, message_id, part_id, documento.get("version"), "requiere_revision", motivos=motivos)
             return {**salida, "envio": "requiere_revision", "motivos": motivos}
         version = documento.get("version")
 
@@ -1118,11 +1176,37 @@ class ExtractorAutomatico:
             return {**salida, "envio": "error", "mensaje": "El documento cambió mientras se preparaba el envío."}
         solicitud_envio = EnvioRequest.model_construct(version_base=revisado.get("version"), sucursal=None, articulo=None, carga_inicial=False, confirmar_reenvio=True, agregar_de_nuevo=False)
         try:
-            respuesta, _intento, enviado = self.envios.enviar(email, message_id, part_id, solicitud_envio)
+            respuesta, intento, enviado = self.envios.enviar(email, message_id, part_id, solicitud_envio, origen="configurar")
         except NoSePuedeEnviar as error:
             return {**salida, "documento": revisado, "envio": "error", "mensaje": str(error)}
         estado = {"exito": "enviado", "incierto": "incierto"}.get(respuesta.resultado, "error")
-        return {**salida, "documento": enviado, "envio": estado, "mensaje": respuesta.mensaje}
+        # "No se pudo conectar": no se envió nada; el proceso automático lo reintenta en las siguientes revisiones.
+        reintentar = respuesta.resultado == "error" and respuesta.mensaje == MENSAJE_SIN_CONEXION
+        if reintentar:
+            estado = "pendiente"
+        self._anotar_pedido_al_configurar(email, message_id, part_id, revisado.get("version"), estado, intento=intento, error=None if estado == "enviado" else respuesta.mensaje)
+        code, _ = _code_de(respuesta.respuesta or "")
+        return {**salida, "documento": self.almacen.obtener(email, message_id, part_id) or enviado, "envio": estado, "mensaje": respuesta.mensaje,
+                "code": code if isinstance(code, int) and not isinstance(code, bool) else None, "reintentara": reintentar}
+
+    def _anotar_pedido_al_configurar(self, email: str, message_id: str, part_id: str, version: Any, estado: str, *, intento: dict[str, Any] | None = None,
+                                     error: str | None = None, motivos: list[str] | None = None) -> None:
+        """Deja el documento marcado para envío automático con origen "configurar". Si quedó pendiente (no se pudo
+        conectar), el proceso automático lo reintenta hasta MAX_INTENTOS veces, aunque el envío automático general esté
+        apagado. Un resultado incierto nunca se reintenta solo."""
+        clave = f"{message_id}__{part_id}"
+        envio = {"estado": estado, "intentos": 0, "intentos_ids": [intento["id"]] if intento else [], "version": version if estado == "pendiente" else None,
+                 "error": error, "motivos": list(motivos or []), "problemas": list(motivos or []), "origen": "configurar", "actualizado": _iso(self.reloj())}
+
+        def cambio(cuenta: dict[str, Any]) -> None:
+            entrada = dict(cuenta["adjuntos"].get(clave) or {"intentos": 0})
+            entrada.update(estado="extraido", error=None, version=version, enviar_auto=True, origen_envio="configurar", envio=envio)
+            cuenta["adjuntos"][clave] = entrada
+        try:
+            self._mutar(email, cambio)
+            self._reflejar_en_documento(email, message_id, part_id, envio)
+        except Exception:
+            logger.exception("No se pudo marcar el envio pedido al configurar %s", clave)
 
     def _marcar_revisado(self, version: Any) -> Callable[[dict[str, Any] | None], dict[str, Any]]:
         def cambio(documento: dict[str, Any] | None) -> dict[str, Any]:
@@ -1138,8 +1222,9 @@ class ExtractorAutomatico:
         from .savedata import EnvioRequest, NoSePuedeEnviar
 
         solicitud = EnvioRequest.model_construct(version_base=version, sucursal=None, articulo=None, carga_inicial=False, confirmar_reenvio=False, agregar_de_nuevo=False)
+        origen = "configurar" if (self._leer(email)["adjuntos"].get(f"{message_id}__{part_id}") or {}).get("origen_envio") == "configurar" else "automatico"
         try:
-            respuesta, intento, _documento = self.envios.enviar(email, message_id, part_id, solicitud)
+            respuesta, intento, _documento = self.envios.enviar(email, message_id, part_id, solicitud, origen=origen)
         except (ConflictoVersion, EnvioEnCurso):
             return self._terminar_envio(email, message_id, part_id, "omitido", error="El usuario edito o esta enviando el documento.")
         except NoSePuedeEnviar as error:

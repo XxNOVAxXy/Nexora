@@ -34,6 +34,7 @@ from .tipos_documento import (
     tipo_para_extraer,
 )
 from .plantilla_campos import CampoPlantilla
+from .estado_envio import estado_envio
 from .extracciones import ID_DOCUMENTO_SEGURO, AlmacenExtracciones, ConflictoVersion, EnvioEnCurso, ExtraccionDanada, GuardarExtraccionRequest, RevisionConProblemas, cuenta_id
 from .gemini import GeminiRequestError, GeminiSettings, GeminiUnavailableError
 from .gmail import GmailAttachmentError, GmailClient, GmailNotConfiguredError, GmailNotConnectedError, GmailRateLimitError
@@ -787,12 +788,67 @@ def _conteos(email: str) -> tuple[dict[str, int], dict[str, int]]:
     return por_tipo, por_estructura
 
 
+DIAS_RESUMEN = 30
+
+
+def _documentos_con_envio(email: str) -> list[dict[str, Any]]:
+    """Documentos guardados con su tipo y su estado de envío (etiqueta y motivo), más recientes primero."""
+    ec = tipos.obtener(email, TIPO_EC_ID) or {}
+    try:
+        registro = automatico.registro_adjuntos(email)
+    except Exception:
+        logger.exception("No se pudo leer el registro del proceso automatico")
+        registro = {}
+    documentos = []
+    for entrada in almacen.listar(email):
+        tipo_documento = entrada.get("tipo_documento") or {
+            "tipo_id": TIPO_EC_ID, "codigo": ec.get("codigo"), "nombre": ec.get("nombre"), "color": ec.get("color"), "contable": True,
+            "metodo": None, "confianza": None, "requiere_revision": False, "motivo": None,
+        }
+        try:
+            completo = almacen.leer_completo(email, entrada["messageId"], entrada["partId"]) or {}
+        except Exception:
+            completo = {}
+        clave = f"{entrada['messageId']}__{entrada['partId']}"
+        documentos.append({**entrada, "tipo_documento": tipo_documento, "estado_envio": estado_envio({**completo, "tipo_documento": tipo_documento}, registro.get(clave))})
+    documentos.sort(key=lambda item: item.get("creado") or item.get("actualizado") or "", reverse=True)
+    return documentos
+
+
+def _resumen_por_tipo(documentos: list[dict[str, Any]], dias: int = DIAS_RESUMEN, ahora: datetime | None = None) -> dict[str, dict[str, int]]:
+    """Últimos ``dias`` días por tipo: recibidos, enviados (automáticamente, al configurar, a mano), pendientes,
+    no enviados (requieren revisión) y con error."""
+    desde = (ahora or datetime.now(timezone.utc)) - timedelta(days=dias)
+    resumen: dict[str, dict[str, int]] = {}
+    for documento in documentos:
+        try:
+            fecha = datetime.fromisoformat(str(documento.get("creado") or documento.get("actualizado") or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if fecha.tzinfo is None:
+            fecha = fecha.replace(tzinfo=timezone.utc)
+        if fecha < desde or (ahora is not None and fecha > ahora):
+            continue
+        cuenta = resumen.setdefault(documento["tipo_documento"].get("tipo_id") or "", {
+            "recibidos": 0, "enviados_automatico": 0, "enviados_configurar": 0, "enviados_manual": 0, "pendientes": 0, "no_enviados": 0, "con_error": 0})
+        cuenta["recibidos"] += 1
+        envio = documento["estado_envio"]
+        if envio["estado"] == "enviado":
+            cuenta[f"enviados_{envio.get('origen') or 'manual'}"] += 1
+        else:
+            cuenta[envio["filtro"]] += 1
+    return resumen
+
+
 def _tipos_publicos(email: str) -> dict[str, Any]:
     por_tipo, por_estructura = _conteos(email)
+    resumen = _resumen_por_tipo(_documentos_con_envio(email))
+    vacio = {"recibidos": 0, "enviados_automatico": 0, "enviados_configurar": 0, "enviados_manual": 0, "pendientes": 0, "no_enviados": 0, "con_error": 0}
     lista = [{
         **tipo,
         "documentos": por_tipo.get(tipo["id"], 0),
         "estructuras": [{**estructura, "documentos": por_estructura.get(estructura["id"], 0)} for estructura in tipo.get("estructuras") or []],
+        "resumen_envios": {"dias": DIAS_RESUMEN, **(resumen.get(tipo["id"]) or vacio)},
     } for tipo in tipos.leer(email)]
     return {"tipos": lista, "umbral_confianza": UMBRAL_CONFIANZA}
 
@@ -885,16 +941,8 @@ def resolver_sugerencia_estructura(tipo_id: str, accion: str, payload: Sugerenci
 def documentos_recibidos(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
     """Últimos documentos guardados con su tipo detectado, cómo se detectó y su estado (más recientes primero)."""
     email = _cuenta_actual()
-    ec = tipos.obtener(email, TIPO_EC_ID) or {}
-    documentos = []
-    for entrada in almacen.listar(email):
-        tipo_documento = entrada.get("tipo_documento") or {
-            "tipo_id": TIPO_EC_ID, "codigo": ec.get("codigo"), "nombre": ec.get("nombre"), "color": ec.get("color"), "contable": True,
-            "metodo": None, "confianza": None, "requiere_revision": False, "motivo": None,
-        }
-        documentos.append({**entrada, "tipo_documento": tipo_documento})
-    documentos.sort(key=lambda item: item.get("creado") or item.get("actualizado") or "", reverse=True)
-    return {"documentos": documentos[:limit], "umbral_confianza": UMBRAL_CONFIANZA}
+    # Cada documento trae su estado de envío ("Enviado automáticamente", "Pendiente de envío…", "No se envió: …").
+    return {"documentos": _documentos_con_envio(email)[:limit], "umbral_confianza": UMBRAL_CONFIANZA}
 
 
 class SugerirTipoRequest(BaseModel):
