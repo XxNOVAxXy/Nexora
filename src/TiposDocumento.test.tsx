@@ -6,12 +6,12 @@ import type { ExtraccionGuardada } from './services/extraccionesApi'
 import type { ArchivoExtraccion } from './services/pestanasExtraccion'
 import type { DocumentoRecibido, ResultadoConfigurar, TipoDocumento } from './services/tiposDocumentoApi'
 
-const { listarMock, documentosMock, sugerirMock, configurarMock, editarMock, editarEstructuraMock, guardarMock } = vi.hoisted(() => ({
-  listarMock: vi.fn(), documentosMock: vi.fn(), sugerirMock: vi.fn(), configurarMock: vi.fn(), editarMock: vi.fn(), editarEstructuraMock: vi.fn(), guardarMock: vi.fn(),
+const { listarMock, documentosMock, sugerirMock, configurarMock, editarMock, editarEstructuraMock, guardarMock, restaurarMock } = vi.hoisted(() => ({
+  listarMock: vi.fn(), documentosMock: vi.fn(), sugerirMock: vi.fn(), configurarMock: vi.fn(), editarMock: vi.fn(), editarEstructuraMock: vi.fn(), guardarMock: vi.fn(), restaurarMock: vi.fn(),
 }))
 vi.mock('./services/tiposDocumentoApi', async (importOriginal) => {
   const real = await importOriginal<typeof import('./services/tiposDocumentoApi')>()
-  return { ...real, tiposDocumentoApi: { ...real.tiposDocumentoApi, listar: listarMock, documentos: documentosMock, sugerir: sugerirMock, configurarDocumento: configurarMock, editar: editarMock, editarEstructura: editarEstructuraMock } }
+  return { ...real, tiposDocumentoApi: { ...real.tiposDocumentoApi, listar: listarMock, documentos: documentosMock, sugerir: sugerirMock, configurarDocumento: configurarMock, editar: editarMock, editarEstructura: editarEstructuraMock, restaurarPlantilla: restaurarMock } }
 })
 vi.mock('./services/plantillaCamposApi', () => ({
   plantillaCamposApi: { obtener: vi.fn(async () => ({ configurada: true, campos: [], actualizado: null })), guardar: vi.fn(), sugerir: vi.fn(async () => []) },
@@ -104,7 +104,7 @@ describe('Configuración → Tipos de documento: documentos que llegaron', () =>
     // Paso 3: la IA lee el mismo documento y propone campos con un ejemplo.
     fireEvent.click(within(panel).getByRole('button', { name: 'Proponer campos con IA' }))
     const propuestos = await within(panel).findByRole('list', { name: 'Campos propuestos por la IA' })
-    expect(sugerirMock).toHaveBeenCalledWith('m1', 'att-1', 'Gastos médicos', 'Asegurados')
+    expect(sugerirMock).toHaveBeenCalledWith('m1', 'att-1', 'Gastos médicos', 'Asegurados', [])
     expect(propuestos.textContent).toContain('Ej.: Ana López')
     expect((within(propuestos).getByLabelText('Dónde va Asegurado') as HTMLSelectElement).value).toBe('movimiento')
     fireEvent.click(within(propuestos).getByRole('checkbox', { name: 'Usar Vigencia' }))
@@ -338,5 +338,43 @@ describe('Pólizas: datos legibles, sección con su nombre y sin verificación d
     fireEvent.click(within(panel).getByRole('button', { name: 'Proponer campos con IA' }))
     const aviso = await within(panel).findByRole('note')
     expect(aviso.textContent).toContain('La IA ve una tabla que se repite (Asegurado)')
+  })
+})
+
+describe('Plantillas predeterminadas', () => {
+  const FIANZAS: TipoDocumento = { id: 'tipo-f', nombre: 'Fianzas', codigo: 'F', color: '#059669', seccion: null, contable: false, configurado: true, estructuras: [],
+    plantilla: { codigo: 'F', version: 1 }, plantilla_faltantes: ['Agente'],
+    campos: [{ id: 'pd-numero-de-fianza', nombre: 'Número de fianza', origen: 'manual', alcance: 'documento' }] }
+
+  it('el tipo precargado muestra "Plantilla predeterminada" y restaura los campos que faltan después de confirmar', async () => {
+    listarMock.mockImplementation(async () => ({ tipos: [EC, FIANZAS], umbral_confianza: 0.7 }))
+    const restaurado = { ...FIANZAS, plantilla_faltantes: [], campos: [...FIANZAS.campos, { id: 'pd-agente', nombre: 'Agente', origen: 'manual' as const, alcance: 'documento' as const }] }
+    restaurarMock.mockImplementation(async () => ({ tipos: [EC, restaurado], umbral_confianza: 0.7, tipo: restaurado, agregados: ['Agente'] }))
+    const onNotice = vi.fn()
+    render(<TiposDocumentoSeccion onNotice={onNotice} onError={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Tipos y reglas' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Fianzas/ }))
+    expect(screen.getByTestId('tipo-configurando').textContent).toContain('Plantilla predeterminada')
+    fireEvent.click(screen.getByRole('button', { name: 'Restaurar campos predeterminados' }))
+    const confirmar = screen.getByRole('alertdialog', { name: 'Confirmar restaurar campos' })
+    expect(confirmar.textContent).toContain('Agente')
+    expect(restaurarMock).not.toHaveBeenCalled()
+    fireEvent.click(within(confirmar).getByRole('button', { name: 'Sí, agregar' }))
+    await waitFor(() => expect(restaurarMock).toHaveBeenCalledWith('tipo-f'))
+    await waitFor(() => expect(onNotice).toHaveBeenCalledWith('Se agregó 1 campo predeterminado a «Fianzas»: Agente.'))
+    // La lista de campos del editor ya trae el campo restaurado y el botón queda sin nada que restaurar.
+    expect(within(screen.getByRole('list', { name: 'Campos de Fianzas' })).getByText('Agente')).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Restaurar campos predeterminados' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('en un tipo que no es Estado de cuenta se puede agregar un campo «Fecha»', async () => {
+    listarMock.mockImplementation(async () => ({ tipos: [EC, FIANZAS], umbral_confianza: 0.7 }))
+    render(<TiposDocumentoSeccion onNotice={vi.fn()} onError={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Tipos y reglas' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Fianzas/ }))
+    fireEvent.change(screen.getByLabelText('Nombre del campo nuevo'), { target: { value: 'Fecha' } })
+    expect(screen.queryByText('Ese campo ya es una columna de la tabla.')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Agregar a mano' }))
+    expect(within(screen.getByRole('list', { name: 'Campos de Fianzas' })).getByText('Fecha')).toBeTruthy()
   })
 })

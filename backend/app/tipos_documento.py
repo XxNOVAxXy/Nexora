@@ -35,9 +35,9 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from . import filtro_estados
+from . import filtro_estados, plantillas_tipos
 from .extracciones import MAX_CAMPOS_EXTRA, TIPO_EC_ID as TIPO_EC_ID_EXTRACCIONES, cuenta_id, escribir_atomico
-from .plantilla_campos import AlmacenPlantillas, CampoPlantilla, PlantillaRequest, comparable
+from .plantilla_campos import AlmacenPlantillas, CampoPlantilla, PlantillaRequest, comparable, validar_campos
 from .remitentes import ReglaInvalida, coincide, normalizar_remitente
 
 logger = logging.getLogger("nexora.tipos")
@@ -153,7 +153,9 @@ class TipoRequest(BaseModel):
 
     @model_validator(mode="after")
     def _campos_validos(self) -> "TipoRequest":
-        PlantillaRequest.model_validate({"campos": [campo.model_dump() for campo in self.campos]})
+        # Fuera de Estado de cuenta no hay columnas fijas: "Fecha" puede ser un campo (p. ej. del recibo de fianza).
+        # Los campos de EC se validan con las columnas fijas al guardarse en la configuración de campos.
+        validar_campos(self.campos, fijos=False)
         if self.seccion is None and any(campo.alcance != "documento" for campo in self.campos):
             raise ValueError("Sin sección repetible, todos los campos deben ser «Una vez».")
         return self
@@ -173,9 +175,11 @@ def _tipo_ec(ahora: str | None = None) -> dict[str, Any]:
 
 
 class AlmacenTipos:
-    def __init__(self, raiz: Path, plantillas: AlmacenPlantillas) -> None:
+    def __init__(self, raiz: Path, plantillas: AlmacenPlantillas, precargadas: tuple[dict[str, Any], ...] = plantillas_tipos.PLANTILLAS) -> None:
         self.raiz = raiz
         self.plantillas = plantillas
+        # Plantillas que se precargan (las pruebas de la mecánica genérica de tipos usan una configuración vacía).
+        self.precargadas = precargadas
         self._lock = threading.RLock()
 
     def _ruta(self, email: str) -> Path:
@@ -194,7 +198,35 @@ class AlmacenTipos:
         # Migración: Estado de cuenta siempre existe y va primero.
         if not any(tipo.get("id") == TIPO_EC_ID for tipo in datos["tipos"]):
             datos["tipos"].insert(0, _tipo_ec())
+        if self._aplicar_plantillas(datos["tipos"], self.precargadas):
+            self._escribir(email, datos)
         return datos
+
+    @staticmethod
+    def _aplicar_plantillas(tipos: list[dict[str, Any]], precargadas: tuple[dict[str, Any], ...]) -> bool:
+        """Plantillas precargadas (una vez por versión): crea los tipos que falten y completa los existentes con los
+        campos que les falten, sin borrar ni renombrar. Devuelve True si cambió algo."""
+        cambio = False
+        for base in precargadas:
+            marcado = next((tipo for tipo in tipos if (tipo.get("plantilla") or {}).get("codigo") == base["codigo"]), None)
+            if marcado is not None and int(marcado["plantilla"].get("version") or 0) >= plantillas_tipos.VERSION_PLANTILLAS:
+                continue
+            tipo = marcado or next((item for item in tipos if item.get("codigo") == base["codigo"] and item.get("id") != TIPO_EC_ID), None)
+            if tipo is None:
+                if len(tipos) >= MAX_TIPOS or any(comparable(item.get("nombre", "")) == comparable(base["nombre"]) for item in tipos):
+                    logger.warning("Plantilla %s no se creo: no hay lugar o ya hay un tipo con ese nombre", base["codigo"])
+                    continue
+                tipo = plantillas_tipos.nuevo_tipo(base, f"tipo-{uuid.uuid4().hex[:10]}")
+                tipo["creado"] = _ahora()
+                tipos.append(tipo)
+                logger.info("Plantilla %s: tipo creado con %d campos", base["codigo"], len(tipo["campos"]))
+            else:
+                quitados = plantillas_tipos.quitar_mal_nombrados(tipo, base["codigo"])
+                agregados = plantillas_tipos.completar(tipo, base, MAX_CAMPOS_EXTRA)
+                logger.info("Plantilla %s: tipo existente completado agregados=%s quitados=%s", base["codigo"], agregados, quitados)
+            tipo["plantilla"] = {"codigo": base["codigo"], "version": plantillas_tipos.VERSION_PLANTILLAS}
+            cambio = True
+        return cambio
 
     def _escribir(self, email: str, datos: dict[str, Any]) -> None:
         datos = {**datos, "schema": 1, "cuenta": email.strip().lower(), "actualizado": _ahora()}
@@ -206,12 +238,17 @@ class AlmacenTipos:
     def _publico(self, email: str, tipo: dict[str, Any]) -> dict[str, Any]:
         ec = tipo["id"] == TIPO_EC_ID
         campos = self.plantillas.efectiva(email) if ec else list(tipo.get("campos") or [])
+        base = plantillas_tipos.plantilla((tipo.get("plantilla") or {}).get("codigo"))
         return {
             **tipo,
             "campos": campos,
             "contable": ec,
             # Estado de cuenta funciona aunque no tenga campos adicionales (como siempre).
             "configurado": ec or bool(campos),
+            # Tipos precargados: su plantilla, la descripción para clasificar y los campos que le faltan.
+            "plantilla": None if base is None else {"codigo": base["codigo"], "version": (tipo.get("plantilla") or {}).get("version")},
+            "descripcion": None if base is None else base["descripcion"],
+            "plantilla_faltantes": [] if base is None else [campo["nombre"] for campo in plantillas_tipos.faltantes(tipo, base)],
         }
 
     def leer(self, email: str) -> list[dict[str, Any]]:
@@ -331,6 +368,21 @@ class AlmacenTipos:
                 reglas["aseguradoras"] = [*reglas.get("aseguradoras", []), aseguradora]
             solicitud = EstructuraRequest(nombre=existente["nombre"] if existente else nombre, reglas=ReglasEstructura.model_validate(reglas))
             return self.guardar_estructura(email, tipo_id, solicitud, existente["id"] if existente else None)
+
+    def restaurar_plantilla(self, email: str, tipo_id: str) -> tuple[dict[str, Any], list[str]]:
+        """Restaurar campos predeterminados: agrega los campos de la plantilla que falten (sin borrar ni renombrar)."""
+        with self._lock:
+            datos = self._leer_archivo(email)
+            tipo = next((item for item in datos["tipos"] if item["id"] == tipo_id), None)
+            if tipo is None:
+                raise KeyError(tipo_id)
+            base = plantillas_tipos.plantilla((tipo.get("plantilla") or {}).get("codigo"))
+            if base is None:
+                raise ConflictoTipos("Este tipo no tiene plantilla predeterminada.")
+            agregados = plantillas_tipos.completar(tipo, base, MAX_CAMPOS_EXTRA)
+            if agregados:
+                self._escribir(email, datos)
+            return self._publico(email, tipo), agregados
 
     def color_libre(self, email: str) -> str:
         usados = {tipo.get("color") for tipo in self.leer(email)}
@@ -457,6 +509,7 @@ def para_clasificar(tipos: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "codigo": tipo["codigo"],
         "nombre": tipo["nombre"],
         "seccion": (tipo.get("seccion") or {}).get("nombre"),
+        **({"descripcion": tipo["descripcion"]} if tipo.get("descripcion") else {}),
         "campos": [campo["nombre"] for campo in tipo.get("campos") or []][:15],
     } for tipo in tipos]
 

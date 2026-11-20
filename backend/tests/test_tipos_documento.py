@@ -93,7 +93,7 @@ class BaseTipos(unittest.TestCase):
         raiz = Path(self.tmp.name)
         self.almacen = AlmacenExtracciones(raiz / "extracciones")
         self.plantillas = AlmacenPlantillas(raiz / "plantillas", lambda _email: [])
-        self.tipos = AlmacenTipos(raiz / "tipos", self.plantillas)
+        self.tipos = AlmacenTipos(raiz / "tipos", self.plantillas, precargadas=())
 
 
 class Migracion(BaseTipos):
@@ -112,7 +112,7 @@ class Migracion(BaseTipos):
 
     def test_campos_deducidos_mientras_no_se_guarde(self) -> None:
         deducidos = AlmacenPlantillas(Path(self.tmp.name) / "p2", lambda _email: [RFC])
-        tipos = AlmacenTipos(Path(self.tmp.name) / "t2", deducidos)
+        tipos = AlmacenTipos(Path(self.tmp.name) / "t2", deducidos, precargadas=())
         self.assertEqual(tipos.ec(EMAIL)["campos"], [RFC])
         self.assertFalse(deducidos.leer(EMAIL)["configurada"])
 

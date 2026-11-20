@@ -138,7 +138,8 @@ function PanelConfigurar({ documento, tipos, onCerrar, onListo, onError }: { doc
     if (!documento.attachmentId) return
     setLeyendo(true)
     try {
-      const respuesta = await tiposDocumentoApi.sugerir(documento.messageId, documento.attachmentId, modo === 'nuevo' ? nuevo.nombre : existente?.nombre ?? '', seccion)
+      // Parte de los campos del tipo (su plantilla): la IA solo sugiere los que no estén.
+      const respuesta = await tiposDocumentoApi.sugerir(documento.messageId, documento.attachmentId, modo === 'nuevo' ? nuevo.nombre : existente?.nombre ?? '', seccion, campos.map((campo) => campo.nombre))
       setSugerencias(respuesta.sugerencias)
       if (!aseguradora && respuesta.aseguradora) { setAseguradora(respuesta.aseguradora); setPorAseguradora(true) }
     } catch (error) { onError(mensaje(error, 'La IA no pudo leer el documento.')) } finally { setLeyendo(false) }
@@ -190,7 +191,7 @@ function PanelConfigurar({ documento, tipos, onCerrar, onListo, onError }: { doc
       <Paso numero={3} titulo="Elige los campos">
         <div className="flex flex-wrap items-center gap-2"><button type="button" onClick={() => void leer()} disabled={leyendo || !documento.attachmentId} className="btn-soft"><Sparkles size={14} className={leyendo ? 'animate-pulse' : ''} />{leyendo ? 'Leyendo el documento…' : 'Proponer campos con IA'}</button><span className="text-[11px] text-slate-500">{documento.attachmentId ? 'La IA lee este mismo documento y propone campos con un ejemplo de su valor.' : 'Este documento no guarda el adjunto: agrega los campos a mano.'}</span></div>
         {sugerencias && <Sugerencias sugerencias={sugerencias} campos={campos} seccion={seccion} onAgregar={setCampos} />}
-        <div className="mt-3"><ListaCamposEditable campos={campos} onCampos={setCampos} seccion={seccion} etiqueta="Campos del tipo" /></div>
+        <div className="mt-3"><ListaCamposEditable campos={campos} onCampos={setCampos} seccion={seccion} etiqueta="Campos del tipo" permitirFijos={!(modo === 'existente' && existente?.contable)} /></div>
       </Paso>
     </div>
     <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4">
@@ -234,19 +235,19 @@ function Sugerencias({ sugerencias, campos, seccion, onAgregar }: { sugerencias:
 }
 
 /** Lista de campos de un tipo: renombrar, cambiar si van "Una vez" o en la sección, quitar y agregar a mano. */
-function ListaCamposEditable({ campos, onCampos, seccion, etiqueta }: { campos: CampoPlantilla[]; onCampos: (campos: CampoPlantilla[]) => void; seccion: string | null; etiqueta: string }) {
+function ListaCamposEditable({ campos, onCampos, seccion, etiqueta, permitirFijos = true }: { campos: CampoPlantilla[]; onCampos: (campos: CampoPlantilla[]) => void; seccion: string | null; etiqueta: string; permitirFijos?: boolean }) {
   const [nombre, setNombre] = useState('')
   const [alcance, setAlcance] = useState<AlcanceCampo>('documento')
   const [renombrando, setRenombrando] = useState<{ id: string; nombre: string } | null>(null)
-  const errorNombre = nombre.trim() ? errorNombrePlantilla(nombre, campos) : null
+  const errorNombre = nombre.trim() ? errorNombrePlantilla(nombre, campos, undefined, permitirFijos) : null
   const agregarManual = () => {
     if (!nombre.trim() || errorNombre) return
-    onCampos(agregarAPlantilla(campos, { nombre, origen: 'manual', alcance: seccion ? alcance : 'documento' }))
+    onCampos(agregarAPlantilla(campos, { nombre, origen: 'manual', alcance: seccion ? alcance : 'documento' }, permitirFijos))
     setNombre('')
   }
   const confirmarRenombre = () => {
-    if (!renombrando || errorNombrePlantilla(renombrando.nombre, campos, renombrando.id)) return
-    onCampos(renombrarEnPlantilla(campos, renombrando.id, renombrando.nombre))
+    if (!renombrando || errorNombrePlantilla(renombrando.nombre, campos, renombrando.id, permitirFijos)) return
+    onCampos(renombrarEnPlantilla(campos, renombrando.id, renombrando.nombre, permitirFijos))
     setRenombrando(null)
   }
   return <div>
@@ -255,7 +256,7 @@ function ListaCamposEditable({ campos, onCampos, seccion, etiqueta }: { campos: 
     <ul className="mt-2 space-y-1 text-xs" aria-label={etiqueta}>
       {campos.map((campo) => <li key={campo.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-100 px-2.5 py-1.5">
         {renombrando?.id === campo.id
-          ? <span className="flex flex-1 items-center gap-1"><input autoFocus aria-label={`Nuevo nombre de ${campo.nombre}`} value={renombrando.nombre} maxLength={60} onChange={(event) => setRenombrando({ id: campo.id, nombre: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter') confirmarRenombre(); if (event.key === 'Escape') setRenombrando(null) }} className="input py-1 text-xs" /><button type="button" onClick={confirmarRenombre} disabled={Boolean(errorNombrePlantilla(renombrando.nombre, campos, campo.id))} className="btn-soft px-2 py-1 text-[11px]">Listo</button></span>
+          ? <span className="flex flex-1 items-center gap-1"><input autoFocus aria-label={`Nuevo nombre de ${campo.nombre}`} value={renombrando.nombre} maxLength={60} onChange={(event) => setRenombrando({ id: campo.id, nombre: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter') confirmarRenombre(); if (event.key === 'Escape') setRenombrando(null) }} className="input py-1 text-xs" /><button type="button" onClick={confirmarRenombre} disabled={Boolean(errorNombrePlantilla(renombrando.nombre, campos, campo.id, permitirFijos))} className="btn-soft px-2 py-1 text-[11px]">Listo</button></span>
           : <span className="min-w-0 flex-1 truncate font-semibold text-ink">{campo.nombre}</span>}
         <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-bold ${campo.origen === 'ia' ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-600'}`}>{campo.origen === 'ia' ? 'IA' : 'Manual'}</span>
         <select aria-label={`Dónde va ${campo.nombre}`} value={seccion ? campo.alcance : 'documento'} disabled={!seccion} onChange={(event) => onCampos(cambiarTipoEnPlantilla(campos, campo.id, event.target.value as AlcanceCampo))} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[11px]"><option value="documento">Una vez</option>{seccion && <option value="movimiento">{etiquetaAlcanceTipo('movimiento', seccion)}</option>}</select>
@@ -299,11 +300,40 @@ function DetalleTipo({ tipo, tipos, onTipos, onNotice, onError, editorEstadoDeCu
     <div role="status" data-testid="tipo-configurando" className="rounded-xl border-l-4 px-4 py-3 text-sm font-bold" style={{ borderColor: tipo.color, backgroundColor: `${tipo.color}14`, color: tipo.color }}>
       Estás configurando el tipo {tipo.nombre} · código {tipo.codigo}
       <div className="mt-0.5 text-[11px] font-medium text-slate-500">{tipo.seccion ? `Sección repetible: ${tipo.seccion.nombre}` : 'Sin sección repetible'} · {tipo.documentos ?? 0} documento{tipo.documentos === 1 ? '' : 's'}{tipo.contable ? ' · con validación contable' : ''}</div>
+      {tipo.plantilla && <div className="mt-1.5"><span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700">Plantilla predeterminada</span></div>}
     </div>
+    {tipo.plantilla && <RestaurarPlantilla tipo={tipo} onTipos={onTipos} onNotice={onNotice} onError={onError} />}
     {!tipo.contable && <FormularioTipo tipo={tipo} tipos={tipos} onGuardado={(lista) => { onTipos(lista); onNotice(`Tipo «${tipo.nombre}» guardado.`) }} onError={onError} />}
     <Estructuras tipo={tipo} onTipos={onTipos} onNotice={onNotice} onError={onError} />
     {tipo.contable ? editorEstadoDeCuenta ?? null : <EditorCamposTipo tipo={tipo} onTipos={onTipos} onNotice={onNotice} onError={onError} />}
   </div>
+}
+
+/** "Restaurar campos predeterminados": agrega los campos de la plantilla que falten, después de confirmar. */
+function RestaurarPlantilla({ tipo, onTipos, onNotice, onError }: Avisos & { tipo: TipoDocumento; onTipos: (tipos: TipoDocumento[]) => void }) {
+  const [confirmando, setConfirmando] = useState(false)
+  const [restaurando, setRestaurando] = useState(false)
+  const faltan = tipo.plantilla_faltantes ?? []
+  const restaurar = async () => {
+    setRestaurando(true)
+    try {
+      const respuesta = await tiposDocumentoApi.restaurarPlantilla(tipo.id)
+      onTipos(respuesta.tipos)
+      setConfirmando(false)
+      const n = respuesta.agregados.length
+      onNotice(n ? `${n === 1 ? 'Se agregó 1 campo predeterminado' : `Se agregaron ${n} campos predeterminados`} a «${tipo.nombre}»: ${respuesta.agregados.join(', ')}.` : `«${tipo.nombre}» ya tiene todos los campos predeterminados.`)
+    } catch (error) { onError(mensaje(error, 'No se pudieron restaurar los campos predeterminados.')) } finally { setRestaurando(false) }
+  }
+  return <section className="panel p-4 text-xs" aria-label="Plantilla predeterminada">
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="flex-1 text-[11px] text-slate-500">{faltan.length ? `Faltan ${faltan.length} campo${faltan.length === 1 ? '' : 's'} de la plantilla predeterminada.` : 'El tipo tiene todos los campos de la plantilla predeterminada.'}</span>
+      <button type="button" onClick={() => setConfirmando(true)} disabled={faltan.length === 0 || confirmando} className="btn-soft px-3 py-1.5 text-xs"><RefreshCw size={13} />Restaurar campos predeterminados</button>
+    </div>
+    {confirmando && <div role="alertdialog" aria-label="Confirmar restaurar campos" className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
+      <p>Se agregarán estos campos a «{tipo.nombre}»: <strong>{faltan.join(', ')}</strong>. No se borra ni se renombra ningún campo.</p>
+      <div className="mt-2 flex gap-2"><button type="button" onClick={() => void restaurar()} disabled={restaurando} className="btn-primary px-3 py-1 text-[11px]"><Check size={12} />Sí, agregar</button><button type="button" onClick={() => setConfirmando(false)} className="btn-soft px-3 py-1 text-[11px]">Cancelar</button></div>
+    </div>}
+  </section>
 }
 
 function FormularioTipo({ tipo, tipos, onGuardado, onError }: { tipo?: TipoDocumento; tipos: TipoDocumento[]; onGuardado: (tipos: TipoDocumento[], tipo: TipoDocumento) => void; onError: (texto: string) => void }) {
@@ -391,6 +421,9 @@ function EditorCamposTipo({ tipo, onTipos, onNotice, onError }: Avisos & { tipo:
   const [campos, setCampos] = useState<CampoPlantilla[]>(tipo.campos)
   const [guardando, setGuardando] = useState(false)
   const sinGuardar = useMemo(() => JSON.stringify(campos) !== JSON.stringify(tipo.campos), [campos, tipo.campos])
+  // "Restaurar campos predeterminados" cambió los campos guardados: se parte de ellos (solo si cambió su contenido).
+  const guardados = JSON.stringify(tipo.campos)
+  useEffect(() => { setCampos(tipo.campos) }, [guardados])
   const guardar = async () => {
     setGuardando(true)
     try {

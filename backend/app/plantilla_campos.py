@@ -59,9 +59,22 @@ class CampoPlantilla(BaseModel):
             raise ValueError("El nombre del campo no puede estar vacio.")
         if len(nombre) > MAX_NOMBRE_CAMPO:
             raise ValueError(f"El nombre del campo admite hasta {MAX_NOMBRE_CAMPO} caracteres.")
-        if comparable(nombre) in NOMBRES_FIJOS:
-            raise ValueError(f"«{nombre}» ya es un campo fijo de la tabla.")
         return nombre
+
+
+def validar_campos(campos: list[CampoPlantilla], fijos: bool = True) -> None:
+    """Ids y nombres únicos. Con ``fijos`` (Estado de cuenta) tampoco se admiten los nombres de las columnas fijas."""
+    ids = [campo.id for campo in campos]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Los ids de los campos deben ser unicos.")
+    nombres = [comparable(campo.nombre) for campo in campos]
+    repetidos = sorted({nombre for nombre in nombres if nombres.count(nombre) > 1})
+    if repetidos:
+        raise ValueError(f"Hay campos repetidos: {', '.join(repetidos)}.")
+    if fijos:
+        fijo = next((campo.nombre for campo in campos if comparable(campo.nombre) in NOMBRES_FIJOS), None)
+        if fijo:
+            raise ValueError(f"«{fijo}» ya es un campo fijo de la tabla.")
 
 
 class PlantillaRequest(BaseModel):
@@ -71,13 +84,7 @@ class PlantillaRequest(BaseModel):
 
     @model_validator(mode="after")
     def _sin_repetidos(self) -> "PlantillaRequest":
-        ids = [campo.id for campo in self.campos]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Los ids de los campos deben ser unicos.")
-        nombres = [comparable(campo.nombre) for campo in self.campos]
-        repetidos = sorted({nombre for nombre in nombres if nombres.count(nombre) > 1})
-        if repetidos:
-            raise ValueError(f"Hay campos repetidos: {', '.join(repetidos)}.")
+        validar_campos(self.campos)
         return self
 
 

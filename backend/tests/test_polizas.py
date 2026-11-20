@@ -73,7 +73,7 @@ class TresPolizas(unittest.TestCase):
         raiz = Path(self.tmp.name)
         self.ajustes = modulo_gemini.GeminiSettings(raiz / "gemini.json")
         self.ajustes._write({"apiKey": "x" * 20, "model": "m", "enabled": True})
-        self.tipos = AlmacenTipos(raiz / "tipos", AlmacenPlantillas(raiz / "plantillas"))
+        self.tipos = AlmacenTipos(raiz / "tipos", AlmacenPlantillas(raiz / "plantillas"), precargadas=())
         self.almacen = AlmacenExtracciones(raiz / "extracciones")
 
     def _extraer(self, clave: str) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
@@ -148,7 +148,7 @@ class SinDatosNoSeEnvia(unittest.TestCase):
         raiz = Path(tmp.name)
         almacen = AlmacenExtracciones(raiz / "extracciones")
         plantillas = AlmacenPlantillas(raiz / "plantillas")
-        tipos = AlmacenTipos(raiz / "tipos", plantillas)
+        tipos = AlmacenTipos(raiz / "tipos", plantillas, precargadas=())
         tipo = tipos.guardar_tipo(EMAIL, TipoRequest.model_validate({"nombre": "Autos", "codigo": "A", "seccion": {"nombre": "Coberturas"}, "campos": _campos(["Número de póliza"], ["Cobertura"])}))
         tipos.agregar_reglas(EMAIL, tipo["id"], nombre_estructura="Norte", remitente="@norte.example")
         gmail = GmailFalso()

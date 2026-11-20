@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .adjuntos import content_disposition
 from .automatico import ExtractorAutomatico, intervalo_desde_entorno
-from .plantilla_campos import AlmacenPlantillas, PlantillaRequest, aplicar_plantilla, deducir_campos, sugerencias_para_configurar
+from .plantilla_campos import AlmacenPlantillas, PlantillaRequest, aplicar_plantilla, comparable, deducir_campos, sugerencias_para_configurar
 from .config import settings
 from .preferencias import AlmacenClasificaciones, ClasificacionRequest, ConfiguracionCuenta, MigracionRequest, RemitentesRequest
 from .remitentes import CONSULTAS_CARPETA, ListaRemitentesInvalida, coincide, construir_query
@@ -841,6 +841,17 @@ def editar_estructura(tipo_id: str, estructura_id: str, payload: EstructuraReque
     return _tipos_publicos(email)
 
 
+@app.post("/api/tipos/{tipo_id}/restaurar-plantilla")
+def restaurar_plantilla(tipo_id: str) -> dict[str, Any]:
+    """Restaurar campos predeterminados: agrega los campos de la plantilla que falten, sin borrar ni renombrar."""
+    email = _cuenta_actual()
+    try:
+        tipo, agregados = tipos.restaurar_plantilla(email, tipo_id)
+    except (ConflictoTipos, KeyError) as error:
+        raise _error_tipos(error) from error
+    return {"tipo": tipo, "agregados": agregados, **_tipos_publicos(email)}
+
+
 @app.get("/api/tipos/documentos")
 def documentos_recibidos(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
     """Últimos documentos guardados con su tipo detectado, cómo se detectó y su estado (más recientes primero)."""
@@ -864,6 +875,8 @@ class SugerirTipoRequest(BaseModel):
     attachmentId: str = Field(min_length=1, max_length=4000)
     nombre_tipo: str = Field(default="Documento", max_length=80)
     seccion: str | None = Field(default=None, max_length=60)
+    # Campos que ya tiene el tipo (su plantilla): la IA los busca y solo sugiere los que no estén.
+    campos: list[str] = Field(default_factory=list, max_length=30)
 
 
 @app.post("/api/tipos/sugerir")
@@ -872,7 +885,7 @@ def sugerir_campos_tipo(payload: SugerirTipoRequest) -> dict[str, Any]:
     _cuenta_actual()
     try:
         data, media_type, filename = gmail.attachment(payload.messageId, payload.attachmentId)
-        resultado = gemini.extract_document(data, media_type, filename, tipo={"nombre": payload.nombre_tipo or "Documento", "seccion": payload.seccion or ""})
+        resultado = gemini.extract_document(data, media_type, filename, campos_solicitados=payload.campos, tipo={"nombre": payload.nombre_tipo or "Documento", "seccion": payload.seccion or ""})
     except GmailNotConnectedError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
     except GmailRateLimitError as error:
@@ -883,7 +896,9 @@ def sugerir_campos_tipo(payload: SugerirTipoRequest) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except GeminiRequestError as error:
         raise HTTPException(status_code=error.status_code, detail={"code": error.code, "message": str(error), "retryable": error.retryable}) from error
-    return {"sugerencias": sugerencias_para_configurar(resultado), "aseguradora": resultado.get("aseguradora") or None}
+    ya = {comparable(nombre) for nombre in payload.campos}
+    sugerencias = [item for item in sugerencias_para_configurar(resultado) if comparable(item["nombre"]) not in ya]
+    return {"sugerencias": sugerencias, "aseguradora": resultado.get("aseguradora") or None}
 
 
 class TipoNuevoRequest(BaseModel):

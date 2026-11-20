@@ -21,18 +21,18 @@ export function nuevoIdPlantilla(): string {
 }
 
 /** Error del nombre de un campo de la configuración, o null si es válido (mismas reglas que "+ Campo"). */
-export function errorNombrePlantilla(nombre: string, campos: CampoPlantilla[], excepto?: string): string | null {
-  return errorNombreCampo(nombre, campos.map((campo) => ({ id: campo.id, nombre: campo.nombre, origen: campo.origen })), excepto)
+export function errorNombrePlantilla(nombre: string, campos: CampoPlantilla[], excepto?: string, permitirFijos = false): string | null {
+  return errorNombreCampo(nombre, campos.map((campo) => ({ id: campo.id, nombre: campo.nombre, origen: campo.origen })), excepto, permitirFijos)
 }
 
-export function agregarAPlantilla(campos: CampoPlantilla[], campo: Omit<CampoPlantilla, 'id'> & { id?: string }): CampoPlantilla[] {
-  if (campos.length >= MAX_CAMPOS_EXTRA || errorNombrePlantilla(campo.nombre, campos)) return campos
+export function agregarAPlantilla(campos: CampoPlantilla[], campo: Omit<CampoPlantilla, 'id'> & { id?: string }, permitirFijos = false): CampoPlantilla[] {
+  if (campos.length >= MAX_CAMPOS_EXTRA || errorNombrePlantilla(campo.nombre, campos, undefined, permitirFijos)) return campos
   const { id, ...resto } = campo
   return [...campos, { ...resto, id: id ?? nuevoIdPlantilla(), nombre: campo.nombre.replace(/\s+/g, ' ').trim() }]
 }
 
-export const renombrarEnPlantilla = (campos: CampoPlantilla[], id: string, nombre: string) =>
-  errorNombrePlantilla(nombre, campos, id) ? campos : campos.map((campo) => (campo.id === id ? { ...campo, nombre: nombre.replace(/\s+/g, ' ').trim() } : campo))
+export const renombrarEnPlantilla = (campos: CampoPlantilla[], id: string, nombre: string, permitirFijos = false) =>
+  errorNombrePlantilla(nombre, campos, id, permitirFijos) ? campos : campos.map((campo) => (campo.id === id ? { ...campo, nombre: nombre.replace(/\s+/g, ' ').trim() } : campo))
 export const cambiarTipoEnPlantilla = (campos: CampoPlantilla[], id: string, alcance: AlcanceCampo) => campos.map((campo) => (campo.id === id ? { ...campo, alcance } : campo))
 export const quitarDePlantilla = (campos: CampoPlantilla[], id: string) => campos.filter((campo) => campo.id !== id)
 

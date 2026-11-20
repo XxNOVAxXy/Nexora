@@ -39,12 +39,13 @@ export function sugerenciasDisponibles(sugerencias: SugerenciaCampo[], campos: C
 }
 
 /** Error de validación del nombre de una columna, o null si es válido. `excepto` permite conservar el propio nombre al renombrar. */
-export function errorNombreCampo(nombre: string, campos: CampoExtra[], excepto?: string): string | null {
+export function errorNombreCampo(nombre: string, campos: CampoExtra[], excepto?: string, permitirFijos = false): string | null {
   const limpio = limpiarNombre(nombre)
   if (!limpio) return 'Escribe un nombre para el campo.'
   if (limpio.length > MAX_NOMBRE_CAMPO) return `El nombre admite hasta ${MAX_NOMBRE_CAMPO} caracteres.`
   const comparable = nombreComparable(limpio)
-  if (['fecha', 'concepto', 'referencia', 'cargo', 'abono', 'saldo'].includes(comparable)) return 'Ese campo ya es una columna de la tabla.'
+  // Solo Estado de cuenta tiene columnas fijas: en los demás tipos «Fecha» puede ser un campo (recibo de fianza).
+  if (!permitirFijos && ['fecha', 'concepto', 'referencia', 'cargo', 'abono', 'saldo'].includes(comparable)) return 'Ese campo ya es una columna de la tabla.'
   if (campos.some((campo) => campo.id !== excepto && nombreComparable(campo.nombre) === comparable)) return 'Ya existe un campo con ese nombre.'
   return null
 }

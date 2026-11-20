@@ -41,7 +41,7 @@ class GeminiRequestError(RuntimeError):
 
 
 # Cambia esta versión cada vez que cambie el prompt o el esquema: invalida los resultados en caché.
-PROMPT_VERSION = "2026-11-12.2"
+PROMPT_VERSION = "2026-11-20.1"
 CACHE_MAX_ITEMS = 16
 # Máximo de los modelos Flash actuales. Los tokens de razonamiento también cuentan contra este límite.
 MAX_OUTPUT_TOKENS_PREDETERMINADO = 65536
@@ -579,6 +579,8 @@ def _prompt_clasificar(filename: str, tipos: list[dict[str, Any]]) -> str:
     return f"""Clasifica el documento adjunto llamado {filename!r} en uno de estos tipos de documento (uno por linea, en JSON):
 {lista}
 
+Cada tipo puede traer una `descripcion` corta de lo que lo distingue: usala para decidir. Revisa todas las paginas: algunos PDF empiezan con un aviso de cobro, una carta o una hoja de asistencia y el documento principal viene despues.
+
 Devuelve unicamente un objeto JSON que cumpla el esquema recibido:
 - `codigo`: el `codigo` del tipo que corresponde, exactamente como aparece en la lista. Si no corresponde a ninguno, deja `codigo` vacio.
 - `confianza`: un numero de 0 a 1 que indica que tan seguro estas de la clasificacion (1 = seguro).
@@ -611,7 +613,7 @@ Para cada uno agrega un elemento en `campos_solicitados` con `nombre` (exactamen
 
 `datos`: ademas, agrega cada dato que el documento muestra una sola vez y que no este en la lista (por ejemplo numero de poliza, vigencia, contratante, prima total), con `nombre` y `valor` tal como estan impresos. En las filas incluye tambien las columnas visibles que no esten en la lista. Nunca inventes nombres ni valores.
 
-El documento puede tener varias paginas: cuenta cada fila una sola vez. Incluye en `notas` cualquier advertencia de lectura."""
+Lee todas las paginas necesarias: algunos PDF empiezan con un aviso de cobro, una carta o una hoja de asistencia, y la caratula o la tabla vienen en paginas posteriores. No te detengas en la primera pagina si los datos pedidos no estan ahi. Cuenta cada fila una sola vez aunque la tabla continue en otra pagina. Incluye en `notas` cualquier advertencia de lectura."""
 
 
 def _parse_generico(value: str) -> DocumentoGenerico:

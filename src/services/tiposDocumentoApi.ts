@@ -24,6 +24,12 @@ export type TipoDocumento = {
   contable: boolean
   configurado: boolean
   documentos?: number
+  /** Tipos precargados: su plantilla predeterminada (null si el tipo lo creó el usuario). */
+  plantilla?: { codigo: string; version: number | null } | null
+  /** Descripción corta que recibe la IA al clasificar. */
+  descripcion?: string | null
+  /** Campos de la plantilla que el tipo ya no tiene ("Restaurar campos predeterminados" los agrega). */
+  plantilla_faltantes?: string[]
 }
 
 export type MetodoDeteccion = 'remitente' | 'aseguradora' | 'asunto' | 'ia' | 'manual'
@@ -89,8 +95,10 @@ export const tiposDocumentoApi = {
   editarEstructura: (tipoId: string, id: string, estructura: { nombre: string; reglas: ReglasEstructura }) => request<ListaTipos>(`/tipos/${encodeURIComponent(tipoId)}/estructuras/${encodeURIComponent(id)}`, { method: 'PUT', body: json(estructura) }),
   documentos: (limite = 50) => request<{ documentos: DocumentoRecibido[]; umbral_confianza: number }>(`/tipos/documentos?limit=${limite}`),
   /** La IA lee el documento (de Gmail) y propone campos con un ejemplo de su valor. */
-  sugerir: (messageId: string, attachmentId: string, nombreTipo: string, seccion: string | null) =>
-    request<{ sugerencias: SugerenciaPlantilla[]; aseguradora: string | null }>('/tipos/sugerir', { method: 'POST', body: json({ messageId, attachmentId, nombre_tipo: nombreTipo || 'Documento', seccion }) }),
+  sugerir: (messageId: string, attachmentId: string, nombreTipo: string, seccion: string | null, campos: string[] = []) =>
+    request<{ sugerencias: SugerenciaPlantilla[]; aseguradora: string | null }>('/tipos/sugerir', { method: 'POST', body: json({ messageId, attachmentId, nombre_tipo: nombreTipo || 'Documento', seccion, campos: campos.slice(0, 30) }) }),
+  /** Agrega los campos de la plantilla predeterminada que le falten al tipo (sin borrar ni renombrar). */
+  restaurarPlantilla: (tipoId: string) => request<ListaTipos & { tipo: TipoDocumento; agregados: string[] }>(`/tipos/${encodeURIComponent(tipoId)}/restaurar-plantilla`, { method: 'POST' }),
   configurarDocumento: (solicitud: SolicitudConfigurarDocumento) => request<ResultadoConfigurar>('/tipos/configurar-documento', { method: 'POST', body: json(solicitud) }),
 }
 

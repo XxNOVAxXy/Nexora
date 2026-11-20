@@ -35,12 +35,16 @@ TERMINOS_ESTADO_CUENTA: tuple[str, ...] = (
     "statement",
 )
 
-# Pólizas (autos, flotillas, gastos médicos, daños): entran al filtro, pero no se asignan a Estado de cuenta por asunto.
+# Pólizas (autos, flotillas, gastos médicos, daños) y fianzas: entran al filtro, pero no se asignan a Estado de cuenta
+# por asunto.
 TERMINOS_POLIZA: tuple[str, ...] = (
     "poliza",
     "polizas",
     "renovacion",
     "endoso",
+    "fianza",
+    "fianzas",
+    "afianzadora",
 )
 
 TERMINOS_ASUNTO = (*TERMINOS_ESTADO_CUENTA, *TERMINOS_POLIZA)
@@ -62,6 +66,9 @@ TERMINOS_GMAIL: tuple[str, ...] = (
     "renovación",
     "renovacion",
     "endoso",
+    "fianza",
+    "fianzas",
+    "afianzadora",
 )
 
 # Tipos que Gemini puede extraer. Cambiar esta lista o los términos cambia la firma (y se reconsulta Gmail).
