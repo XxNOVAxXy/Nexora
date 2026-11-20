@@ -23,6 +23,7 @@ Queda "Requiere revisión" (se extrae, pero no se envía solo) si no hay tipo, s
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -35,7 +36,7 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from . import filtro_estados, plantillas_tipos
+from . import estructura_sugerida, filtro_estados, plantillas_tipos
 from .extracciones import MAX_CAMPOS_EXTRA, TIPO_EC_ID as TIPO_EC_ID_EXTRACCIONES, cuenta_id, escribir_atomico
 from .plantilla_campos import AlmacenPlantillas, CampoPlantilla, PlantillaRequest, comparable, validar_campos
 from .remitentes import ReglaInvalida, coincide, normalizar_remitente
@@ -239,8 +240,11 @@ class AlmacenTipos:
         ec = tipo["id"] == TIPO_EC_ID
         campos = self.plantillas.efectiva(email) if ec else list(tipo.get("campos") or [])
         base = plantillas_tipos.plantilla((tipo.get("plantilla") or {}).get("codigo"))
+        publico = {clave: valor for clave, valor in tipo.items() if clave != "estructura_sugerida"}
         return {
-            **tipo,
+            **publico,
+            # Avisos de cambios de estructura (por aseguradora): datos nuevos y campos que dejaron de aparecer.
+            **({"sugerencias_estructura": [], "campos_ausentes": []} if ec else estructura_sugerida.publico({**tipo, "campos": campos})),
             "campos": campos,
             "contable": ec,
             # Estado de cuenta funciona aunque no tenga campos adicionales (como siempre).
@@ -368,6 +372,52 @@ class AlmacenTipos:
                 reglas["aseguradoras"] = [*reglas.get("aseguradoras", []), aseguradora]
             solicitud = EstructuraRequest(nombre=existente["nombre"] if existente else nombre, reglas=ReglasEstructura.model_validate(reglas))
             return self.guardar_estructura(email, tipo_id, solicitud, existente["id"] if existente else None)
+
+    # --- Avisos de cambios de estructura ---------------------------------------------------------
+
+    def registrar_extraccion(self, email: str, tipo_id: str | None, aseguradora: str, resultado: dict[str, Any], huella: str) -> bool:
+        """Suma una extracción de la IA a los avisos de estructura del tipo (nunca de Estado de cuenta). Nunca cambia
+        los campos del tipo. Devuelve False si no aplica o si ese documento ya se había contado."""
+        if not tipo_id or tipo_id == TIPO_EC_ID:
+            return False
+        with self._lock:
+            datos = self._leer_archivo(email)
+            tipo = next((item for item in datos["tipos"] if item["id"] == tipo_id), None)
+            if tipo is None or not estructura_sugerida.registrar(tipo, aseguradora, resultado, huella):
+                return False
+            self._escribir(email, datos)
+            return True
+
+    def resolver_sugerencia(self, email: str, tipo_id: str, aseguradora: str, clave: str, accion: str) -> dict[str, Any]:
+        """"Agregar" pone el dato sugerido en el tipo (en la sección si es por fila y el tipo tiene sección);
+        "ignorar" no lo vuelve a sugerir para esa aseguradora."""
+        with self._lock:
+            datos = self._leer_archivo(email)
+            tipo = next((item for item in datos["tipos"] if item["id"] == tipo_id), None)
+            if tipo is None or tipo_id == TIPO_EC_ID:
+                raise KeyError(tipo_id)
+            encontrado = estructura_sugerida.buscar(tipo, aseguradora, clave)
+            if encontrado is None:
+                raise KeyError(clave)
+            if accion == "ignorar":
+                estructura_sugerida.ignorar(tipo, aseguradora, clave)
+            else:
+                _, nuevo = encontrado
+                campos = list(tipo.get("campos") or [])
+                if any(comparable(campo.get("nombre", "")) == comparable(nuevo["nombre"]) for campo in campos):
+                    raise ConflictoTipos(f"El tipo ya tiene el campo «{nuevo['nombre']}».")
+                if len(campos) >= MAX_CAMPOS_EXTRA:
+                    raise ConflictoTipos(f"Se admiten como máximo {MAX_CAMPOS_EXTRA} campos por tipo.")
+                ids = {campo.get("id") for campo in campos}
+                nuevo_id = plantillas_tipos.id_campo(nuevo["nombre"]).replace("pd-", "pl-", 1)
+                while nuevo_id in ids:
+                    nuevo_id = f"{nuevo_id}-{len(campos) + 1}"
+                alcance = "movimiento" if nuevo.get("alcance") == "movimiento" and tipo.get("seccion") else "documento"
+                campos.append({"id": nuevo_id, "nombre": nuevo["nombre"], "origen": "ia", "alcance": alcance})
+                TipoRequest.model_validate({**tipo, "campos": campos})
+                tipo["campos"] = campos
+            self._escribir(email, datos)
+            return self._publico(email, tipo)
 
     def restaurar_plantilla(self, email: str, tipo_id: str) -> tuple[dict[str, Any], list[str]]:
         """Restaurar campos predeterminados: agrega los campos de la plantilla que falten (sin borrar ni renombrar)."""
@@ -512,6 +562,11 @@ def para_clasificar(tipos: list[dict[str, Any]]) -> list[dict[str, Any]]:
         **({"descripcion": tipo["descripcion"]} if tipo.get("descripcion") else {}),
         "campos": [campo["nombre"] for campo in tipo.get("campos") or []][:15],
     } for tipo in tipos]
+
+
+def huella_documento(data: bytes) -> str:
+    """Identifica un documento por su contenido (los avisos de estructura no cuentan dos veces el mismo PDF)."""
+    return hashlib.sha256(data or b"").hexdigest()[:16]
 
 
 def tipo_para_extraer(tipo: dict[str, Any] | None) -> dict[str, Any] | None:

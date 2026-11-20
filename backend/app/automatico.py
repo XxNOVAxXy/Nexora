@@ -64,7 +64,7 @@ from .gemini import GeminiRequestError, GeminiUnavailableError, clave_campo, nor
 from .gmail import GmailNotConnectedError, GmailRateLimitError
 from .orden_fechas import ordenar_por_fecha
 from .plantilla_campos import AlmacenPlantillas, deducir_campos
-from .tipos_documento import AlmacenTipos, deteccion_manual, direccion, detectar_tipo, para_clasificar, tipo_para_extraer
+from .tipos_documento import AlmacenTipos, deteccion_manual, direccion, detectar_tipo, huella_documento, para_clasificar, tipo_para_extraer
 
 logger = logging.getLogger("nexora.automatico")
 
@@ -871,6 +871,7 @@ class ExtractorAutomatico:
             solicitud = borrador_desde_extraccion(resultado, campos_tipo, filename=nombre or filename, attachment_id=attachment_id or None, lote=uuid.uuid4().hex[:8],
                                                   tipo_documento=TipoDocumentoGuardado.model_validate(deteccion).model_dump())
             documento = self.almacen.guardar(email, message_id, part_id, solicitud)
+            self._registrar_estructura(email, deteccion, resultado, data)
         except (ConflictoVersion, EnvioEnCurso):
             # El usuario guardó este documento mientras Gemini extraía: lo suyo se conserva.
             self._anotar(email, clave, estado="omitido", error=None)
@@ -898,6 +899,13 @@ class ExtractorAutomatico:
         extraer = tipo_para_extraer(tipo)
         logger.info("Ciclo automatico tipo detectado codigo=%s metodo=%s confianza=%s requiere_revision=%s", deteccion.get("codigo"), deteccion.get("metodo"), deteccion.get("confianza"), deteccion.get("requiere_revision"))
         return deteccion, campos, ({} if extraer is None else {"tipo": extraer})
+
+    def _registrar_estructura(self, email: str, deteccion: dict[str, Any], resultado: dict[str, Any], data: bytes) -> None:
+        """Avisos de cambios de estructura (datos nuevos o que dejan de aparecer). Nunca detiene la extracción."""
+        try:
+            self.tipos.registrar_extraccion(email, deteccion.get("tipo_id"), deteccion.get("aseguradora") or resultado.get("aseguradora") or "", resultado, huella_documento(data))
+        except Exception:
+            logger.exception("No se pudieron registrar los avisos de estructura")
 
     def _fallo(self, email: str, clave: str, intentos: int, mensaje: str, ctx: dict[str, Any], causa: str = "error") -> str:
         estado = "error" if intentos >= MAX_INTENTOS else "pendiente"
@@ -1086,6 +1094,7 @@ class ExtractorAutomatico:
                                               tipo_documento=TipoDocumentoGuardado.model_validate(deteccion).model_dump())
         solicitud.version_base = None if actual is None else actual.get("version")
         documento = self.almacen.guardar(email, message_id, part_id, solicitud)
+        self._registrar_estructura(email, deteccion, resultado, data)
         salida: dict[str, Any] = {"documento": documento, "envio": None, "motivos": [], "mensaje": None}
         if not enviar:
             return salida

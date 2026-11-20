@@ -30,7 +30,14 @@ export type TipoDocumento = {
   descripcion?: string | null
   /** Campos de la plantilla que el tipo ya no tiene ("Restaurar campos predeterminados" los agrega). */
   plantilla_faltantes?: string[]
+  /** Datos que la IA encontró en documentos de una aseguradora y que no están en el tipo. */
+  sugerencias_estructura?: SugerenciaEstructura[]
+  /** Campos del tipo que salieron vacíos en los últimos documentos seguidos de una aseguradora. */
+  campos_ausentes?: CampoAusente[]
 }
+
+export type SugerenciaEstructura = { aseguradora: string; clave: string; nombre: string; alcance: CampoPlantilla['alcance']; veces: number; documentos: number; ejemplo: string }
+export type CampoAusente = { aseguradora: string; nombre: string; racha: number }
 
 export type MetodoDeteccion = 'remitente' | 'aseguradora' | 'asunto' | 'ia' | 'manual'
 
@@ -97,6 +104,9 @@ export const tiposDocumentoApi = {
   /** La IA lee el documento (de Gmail) y propone campos con un ejemplo de su valor. */
   sugerir: (messageId: string, attachmentId: string, nombreTipo: string, seccion: string | null, campos: string[] = []) =>
     request<{ sugerencias: SugerenciaPlantilla[]; aseguradora: string | null }>('/tipos/sugerir', { method: 'POST', body: json({ messageId, attachmentId, nombre_tipo: nombreTipo || 'Documento', seccion, campos: campos.slice(0, 30) }) }),
+  /** Aviso de estructura: "agregar" pone el dato en el tipo; "ignorar" no lo vuelve a sugerir para esa aseguradora. */
+  resolverSugerencia: (tipoId: string, accion: 'agregar' | 'ignorar', aseguradora: string, clave: string) =>
+    request<ListaTipos & { tipo: TipoDocumento }>(`/tipos/${encodeURIComponent(tipoId)}/sugerencias/${accion}`, { method: 'POST', body: json({ aseguradora, clave }) }),
   /** Agrega los campos de la plantilla predeterminada que le falten al tipo (sin borrar ni renombrar). */
   restaurarPlantilla: (tipoId: string) => request<ListaTipos & { tipo: TipoDocumento; agregados: string[] }>(`/tipos/${encodeURIComponent(tipoId)}/restaurar-plantilla`, { method: 'POST' }),
   configurarDocumento: (solicitud: SolicitudConfigurarDocumento) => request<ResultadoConfigurar>('/tipos/configurar-documento', { method: 'POST', body: json(solicitud) }),

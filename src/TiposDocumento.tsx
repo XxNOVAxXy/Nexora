@@ -11,6 +11,7 @@ import {
   type DocumentoRecibido,
   type Estructura,
   type ResultadoConfigurar,
+  type SugerenciaEstructura,
   type TipoDocumento,
 } from './services/tiposDocumentoApi'
 
@@ -303,10 +304,42 @@ function DetalleTipo({ tipo, tipos, onTipos, onNotice, onError, editorEstadoDeCu
       {tipo.plantilla && <div className="mt-1.5"><span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700">Plantilla predeterminada</span></div>}
     </div>
     {tipo.plantilla && <RestaurarPlantilla tipo={tipo} onTipos={onTipos} onNotice={onNotice} onError={onError} />}
+    {!tipo.contable && <AvisosEstructura tipo={tipo} onTipos={onTipos} onNotice={onNotice} onError={onError} />}
     {!tipo.contable && <FormularioTipo tipo={tipo} tipos={tipos} onGuardado={(lista) => { onTipos(lista); onNotice(`Tipo «${tipo.nombre}» guardado.`) }} onError={onError} />}
     <Estructuras tipo={tipo} onTipos={onTipos} onNotice={onNotice} onError={onError} />
     {tipo.contable ? editorEstadoDeCuenta ?? null : <EditorCamposTipo tipo={tipo} onTipos={onTipos} onNotice={onNotice} onError={onError} />}
   </div>
+}
+
+/** Avisos de cambios de estructura: datos nuevos por aseguradora (Agregar / Ignorar) y campos que dejaron de aparecer. Nunca cambia el tipo solo. */
+function AvisosEstructura({ tipo, onTipos, onNotice, onError }: Avisos & { tipo: TipoDocumento; onTipos: (tipos: TipoDocumento[]) => void }) {
+  const [ocupado, setOcupado] = useState<string | null>(null)
+  const sugerencias = tipo.sugerencias_estructura ?? []
+  const ausentes = tipo.campos_ausentes ?? []
+  if (sugerencias.length === 0 && ausentes.length === 0) return null
+  const resolver = async (accion: 'agregar' | 'ignorar', sugerencia: SugerenciaEstructura) => {
+    const llave = `${sugerencia.aseguradora}:${sugerencia.clave}`
+    setOcupado(llave)
+    try {
+      const respuesta = await tiposDocumentoApi.resolverSugerencia(tipo.id, accion, sugerencia.aseguradora, sugerencia.clave)
+      onTipos(respuesta.tipos)
+      onNotice(accion === 'agregar' ? `«${sugerencia.nombre}» se agregó a «${tipo.nombre}».` : `«${sugerencia.nombre}» ya no se sugerirá para ${sugerencia.aseguradora}.`)
+    } catch (error) { onError(mensaje(error, 'No se pudo aplicar la sugerencia.')) } finally { setOcupado(null) }
+  }
+  return <section className="panel overflow-hidden" aria-label={`Cambios de estructura de ${tipo.nombre}`}>
+    <div className="border-b border-slate-200 px-5 py-4"><div className="text-sm font-bold text-ink">Cambios de estructura</div><p className="mt-0.5 text-[11px] text-slate-500">Lo que la IA encontró en los documentos de cada aseguradora y no está en el tipo. El tipo no cambia hasta que tú lo decidas.</p></div>
+    <ul className="divide-y divide-slate-100 text-xs" aria-label="Sugerencias de estructura">
+      {sugerencias.map((sugerencia) => {
+        const llave = `${sugerencia.aseguradora}:${sugerencia.clave}`
+        return <li key={llave} className="flex flex-wrap items-center gap-2 px-5 py-2.5">
+          <span className="min-w-0 flex-1">{sugerencia.aseguradora} trae «{sugerencia.nombre}» ({sugerencia.veces} de {sugerencia.documentos} documentos). ¿Agregar al tipo?{sugerencia.ejemplo && <span className="mt-0.5 block truncate text-[10px] text-slate-500" title={sugerencia.ejemplo}>Ej.: {sugerencia.ejemplo}</span>}</span>
+          <button type="button" onClick={() => void resolver('agregar', sugerencia)} disabled={ocupado === llave} aria-label={`Agregar ${sugerencia.nombre} de ${sugerencia.aseguradora}`} className="btn-primary px-2.5 py-1 text-[11px]"><Plus size={12} />Agregar</button>
+          <button type="button" onClick={() => void resolver('ignorar', sugerencia)} disabled={ocupado === llave} aria-label={`Ignorar ${sugerencia.nombre} de ${sugerencia.aseguradora}`} className="btn-soft px-2.5 py-1 text-[11px]">Ignorar</button>
+        </li>
+      })}
+      {ausentes.map((ausente) => <li key={`${ausente.aseguradora}:${ausente.nombre}`} className="px-5 py-2.5 text-amber-800" role="note">«{ausente.nombre}»: No se encontró en los últimos {ausente.racha} documentos de {ausente.aseguradora}.</li>)}
+    </ul>
+  </section>
 }
 
 /** "Restaurar campos predeterminados": agrega los campos de la plantilla que falten, después de confirmar. */

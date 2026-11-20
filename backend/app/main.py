@@ -26,6 +26,7 @@ from .tipos_documento import (
     ConflictoTipos,
     EstructuraRequest,
     TipoRequest,
+    huella_documento,
     deteccion_manual,
     detectar_tipo,
     direccion,
@@ -292,6 +293,12 @@ def _extraer_con_tipo(payload: GeminiExtractionRequest, data: bytes, media_type:
     result = gemini.extract_document(data, media_type, filename, forzar=payload.forzar, campos_solicitados=campos, **({} if extraer is None else {"tipo": extraer}))
     if not deteccion.get("aseguradora") and result.get("aseguradora"):
         deteccion["aseguradora"] = result["aseguradora"]
+    if tipo is not None and not contable:
+        # Avisos de cambios de estructura: nunca detienen la extracción.
+        try:
+            tipos.registrar_extraccion(email, tipo["id"], deteccion.get("aseguradora") or "", result, huella_documento(data))
+        except Exception:
+            logger.exception("No se pudieron registrar los avisos de estructura")
     return {**result, "tipo_documento": deteccion, "campos_tipo": None if contable else list((tipo or {}).get("campos") or [])}
 
 
@@ -850,6 +857,28 @@ def restaurar_plantilla(tipo_id: str) -> dict[str, Any]:
     except (ConflictoTipos, KeyError) as error:
         raise _error_tipos(error) from error
     return {"tipo": tipo, "agregados": agregados, **_tipos_publicos(email)}
+
+
+class SugerenciaEstructuraRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    aseguradora: str = Field(min_length=1, max_length=120)
+    clave: str = Field(min_length=1, max_length=200)
+
+
+@app.post("/api/tipos/{tipo_id}/sugerencias/{accion}")
+def resolver_sugerencia_estructura(tipo_id: str, accion: str, payload: SugerenciaEstructuraRequest) -> dict[str, Any]:
+    """Aviso de estructura: "agregar" pone el dato en el tipo; "ignorar" no lo vuelve a sugerir para esa aseguradora."""
+    if accion not in ("agregar", "ignorar"):
+        raise HTTPException(status_code=404, detail="Acción desconocida.")
+    email = _cuenta_actual()
+    try:
+        tipo = tipos.resolver_sugerencia(email, tipo_id, payload.aseguradora, payload.clave, accion)
+    except (ConflictoTipos, KeyError) as error:
+        raise _error_tipos(error) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {"tipo": tipo, **_tipos_publicos(email)}
 
 
 @app.get("/api/tipos/documentos")

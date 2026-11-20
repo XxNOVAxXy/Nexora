@@ -6,12 +6,12 @@ import type { ExtraccionGuardada } from './services/extraccionesApi'
 import type { ArchivoExtraccion } from './services/pestanasExtraccion'
 import type { DocumentoRecibido, ResultadoConfigurar, TipoDocumento } from './services/tiposDocumentoApi'
 
-const { listarMock, documentosMock, sugerirMock, configurarMock, editarMock, editarEstructuraMock, guardarMock, restaurarMock } = vi.hoisted(() => ({
-  listarMock: vi.fn(), documentosMock: vi.fn(), sugerirMock: vi.fn(), configurarMock: vi.fn(), editarMock: vi.fn(), editarEstructuraMock: vi.fn(), guardarMock: vi.fn(), restaurarMock: vi.fn(),
+const { listarMock, documentosMock, sugerirMock, configurarMock, editarMock, editarEstructuraMock, guardarMock, restaurarMock, resolverMock } = vi.hoisted(() => ({
+  listarMock: vi.fn(), documentosMock: vi.fn(), sugerirMock: vi.fn(), configurarMock: vi.fn(), editarMock: vi.fn(), editarEstructuraMock: vi.fn(), guardarMock: vi.fn(), restaurarMock: vi.fn(), resolverMock: vi.fn(),
 }))
 vi.mock('./services/tiposDocumentoApi', async (importOriginal) => {
   const real = await importOriginal<typeof import('./services/tiposDocumentoApi')>()
-  return { ...real, tiposDocumentoApi: { ...real.tiposDocumentoApi, listar: listarMock, documentos: documentosMock, sugerir: sugerirMock, configurarDocumento: configurarMock, editar: editarMock, editarEstructura: editarEstructuraMock, restaurarPlantilla: restaurarMock } }
+  return { ...real, tiposDocumentoApi: { ...real.tiposDocumentoApi, listar: listarMock, documentos: documentosMock, sugerir: sugerirMock, configurarDocumento: configurarMock, editar: editarMock, editarEstructura: editarEstructuraMock, restaurarPlantilla: restaurarMock, resolverSugerencia: resolverMock } }
 })
 vi.mock('./services/plantillaCamposApi', () => ({
   plantillaCamposApi: { obtener: vi.fn(async () => ({ configurada: true, campos: [], actualizado: null })), guardar: vi.fn(), sugerir: vi.fn(async () => []) },
@@ -365,6 +365,30 @@ describe('Plantillas predeterminadas', () => {
     // La lista de campos del editor ya trae el campo restaurado y el botón queda sin nada que restaurar.
     expect(within(screen.getByRole('list', { name: 'Campos de Fianzas' })).getByText('Agente')).toBeTruthy()
     expect((screen.getByRole('button', { name: 'Restaurar campos predeterminados' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('muestra los cambios de estructura por aseguradora con "Agregar" e "Ignorar" y los campos que dejaron de aparecer', async () => {
+    const conAvisos: TipoDocumento = { ...FIANZAS,
+      sugerencias_estructura: [{ aseguradora: 'AFIANZADORA NORTE', clave: 'folio interno', nombre: 'Folio interno', alcance: 'documento', veces: 4, documentos: 5, ejemplo: 'FI-1' },
+        { aseguradora: 'AFIANZADORA SUR', clave: 'color', nombre: 'Color', alcance: 'documento', veces: 2, documentos: 2, ejemplo: 'Azul' }],
+      campos_ausentes: [{ aseguradora: 'AFIANZADORA NORTE', nombre: 'Agente', racha: 3 }] }
+    listarMock.mockImplementation(async () => ({ tipos: [EC, conAvisos], umbral_confianza: 0.7 }))
+    const agregado = { ...conAvisos, sugerencias_estructura: conAvisos.sugerencias_estructura!.slice(1), campos: [...conAvisos.campos, { id: 'pl-folio-interno', nombre: 'Folio interno', origen: 'ia' as const, alcance: 'documento' as const }] }
+    resolverMock.mockImplementationOnce(async () => ({ tipos: [EC, agregado], umbral_confianza: 0.7, tipo: agregado }))
+    const onNotice = vi.fn()
+    render(<TiposDocumentoSeccion onNotice={onNotice} onError={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Tipos y reglas' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Fianzas/ }))
+    const lista = screen.getByRole('list', { name: 'Sugerencias de estructura' })
+    expect(lista.textContent).toContain('AFIANZADORA NORTE trae «Folio interno» (4 de 5 documentos). ¿Agregar al tipo?')
+    expect(within(lista).getByRole('note').textContent).toBe('«Agente»: No se encontró en los últimos 3 documentos de AFIANZADORA NORTE.')
+    fireEvent.click(within(lista).getByRole('button', { name: 'Agregar Folio interno de AFIANZADORA NORTE' }))
+    await waitFor(() => expect(resolverMock).toHaveBeenCalledWith('tipo-f', 'agregar', 'AFIANZADORA NORTE', 'folio interno'))
+    await waitFor(() => expect(within(screen.getByRole('list', { name: 'Campos de Fianzas' })).getByText('Folio interno')).toBeTruthy())
+    resolverMock.mockImplementationOnce(async () => ({ tipos: [EC, { ...agregado, sugerencias_estructura: [] }], umbral_confianza: 0.7, tipo: agregado }))
+    fireEvent.click(screen.getByRole('button', { name: 'Ignorar Color de AFIANZADORA SUR' }))
+    await waitFor(() => expect(resolverMock).toHaveBeenLastCalledWith('tipo-f', 'ignorar', 'AFIANZADORA SUR', 'color'))
+    await waitFor(() => expect(onNotice).toHaveBeenLastCalledWith('«Color» ya no se sugerirá para AFIANZADORA SUR.'))
   })
 
   it('en un tipo que no es Estado de cuenta se puede agregar un campo «Fecha»', async () => {
