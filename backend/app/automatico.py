@@ -207,6 +207,18 @@ def problemas_encontrados(problemas: dict[str, Any], contable: bool = True) -> l
     return motivos
 
 
+def sin_datos_extraidos(documento: dict[str, Any]) -> bool:
+    """Documento que no es estado de cuenta sin ningún campo con valor y sin filas con valores: no hay nada que enviar."""
+    if es_contable(documento.get("tipo_documento")):
+        return False
+    con_valor = any(str(campo.get("valor") or "").strip() for campo in documento.get("campos_extra") or [] if campo.get("alcance") == "documento")
+    con_filas = any(any(str(valor).strip() for valor in (fila.get("extras") or {}).values()) for fila in documento.get("transacciones") or [])
+    return not con_valor and not con_filas
+
+
+SIN_DATOS = "No se extrajo ningun dato del documento (todos los campos estan vacios y no hay filas)."
+
+
 class _CortarCiclo(Exception):
     """Gmail limita las consultas, se perdió la conexión o el backend se está apagando: se sigue en otro ciclo."""
 
@@ -1020,6 +1032,8 @@ class ExtractorAutomatico:
                 # Tipo sin configurar, confianza baja o tipo sin campos: se extrajo lo posible, pero nunca se envía solo.
                 motivo = tipo_documento.get("motivo") or "El tipo de documento requiere revision."
                 return self._terminar_envio(email, message_id, part_id, "requiere_revision", error=None, motivos=[motivo], problemas=[motivo])
+            if sin_datos_extraidos(documento):
+                return self._terminar_envio(email, message_id, part_id, "requiere_revision", error=None, motivos=[SIN_DATOS], problemas=[SIN_DATOS])
             motivos = motivos_sin_cuadrar(problemas, contable)
             if motivos and cuenta.get("solo_si_cuadra") is not False:
                 return self._terminar_envio(email, message_id, part_id, "requiere_revision", error=None, motivos=motivos, problemas=problemas_encontrados(problemas, contable))
@@ -1076,7 +1090,7 @@ class ExtractorAutomatico:
         if not enviar:
             return salida
         problemas = documento.get("problemas") or {}
-        motivos = [deteccion["motivo"]] if deteccion.get("requiere_revision") else []
+        motivos = [deteccion["motivo"]] if deteccion.get("requiere_revision") else [SIN_DATOS] if sin_datos_extraidos(documento) else []
         if not motivos and self._leer(email).get("solo_si_cuadra") is not False:
             motivos = motivos_sin_cuadrar(problemas, es_contable(deteccion))
         if motivos:

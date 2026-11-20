@@ -173,7 +173,11 @@ describe('la IA llena columnas manuales', () => {
     const lleno = llenarColumnaManual(actuales, rfc, true, { unico: 'XAXX010101000' })
     expect(lleno.transacciones).toBe(actuales)
     expect(lleno.campo).toEqual({ ...rfc, valor: 'XAXX010101000', valor_ia: true })
-    expect(llenarColumnaManual(actuales, lleno.campo, true, { unico: 'OTRO' }).resultado.estado).toBe('completa')
+    // Ya tenía valor: se conserva y el mensaje lo dice (con lo que leyó la IA si es distinto).
+    const conservado = llenarColumnaManual(actuales, lleno.campo, true, { unico: 'OTRO' })
+    expect(conservado.campo).toBe(lleno.campo)
+    expect(mensajeLlenado(conservado.resultado)).toBe('«RFC» ya tenía un valor; se conservó (la IA leyó: «OTRO»).')
+    expect(mensajeLlenado(llenarColumnaManual(actuales, lleno.campo, true, { unico: 'XAXX010101000' }).resultado)).toBe('«RFC» ya tenía un valor; se conservó.')
     expect(llenarColumnaManual(actuales, rfc, true, { porId: new Map([['a', 'X']]) }).resultado.estado).toBe('por_movimiento')
     expect(editarValorDocumento([lleno.campo], 'c-rfc', 'XAXX010101001')).toEqual([{ ...rfc, valor: 'XAXX010101001' }])
     expect(agregarCampoManual([], 'RFC', 'documento')).toEqual([expect.objectContaining({ nombre: 'RFC', origen: 'manual', alcance: 'documento', valor: '' })])

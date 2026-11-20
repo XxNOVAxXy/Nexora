@@ -142,7 +142,7 @@ export function eliminarCampo(documento: ColumnasDocumento, id: string): Columna
 export type ResultadoLlenado = {
   campoId: string
   nombre: string
-  estado: 'no_encontrado' | 'llenado' | 'completa' | 'sin_valores_para_vacias' | 'dato_del_documento' | 'unico_con_valores' | 'por_movimiento' | 'tipo_distinto'
+  estado: 'no_encontrado' | 'llenado' | 'completa' | 'conservado' | 'sin_valores_para_vacias' | 'dato_del_documento' | 'unico_con_valores' | 'por_movimiento' | 'tipo_distinto'
   llenadas: number
   /** Valor único que encontró la IA (para explicar por qué no se repitió en cada movimiento). */
   valor?: string
@@ -154,6 +154,9 @@ export function mensajeLlenado(resultado: ResultadoLlenado): string {
     case 'no_encontrado': return `No se encontró «${nombre}» en el documento.`
     case 'llenado': return `Se llenaron ${llenadas} celda${llenadas === 1 ? '' : 's'} de «${nombre}».`
     case 'completa': return 'La columna ya estaba completa; no se cambió nada.'
+    case 'conservado': return resultado.valor !== undefined
+      ? `«${nombre}» ya tenía un valor; se conservó (la IA leyó: «${resultado.valor}»).`
+      : `«${nombre}» ya tenía un valor; se conservó.`
     case 'sin_valores_para_vacias': return `La IA encontró «${nombre}», pero no para las celdas vacías; no se cambió nada.`
     case 'dato_del_documento': return `«${nombre}» aparece una sola vez en el documento: se guardó una vez, no en cada movimiento.`
     case 'unico_con_valores': return `La IA encontró «${nombre}» una sola vez en el documento (${resultado.valor ?? ''}); no se repitió en cada movimiento y lo capturado no cambió.`
@@ -197,7 +200,7 @@ export function llenarColumnaManual(transacciones: Transaccion[], campo: CampoEx
     // "Una vez" con valores por fila todos iguales: se acepta como valor único.
     const valor = unico ?? (configurado ? valorUnicoDeFuente(fuente) : null)
     if (valor === null) return sinCambios(configurado ? 'tipo_distinto' : 'por_movimiento')
-    if (campo.valor?.trim()) return sinCambios('completa')
+    if (campo.valor?.trim()) return sinCambios('conservado', valor.trim() === campo.valor.trim() ? {} : { valor })
     return { transacciones, campo: { ...campo, valor, valor_ia: true }, resultado: { ...base, estado: 'dato_del_documento', llenadas: 1 } }
   }
   if (unico !== null && configurado) return sinCambios('tipo_distinto', { valor: unico })

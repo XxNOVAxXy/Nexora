@@ -210,7 +210,11 @@ function Sugerencias({ sugerencias, campos, seccion, onAgregar }: { sugerencias:
   const nuevas = sugerenciasNuevas(sugerencias, campos)
   const [marcadas, setMarcadas] = useState<Set<string>>(() => new Set(nuevas.map((item) => item.clave)))
   const [alcances, setAlcances] = useState<Record<string, AlcanceCampo>>({})
-  if (nuevas.length === 0) return <p className="mt-3 text-[11px] text-slate-500">{sugerencias.length === 0 ? 'La IA no encontró campos en este documento.' : 'Todos los campos propuestos ya están en la lista.'}</p>
+  const porFila = sugerencias.filter((item) => item.alcance === 'movimiento')
+  const avisoSeccion = !seccion && porFila.length > 0
+    ? <p role="note" className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-[11px] text-amber-800">La IA ve una tabla que se repite ({porFila.map((item) => item.nombre).join(', ')}). Escribe una sección repetible para el tipo (por ejemplo «Asegurados», «Incisos» o «Coberturas») para capturar todas sus filas.</p>
+    : null
+  if (nuevas.length === 0) return <>{avisoSeccion}<p className="mt-3 text-[11px] text-slate-500">{sugerencias.length === 0 ? 'La IA no encontró campos en este documento.' : 'Todos los campos propuestos ya están en la lista.'}</p></>
   const alcanceDe = (sugerencia: SugerenciaPlantilla): AlcanceCampo => (seccion ? alcances[sugerencia.clave] ?? sugerencia.alcance : 'documento')
   const agregar = () => {
     let lista = campos
@@ -219,7 +223,8 @@ function Sugerencias({ sugerencias, campos, seccion, onAgregar }: { sugerencias:
   }
   const alternar = (clave: string) => setMarcadas((previas) => { const siguiente = new Set(previas); if (siguiente.has(clave)) siguiente.delete(clave); else siguiente.add(clave); return siguiente })
   return <div className="mt-3">
-    <ul className="space-y-1" aria-label="Campos propuestos por la IA">{nuevas.map((sugerencia) => <li key={sugerencia.clave} className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-100 px-2.5 py-2 text-xs">
+    {avisoSeccion}
+    <ul className="mt-2 space-y-1" aria-label="Campos propuestos por la IA">{nuevas.map((sugerencia) => <li key={sugerencia.clave} className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-100 px-2.5 py-2 text-xs">
       <input type="checkbox" checked={marcadas.has(sugerencia.clave)} onChange={() => alternar(sugerencia.clave)} aria-label={`Usar ${sugerencia.nombre}`} className="h-3.5 w-3.5 rounded border-slate-300 text-coral focus:ring-coral" />
       <span className="min-w-0 flex-1"><span className="font-bold text-ink">{sugerencia.nombre}</span><span className="mt-0.5 block truncate text-[10px] text-slate-500" title={sugerencia.ejemplo}>Ej.: {sugerencia.ejemplo}</span></span>
       <select aria-label={`Dónde va ${sugerencia.nombre}`} value={alcanceDe(sugerencia)} disabled={!seccion} onChange={(event) => setAlcances((valor) => ({ ...valor, [sugerencia.clave]: event.target.value as AlcanceCampo }))} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[11px]"><option value="documento">Una vez</option>{seccion && <option value="movimiento">{etiquetaAlcanceTipo('movimiento', seccion)}</option>}</select>

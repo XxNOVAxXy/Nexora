@@ -183,6 +183,8 @@ function CanvasPagina({ pdf, numero, escala, ancho, alto }: { pdf: DocumentoViso
 export type EstadoTextoDocumento = 'cargando' | 'listo' | 'sin_texto' | 'imagen' | 'error' | 'otro'
 
 type PropsPanel = {
+  /** Texto cuando la verificación no aplica a este tipo de documento (solo compara estados de cuenta). */
+  noAplica?: string | null
   estado: EstadoTextoDocumento
   visible: boolean
   resultado: ResultadoVerificacion | null
@@ -197,7 +199,8 @@ type PropsPanel = {
 
 export const AVISO_SIN_VERIFICACION = 'La verificación visual aún no está disponible para imágenes o documentos escaneados.'
 
-export function PanelVerificacion({ estado, visible, resultado, destino, onCancelarDestino, mensaje, onCerrarMensaje, filaPorAgregar, onAgregar, onCancelarAgregar }: PropsPanel) {
+export function PanelVerificacion({ noAplica = null, estado, visible, resultado, destino, onCancelarDestino, mensaje, onCerrarMensaje, filaPorAgregar, onAgregar, onCancelarAgregar }: PropsPanel) {
+  if (noAplica) return <div role="note" className="shrink-0 border-b border-slate-200 bg-slate-50 px-4 py-2 text-[11px] text-slate-600">{noAplica}</div>
   if (estado === 'sin_texto' || estado === 'imagen') return <div role="note" className="shrink-0 border-b border-amber-200 bg-amber-50 px-4 py-2 text-[11px] text-amber-800">{AVISO_SIN_VERIFICACION}</div>
   if (estado !== 'listo' || !resultado || !visible) return null
   const leyenda: [EstadoVerificacion, string][] = [['coincide', 'Verde = coincide con el documento'], ['difiere', 'Ámbar = capturado con otro valor'], ['falta', 'Rojo = falta capturar'], ['no_se_captura', 'Gris = no se captura']]

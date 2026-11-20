@@ -720,7 +720,9 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   useEffect(() => { void tiposVigentes.cargar() }, [])
   const contable = esContable(documento.tipo_documento)
   const tipoActual = documento.tipo_documento?.tipo_id ? tipos.find((tipo) => tipo.id === documento.tipo_documento?.tipo_id) ?? null : contable ? tipos.find((tipo) => tipo.contable) ?? null : null
-  const nombreSeccion = contable ? 'Movimientos' : tipoActual?.seccion?.nombre ?? 'Filas'
+  // Fuera de estado de cuenta: la sección del tipo; sin sección no hay tabla. Un documento sin tipo puede traer "Filas".
+  const seccionTabla = contable ? null : tipoActual ? tipoActual.seccion?.nombre ?? null : transactions.length > 0 ? 'Filas' : null
+  const nombreSeccion = contable ? 'Movimientos' : seccionTabla ?? 'Datos del documento'
   const validacion = useMemo(() => (contable ? validarContabilidad(documento.resumen ?? {}, transactions, documento.formato_numerico) : VALIDACION_NO_APLICA), [contable, documento.resumen, transactions, documento.formato_numerico])
   const alertas = useMemo(() => alertasPorFila(validacion), [validacion])
   const problemas = useMemo(() => contarProblemas(validacion, documento.resumen, transactions, contable), [validacion, documento.resumen, transactions, contable])
@@ -740,7 +742,8 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
   const esImagen = /\.(png|jpe?g|webp|gif)$/i.test(filename)
   const textoActual = textoDocumento?.documentKey === documentKey ? textoDocumento : null
   const estadoTexto: EstadoTextoDocumento = esImagen ? 'imagen' : !esPdf ? 'otro' : textoActual?.estado ?? 'cargando'
-  const datosDocumento = useMemo(() => (textoActual?.estado === 'listo' ? detectarDatos(textoActual.paginas) : null), [textoActual])
+  // La verificación visual compara movimientos de un estado de cuenta: en otros tipos no se calcula.
+  const datosDocumento = useMemo(() => (contable && textoActual?.estado === 'listo' ? detectarDatos(textoActual.paginas) : null), [contable, textoActual])
   const verificacion = useMemo(() => (datosDocumento ? verificar(datosDocumento, { resumen: documento.resumen, transacciones: transactions, formato_numerico: documento.formato_numerico }) : null), [datosDocumento, documento.resumen, transactions, documento.formato_numerico])
   const verificando = verificacionVisible && verificacion !== null
   // Copiar a un dato del documento (RFC…): todo el texto del documento se vuelve clicable, no solo lo reconocido.
@@ -1220,7 +1223,8 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
       {confirmandoReextraccion && <div role="alertdialog" aria-labelledby="confirmar-reextraccion" className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-amber-900"><div id="confirmar-reextraccion" className="font-bold">Este documento tiene {correcciones} corrección{correcciones === 1 ? '' : 'es'} manual{correcciones === 1 ? '' : 'es'}.</div><div className="mt-1 leading-5">Volver a extraer reemplaza solo las filas de la IA sin editar. Las filas manuales y las editadas se conservan; si una fila editada ya no aparece en la nueva extracción, se conserva marcada para revisión. El resultado queda como borrador hasta que lo guardes.</div><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={() => void extraerConGemini()} className="btn-primary px-3 py-1.5 text-xs"><Sparkles size={13} />Re-extraer conservando correcciones</button><button type="button" onClick={() => setConfirmandoReextraccion(false)} className="btn-soft px-3 py-1.5 text-xs">Cancelar</button></div></div>}
       {confirmandoRevision && <div role="alertdialog" aria-labelledby="confirmar-revision" className="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-3 text-xs text-amber-900"><div id="confirmar-revision" className="font-bold">Quedan {confirmandoRevision.total} problema{confirmandoRevision.total === 1 ? '' : 's'} sin resolver.</div><ul className="mt-1.5 list-disc space-y-0.5 pl-5">{confirmandoRevision.diferencias > 0 && <li>{confirmandoRevision.diferencias} comprobación{confirmandoRevision.diferencias === 1 ? '' : 'es'} contable{confirmandoRevision.diferencias === 1 ? '' : 's'} con diferencia.</li>}{confirmandoRevision.dudosos > 0 && <li>{confirmandoRevision.dudosos} importe{confirmandoRevision.dudosos === 1 ? '' : 's'} dudoso{confirmandoRevision.dudosos === 1 ? '' : 's'}.</li>}{confirmandoRevision.invalidos > 0 && <li>{confirmandoRevision.invalidos} importe{confirmandoRevision.invalidos === 1 ? '' : 's'} inválido{confirmandoRevision.invalidos === 1 ? '' : 's'}.</li>}{confirmandoRevision.en_revision > 0 && <li>{confirmandoRevision.en_revision} fila{confirmandoRevision.en_revision === 1 ? '' : 's'} marcada{confirmandoRevision.en_revision === 1 ? '' : 's'} para revisión.</li>}{confirmandoRevision.validacion_incompleta && <li>La validación contable no pudo completarse.</li>}</ul><div className="mt-2.5 flex flex-wrap gap-2"><button type="button" onClick={() => void guardar('revisado', true)} className="btn-primary px-3 py-1.5 text-xs">Marcar como revisado de todos modos</button><button type="button" onClick={() => setConfirmandoRevision(null)} className="btn-soft px-3 py-1.5 text-xs">Seguir revisando</button></div></div>}
       {aviso && <div className="mt-3"><AvisoReextraccion aviso={aviso} onClose={() => setLista((prev) => ({ ...prev, aviso: null }))} /></div>}
-      {sugerenciasPendientes > 0 && transactions.length > 0 && sugerenciasCerradas !== documentKey && <div role="status" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-violet-200 bg-violet-50 px-3 py-2.5 text-xs text-violet-800"><span className="flex items-center gap-1.5"><Sparkles size={13} />La IA detectó {sugerenciasPendientes} campo{sugerenciasPendientes === 1 ? '' : 's'} que no está{sugerenciasPendientes === 1 ? '' : 'n'} en la tabla. Revisa las sugerencias y decide si agregarlos.</span><span className="flex gap-2"><button type="button" onClick={() => setAbrirMenuCampo((valor) => valor + 1)} className="btn-soft px-3 py-1.5 text-xs"><Plus size={13} />Ver sugerencias</button><button type="button" aria-label="Cerrar aviso de sugerencias" onClick={() => setSugerenciasCerradas(documentKey)} className="px-1 text-violet-500 hover:text-violet-800"><X size={14} /></button></span></div>}
+      {!contable && deEsteDocumento && lista.warnings.length > 0 && <div role="status" aria-label="Avisos de la extracción" className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800"><ul className="list-disc space-y-0.5 pl-4">{lista.warnings.map((texto) => <li key={texto}>{texto}</li>)}</ul></div>}
+      {sugerenciasPendientes > 0 && (transactions.length > 0 || !contable) && sugerenciasCerradas !== documentKey && <div role="status" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-violet-200 bg-violet-50 px-3 py-2.5 text-xs text-violet-800"><span className="flex items-center gap-1.5"><Sparkles size={13} />La IA detectó {sugerenciasPendientes} campo{sugerenciasPendientes === 1 ? '' : 's'} que no está{sugerenciasPendientes === 1 ? '' : 'n'} en la tabla. Revisa las sugerencias y decide si agregarlos.</span><span className="flex gap-2"><button type="button" onClick={() => setAbrirMenuCampo((valor) => valor + 1)} className="btn-soft px-3 py-1.5 text-xs"><Plus size={13} />Ver sugerencias</button><button type="button" aria-label="Cerrar aviso de sugerencias" onClick={() => setSugerenciasCerradas(documentKey)} className="px-1 text-violet-500 hover:text-violet-800"><X size={14} /></button></span></div>}
       {avisoGuardado?.tipo === 'exito' && <div className="mt-3"><Notice text={avisoGuardado.mensaje} onClose={() => setResultadoGuardado(null)} /></div>}
       {avisoGuardado && avisoGuardado.tipo !== 'exito' && <div role="alert" className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"><span>{avisoGuardado.mensaje}{avisoGuardado.tipo === 'conflicto' && ' Tus cambios se conservan como borrador local en este navegador.'}</span><span className="flex gap-2">{avisoGuardado.tipo === 'conflicto' && <button type="button" onClick={recargarGuardado} className="btn-soft px-3 py-1.5 text-xs"><RefreshCw size={13} />Cargar la versión guardada</button>}<button type="button" onClick={() => setResultadoGuardado(null)} aria-label="Cerrar error"><X size={16} /></button></span></div>}
     </section>
@@ -1229,20 +1233,20 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
         estado: estadoTexto,
         onTexto: textoRecibido,
         marcas: marcasTexto ?? (verificando ? verificacion!.marcas : []),
-        disponible: estadoTexto === 'listo',
+        disponible: contable && estadoTexto === 'listo',
         visible: verificacionVisible,
         onAlternar: () => { setVerificacionVisible((valor) => !valor); setDestino(null); setFilaPorAgregar(null) },
         resaltado,
         onClicMarca: clicMarca,
-        panel: <PanelVerificacion estado={estadoTexto} visible={verificacionVisible} resultado={verificacion} destino={destino ? nombreDestino(destino) : null} onCancelarDestino={() => setDestino(null)} mensaje={mensajeCaptura} onCerrarMensaje={() => setMensajeCaptura(null)} filaPorAgregar={filaPorAgregar === null ? null : datosDocumento?.filas[filaPorAgregar] ?? null} onAgregar={agregarDesdeDocumento} onCancelarAgregar={() => { setFilaPorAgregar(null); setResaltado(null) }} />,
+        panel: <PanelVerificacion noAplica={contable ? null : `La verificación visual compara los movimientos de un estado de cuenta; no aplica a ${tipoActual?.nombre ?? 'este tipo de documento'}.`} estado={estadoTexto} visible={verificacionVisible} resultado={verificacion} destino={destino ? nombreDestino(destino) : null} onCancelarDestino={() => setDestino(null)} mensaje={mensajeCaptura} onCerrarMensaje={() => setMensajeCaptura(null)} filaPorAgregar={filaPorAgregar === null ? null : datosDocumento?.filas[filaPorAgregar] ?? null} onAgregar={agregarDesdeDocumento} onCancelarAgregar={() => { setFilaPorAgregar(null); setResaltado(null) }} />,
       }} /></section>
       <section className="panel flex min-h-[520px] min-w-0 flex-col overflow-hidden 2xl:min-h-0">
-        <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-5"><div><div className="text-sm font-bold text-ink">{nombreSeccion}</div><div className="mt-0.5 text-[11px] text-slate-400">{versionGuardada ? `Guardado ${new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(versionGuardada.actualizado))}` : mode === 'gemini' ? 'Resultado del backend Gemini' : 'Captura manual'}</div></div><button type="button" onClick={agregarTransaccion} disabled={!cargaLista} className="btn-soft px-2.5 py-1.5 text-xs"><Plus size={14} />Agregar</button></div>
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-5"><div><div className="text-sm font-bold text-ink">{nombreSeccion}</div><div className="mt-0.5 text-[11px] text-slate-400">{versionGuardada ? `Guardado ${new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(versionGuardada.actualizado))}` : mode === 'gemini' ? 'Resultado del backend Gemini' : 'Captura manual'}</div></div>{(contable || seccionTabla) && <button type="button" onClick={agregarTransaccion} disabled={!cargaLista} className="btn-soft px-2.5 py-1.5 text-xs"><Plus size={14} />Agregar</button>}</div>
         {cargando && <div className="flex items-center justify-center gap-2 px-4 py-10 text-xs text-slate-400"><RefreshCw size={15} className="animate-spin" />Cargando la extracción guardada…</div>}
         {cargaLista && !versionGuardada && transactions.length === 0 && !extracting && !colaActiva && cola?.estado !== 'error' && <div className="border-b border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">Este documento no tiene una extracción guardada. {mode === 'gemini' ? <>Pulsa <strong>Extraer con Gemini</strong> para obtenerla.</> : <>Captura los movimientos con <strong>Agregar</strong> o cambia al modo Gemini para extraerlos.</>}</div>}
         {!cargando && <div className="min-h-0 flex-1 overflow-auto scrollbar-thin"><TablaTransacciones transacciones={transactions} columnas={{
           campos: documento.campos_extra,
-          seccion: contable ? null : nombreSeccion,
+          seccion: contable ? undefined : seccionTabla,
           onCambiar: cambiarExtra,
           onCambiarValorDocumento: cambiarValorDocumento,
           onEnfocarDocumento: enfocarValorDocumento,
@@ -1257,7 +1261,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
           onCerrarAviso: cerrarAvisoCampo,
           menu: <MenuCampo campos={documento.campos_extra} sugerencias={documento.sugerencias_campos} huboExtraccionIa={huboExtraccion} onAplicar={elegirSugerencia} onAgregar={agregarCampo} solicitudAbrir={abrirMenuCampo} />,
         }} alertas={alertas} onCambiar={cambiarCampo} onEliminar={eliminarTransaccion} onMover={moverMovimiento} sinRespaldo={sinRespaldo} resaltado={resaltado} destino={verificando && destino?.tipo === 'movimiento' ? destino : null} onEnfocar={enfocarCeldaMovimiento} /></div>}
-        <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-4 py-2.5 text-[11px] text-slate-400"><div className="flex flex-wrap items-center gap-1.5"><CircleHelp size={13} />{`${transactions.length} movimiento${transactions.length === 1 ? '' : 's'}.`}{dudososCount > 0 && <span className="font-semibold text-amber-700">{dudososCount} importe{dudososCount === 1 ? '' : 's'} dudoso{dudososCount === 1 ? '' : 's'}: revísalo{dudososCount === 1 ? '' : 's'} contra el documento.</span>}</div></div>
+        <div className="shrink-0 border-t border-slate-200 bg-slate-50/70 px-4 py-2.5 text-[11px] text-slate-400"><div className="flex flex-wrap items-center gap-1.5"><CircleHelp size={13} />{contable ? `${transactions.length} movimiento${transactions.length === 1 ? '' : 's'}.` : seccionTabla ? `${transactions.length} fila${transactions.length === 1 ? '' : 's'} en ${seccionTabla}.` : 'Este tipo no tiene sección repetible.'}{dudososCount > 0 && <span className="font-semibold text-amber-700">{dudososCount} importe{dudososCount === 1 ? '' : 's'} dudoso{dudososCount === 1 ? '' : 's'}: revísalo{dudososCount === 1 ? '' : 's'} contra el documento.</span>}</div></div>
       </section>
     </div>
     {barraPestanas}
@@ -1480,7 +1484,10 @@ function NumeroMovimiento({ numero, total, onMover }: { numero: number; total: n
 
 type ColumnasTabla = {
   campos: CampoExtra[]
-  /** Nombre de la sección repetible cuando el tipo no es estado de cuenta: la tabla no muestra las columnas fijas. */
+  /**
+   * Solo fuera de estado de cuenta: nombre de la sección repetible (la tabla no muestra las columnas fijas), o null si
+   * el tipo no tiene sección (no hay tabla). Los datos "Una vez" se muestran aparte, en "Datos del documento".
+   */
   seccion?: string | null
   onCambiar: (id: string, campoId: string, valor: string) => void
   /** Valor de un campo del documento (se guarda una sola vez). */
@@ -1515,10 +1522,18 @@ function TablaTransacciones({ transacciones, columnas, alertas, onCambiar, onEli
   const delDocumento = columnas.campos.filter(esDelDocumento)
   const porMovimiento = columnas.campos.filter((campo) => !esDelDocumento(campo))
   const encabezado = (campo: CampoExtra) => <EncabezadoCampo campo={campo} campos={columnas.campos} onRenombrar={columnas.onRenombrar} onEliminar={columnas.onEliminar} onLlenar={() => columnas.onLlenar(campo.id)} llenando={columnas.llenando.includes(campo.id)} motivoNoLlenar={columnas.motivoNoLlenar} aviso={columnas.avisos[campo.id] ?? null} onCerrarAviso={() => columnas.onCerrarAviso(campo.id)} onCambiarAlcance={(alcance) => columnas.onCambiarAlcance(campo.id, alcance)} puedeSerDelDocumento={puedeSerDelDocumento(transacciones, campo)} />
+  const noEc = columnas.seccion !== undefined
+  const anchoNombres = noEc ? 176 : 112
+  const entradaDocumento = (campo: CampoExtra) => <div className="relative"><input aria-label={`${campo.nombre} del documento`} data-ia={campo.valor_ia || undefined} value={campo.valor ?? ''} title={campo.valor_ia ? `Llenado por la IA: ${campo.valor}` : campo.valor || undefined} maxLength={500} placeholder="Sin capturar" onFocus={() => columnas.onEnfocarDocumento(campo.id)} onChange={(event) => columnas.onCambiarValorDocumento(campo.id, event.target.value)} className={claseEntrada(Boolean(campo.valor_ia), `bg-white ${campo.valor_ia ? 'pr-6' : ''} ${columnas.destinoDocumento === campo.id ? 'ring-2 ring-blue-400' : ''}`)} />{campo.valor_ia && <Sparkles size={10} aria-hidden className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-violet-400" />}</div>
   const claseEntrada = (resaltada: boolean, extra = '') => `w-full rounded-md border px-2 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${resaltada ? 'border-violet-100 bg-violet-50 text-violet-900' : 'border-transparent bg-slate-50/70 hover:border-slate-200'} ${extra}`
   return <div ref={tabla} className="text-xs">
-    <table aria-label={columnas.seccion ? `${columnas.seccion} del documento` : 'Movimientos del estado de cuenta'} style={{ width: 112 + transacciones.length * 188 }} className="table-fixed border-collapse text-xs">
-        <colgroup><col className="w-28" />{transacciones.map((transaccion) => <col key={transaccion.id} className="w-[188px]" />)}</colgroup>
+    {noEc && <section aria-label="Datos del documento" className="border-b border-slate-200 px-3 py-3">
+      <div className="mb-2 flex items-center justify-between gap-2"><div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Datos del documento <span className="font-normal normal-case tracking-normal text-slate-400">· una vez</span></div>{!columnas.seccion && columnas.menu}</div>
+      {delDocumento.length === 0 && <p className="text-[11px] text-slate-400">Sin datos «Una vez». Agrégalos con «+ Campo» o en Configuración → Tipos de documento.</p>}
+      <div className="space-y-1.5">{delDocumento.map((campo) => <div key={campo.id} className="grid grid-cols-[minmax(8rem,14rem)_minmax(0,1fr)] items-start gap-2"><div data-campo={campo.id} className="min-w-0 pt-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">{encabezado(campo)}</div>{entradaDocumento(campo)}</div>)}</div>
+    </section>}
+    {(!noEc || columnas.seccion) && <table aria-label={columnas.seccion ? `${columnas.seccion} del documento` : 'Movimientos del estado de cuenta'} style={{ width: anchoNombres + transacciones.length * 188, minWidth: noEc ? '100%' : undefined }} className="table-fixed border-collapse text-xs">
+        <colgroup><col className={noEc ? 'w-44' : 'w-28'} />{transacciones.map((transaccion) => <col key={transaccion.id} className="w-[188px]" />)}</colgroup>
         <thead><tr>
           <th scope="col" className="sticky left-0 top-0 z-20 border-b border-r border-slate-200 bg-slate-50 px-2 py-1.5 text-left align-top text-[10px] font-bold uppercase tracking-wider text-slate-400"><div title="Número del movimiento. Escribe otro número para moverlo.">#</div><div className="mt-1 normal-case tracking-normal">{columnas.menu}</div></th>
           {transacciones.map((transaccion, index) => {
@@ -1550,14 +1565,15 @@ function TablaTransacciones({ transacciones, columnas, alertas, onCambiar, onEli
               return <td key={transaccion.id} className={`relative border-r border-slate-100 px-1 py-1 ${filaResaltada === transaccion.id ? 'bg-blue-50/70' : ''}`}><input aria-label={`${campo.nombre} del movimiento ${index + 1}`} data-ia={deIa || undefined} value={valor} title={deIa ? `Llenado por la IA: ${valor}` : valor || undefined} maxLength={500} onChange={(event) => columnas.onCambiar(transaccion.id, campo.id, event.target.value)} className={`w-full rounded-md border px-1.5 py-1.5 text-xs text-ink outline-none transition focus:border-coral focus:bg-white focus:ring-2 focus:ring-coral/10 ${deIa ? 'border-violet-100 bg-violet-50 pr-5 text-violet-900' : 'border-transparent bg-transparent hover:border-slate-200'}`} />{deIa && <Sparkles size={10} aria-hidden className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-violet-400" />}</td>
             })}
           </tr>)}
-          {delDocumento.map((campo) => <tr key={campo.id} className="border-b border-slate-100 align-top">
+          {!noEc && delDocumento.map((campo) => <tr key={campo.id} className="border-b border-slate-100 align-top">
             <th scope="row" data-campo={campo.id} className="sticky left-0 z-[5] border-r border-slate-200 bg-white px-2 py-2 text-left text-[10px] font-bold uppercase tracking-wider text-slate-500">{encabezado(campo)}</th>
             {/* Dato que aparece una sola vez en el estado de cuenta: una sola casilla para todos los movimientos. */}
             <td colSpan={Math.max(1, transacciones.length)} className="px-1 py-1"><div className="sticky left-[7.25rem] w-[min(100%,22rem)]" title="Aparece una sola vez en el estado de cuenta: vale para todos los movimientos."><div className="relative"><input aria-label={`${campo.nombre} del documento`} data-ia={campo.valor_ia || undefined} value={campo.valor ?? ''} title={campo.valor_ia ? `Llenado por la IA: ${campo.valor}` : campo.valor || undefined} maxLength={500} placeholder="Sin capturar" onFocus={() => columnas.onEnfocarDocumento(campo.id)} onChange={(event) => columnas.onCambiarValorDocumento(campo.id, event.target.value)} className={claseEntrada(Boolean(campo.valor_ia), `bg-white ${campo.valor_ia ? 'pr-6' : ''} ${columnas.destinoDocumento === campo.id ? 'ring-2 ring-blue-400' : ''}`)} />{campo.valor_ia && <Sparkles size={10} aria-hidden className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-violet-400" />}</div></div></td>
           </tr>)}
         </tbody>
-      </table>
-    {transacciones.length === 0 && <div className="px-5 py-14 text-center text-xs text-slate-400">Sin movimientos. Usa <strong>Agregar</strong> para capturar uno.</div>}
+      </table>}
+    {transacciones.length === 0 && !noEc && <div className="px-5 py-14 text-center text-xs text-slate-400">Sin movimientos. Usa <strong>Agregar</strong> para capturar uno.</div>}
+    {transacciones.length === 0 && noEc && columnas.seccion && <div className="px-5 py-8 text-center text-xs text-slate-400">Sin filas en {columnas.seccion}. Usa <strong>Agregar</strong> para capturar una.</div>}
   </div>
 }
 

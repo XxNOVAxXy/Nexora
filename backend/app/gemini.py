@@ -594,7 +594,9 @@ def _prompt_generico(filename: str, nombre_tipo: str, seccion: str, campos: list
                  "cobertura). Agrega en `filas` un elemento por cada fila, y en `valores` un elemento por dato de esa fila con `campo` (el "
                  "encabezado o el nombre pedido) y `valor` (el texto impreso en esa fila).")
     else:
-        filas = "Este tipo no tiene seccion repetible: deja `filas` vacia."
+        filas = ("Este tipo no tiene seccion repetible configurada. Aun asi, si el documento muestra una tabla con varias filas (por ejemplo "
+                 "asegurados, vehiculos o coberturas), agrega cada fila en `filas` con sus `valores` (`campo` = encabezado, `valor` = texto "
+                 "impreso): se usa solo para avisar al usuario que configure una seccion.")
     return f"""Analiza el documento adjunto llamado {filename!r}. Es un documento del tipo {nombre_tipo!r}.
 
 Devuelve unicamente un objeto JSON que cumpla el esquema recibido. No inventes datos, no completes texto con conocimiento externo y copia los valores EXACTAMENTE como estan impresos. Usa cadenas vacias para valores no visibles.
@@ -624,6 +626,16 @@ def _build_result_generico(filename: str, extraido: DocumentoGenerico, model: st
     (sin columnas fijas: solo sus campos, como columnas adicionales) y no hay validación contable."""
     transacciones: list[dict[str, Any]] = []
     adicionales_por_fila: list[tuple[str, list[ValorAdicional]]] = []
+    avisos = list(extraido.notas)
+    tabla_sin_seccion = None
+    if not seccion:
+        # El tipo no tiene sección: las filas no se capturan, pero se avisa para que el usuario la configure.
+        con_valores = [fila for fila in extraido.filas if any(_limpiar_texto(item.valor, MAX_VALOR_CAMPO) for item in fila.valores)]
+        if con_valores:
+            nombres = list(dict.fromkeys(_limpiar_texto(item.campo, MAX_NOMBRE_CAMPO) for fila in con_valores for item in fila.valores if _limpiar_texto(item.campo, MAX_NOMBRE_CAMPO)))[:8]
+            tabla_sin_seccion = {"filas": len(con_valores), "campos": nombres}
+            avisos.append(f"El documento trae una tabla ({len(con_valores)} fila{'s' if len(con_valores) != 1 else ''}: {', '.join(nombres)}). "
+                          "Agrega una sección al tipo en Configuración → Tipos de documento para capturarla.")
     for indice, fila in enumerate(extraido.filas if seccion else []):
         if not any(_limpiar_texto(item.valor, MAX_VALOR_CAMPO) for item in fila.valores):
             continue
@@ -642,9 +654,11 @@ def _build_result_generico(filename: str, extraido: DocumentoGenerico, model: st
         "transacciones": transacciones,
         "validacion": {"cuadra": None, "aplica": False, "comprobaciones": [], "importes_invalidos": []},
         "aseguradora": _limpiar_texto(extraido.aseguradora, 120),
+        "seccion": seccion or None,
+        "tabla_sin_seccion": tabla_sin_seccion,
         "sugerencias_campos": _sugerencias_campos(adicionales_por_fila, documento, excluir={clave_campo(nombre) for nombre in campos}, estandar=False, limite=MAX_SUGERENCIAS_GENERICAS),
         "resultados_campos": _resultados_campos(list(campos), adicionales_por_fila, extraido.campos_solicitados),
-        "warnings": _unique_text(list(extraido.notas)),
+        "warnings": _unique_text(avisos),
     }
 
 

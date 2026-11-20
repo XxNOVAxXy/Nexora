@@ -6,6 +6,7 @@
 - Cada intento queda auditado en el documento (cuerpo exacto enviado, respuesta, error). Antes de enviar se
   registra como ``en_curso``; si el proceso cae a mitad, el intento queda así y exige confirmar el reenvío.
 - Un timeout es "incierto": SaveData pudo haber recibido el envío, así que reenviar también exige confirmación.
+  Si la conexión nunca se abrió es "error" ("No se pudo conectar con SaveData; no se envió nada."): se puede reintentar.
 - Cada documento va con un "Id" fijo. Una actualización ("Actualizacion": true) de un registro que alguien
   borró en SaveData regresa ``code == 404``: queda como ``no_existe`` y el usuario decide si agregarlo de nuevo
   (se reenvía con el mismo Id y "Actualizacion": false).
@@ -15,6 +16,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import urllib.error
@@ -132,9 +134,48 @@ def _no_existe(status: int | None, texto: str, mensaje: Any) -> RespuestaSaveDat
     return RespuestaSaveData("no_existe", status, texto, f"{MENSAJE_NO_EXISTE} {mensaje}" if mensaje else MENSAJE_NO_EXISTE)
 
 
+MENSAJE_SIN_CONEXION = "No se pudo conectar con SaveData; no se envió nada."
+
+
+class _SinConexion(OSError):
+    """La conexión con SaveData nunca se abrió (ni TCP ni TLS): no se mandó ningún byte del cuerpo."""
+
+
+class _ConexionHTTP(http.client.HTTPConnection):
+    def connect(self) -> None:
+        try:
+            super().connect()
+        except OSError as error:
+            raise _SinConexion(str(error) or error.__class__.__name__) from error
+
+
+class _ConexionHTTPS(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        try:
+            super().connect()
+        except OSError as error:
+            raise _SinConexion(str(error) or error.__class__.__name__) from error
+
+
+class _ManejadorHTTP(urllib.request.HTTPHandler):
+    def http_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(_ConexionHTTP, req)
+
+
+class _ManejadorHTTPS(urllib.request.HTTPSHandler):
+    def https_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(_ConexionHTTPS, req, context=self._context)
+
+
+def _sin_conexion(error: BaseException) -> bool:
+    return isinstance(error, _SinConexion) or isinstance(getattr(error, "reason", None), _SinConexion)
+
+
 def enviar_a_savedata(url: str, cuerpo: str, timeout: float = SAVEDATA_TIMEOUT_SECONDS) -> RespuestaSaveData:
+    """Envía el cuerpo. "error" si SaveData respondió con error o si la conexión nunca se abrió (no se envió nada:
+    se puede reintentar); "incierto" solo si la conexión se abrió y no llegó una respuesta completa."""
     # Sin proxies del entorno (SaveData es un servidor interno) y sin seguir redirecciones.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SinRedirecciones())
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SinRedirecciones(), _ManejadorHTTP(), _ManejadorHTTPS())
     solicitud = urllib.request.Request(url, data=cuerpo.encode("utf-8"), method="POST", headers={"Content-Type": "application/json", "Accept": "application/json"})
     try:
         with opener.open(solicitud, timeout=timeout) as respuesta:
@@ -150,15 +191,17 @@ def enviar_a_savedata(url: str, cuerpo: str, timeout: float = SAVEDATA_TIMEOUT_S
         if _es_no_existe(code):
             return _no_existe(error.code, texto, mensaje)
         return RespuestaSaveData("error", error.code, texto, f"SaveData respondio HTTP {error.code}.")
-    except TimeoutError:
-        return RespuestaSaveData("incierto", None, "", f"SaveData no respondio en {timeout:g} s; no se sabe si recibio el envio.")
-    except urllib.error.URLError as error:
-        if isinstance(error.reason, TimeoutError):
-            return RespuestaSaveData("incierto", None, "", f"SaveData no respondio en {timeout:g} s; no se sabe si recibio el envio.")
-        return RespuestaSaveData("error", None, "", f"No se pudo conectar con SaveData: {error.reason}")
     except OSError as error:
-        # La conexión se cortó después de enviar: SaveData pudo haber procesado el cuerpo.
-        return RespuestaSaveData("incierto", None, "", f"La conexion con SaveData se interrumpio: {error}")
+        # URLError, TimeoutError y cortes de conexión. HTTPError (SaveData sí respondió) ya se atendió arriba.
+        if _sin_conexion(error):
+            return RespuestaSaveData("error", None, "", MENSAJE_SIN_CONEXION)
+        motivo = error.reason if isinstance(error, urllib.error.URLError) else error
+        if isinstance(motivo, TimeoutError):
+            return RespuestaSaveData("incierto", None, "", f"SaveData no respondio en {timeout:g} s; no se sabe si recibio el envio.")
+        if isinstance(error, urllib.error.URLError) and not isinstance(motivo, OSError):
+            return RespuestaSaveData("error", None, "", f"No se pudo conectar con SaveData: {motivo}")
+        # La conexión se abrió y se cortó: SaveData pudo haber procesado el cuerpo.
+        return RespuestaSaveData("incierto", None, "", f"La conexion con SaveData se interrumpio: {motivo}")
 
     texto = texto[:MAX_RESPUESTA_GUARDADA]
     if status != 200:

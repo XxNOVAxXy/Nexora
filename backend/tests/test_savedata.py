@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from backend.app import main
 from backend.app.extracciones import AlmacenExtracciones
-from backend.app.savedata import SaveDataConfig, ServicioEnvio, TotalesEnvio, construir_saldos, enviar_a_savedata, serializar_cuerpo
+from backend.app.savedata import MENSAJE_SIN_CONEXION, SaveDataConfig, ServicioEnvio, TotalesEnvio, construir_saldos, enviar_a_savedata, serializar_cuerpo
 
 EJEMPLO_INTERNO = '{"CargaInicial": false, "Saldos": [{"Sucursal": 3102, "Articulo": "10000453", "Saldo": 10.0, "Clave": "H"}, {"Sucursal": 3102, "Articulo": "10000453", "Saldo": 2.0, "Clave": "S"}]}'
 RESPUESTA_EXITO = {"code": 200, "message": "Exito", "data": []}
@@ -199,7 +199,10 @@ class EnvioTests(unittest.TestCase):
         self.assertEqual(documento["estado"], "revisado")
         self.assertEqual(documento["envios"][0]["resultado"], "error")
         self.assertNotIn("en_curso", [i["resultado"] for i in documento["envios"]])
-        # La reserva se liberó: se puede editar y volver a enviar.
+        # La conexión nunca se abrió: no se envió nada, no es "incierto".
+        self.assertEqual(respuesta.json()["detail"]["message"], MENSAJE_SIN_CONEXION)
+        self.assertEqual(documento["envios"][0]["error"], MENSAJE_SIN_CONEXION)
+        # La reserva se liberó: se puede volver a enviar sin confirmar el reenvío.
         self.url = self.servidor.url
         self.assertEqual(self.enviar(version).status_code, 200)
 

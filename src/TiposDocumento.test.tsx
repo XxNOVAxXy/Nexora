@@ -32,6 +32,7 @@ vi.mock('./services/inboxStore', async (importOriginal) => {
 const { TiposDocumentoSeccion } = await import('./TiposDocumento')
 const { ExtractionTabsWorkspace } = await import('./App')
 const { tiposVigentes } = await import('./services/tiposDocumentoApi')
+const { PanelVerificacion } = await import('./VisorPdf')
 
 const EC: TipoDocumento = { id: 'tipo-ec', nombre: 'Estado de cuenta', codigo: 'EC', color: '#2563eb', seccion: { nombre: 'Movimientos' }, campos: [], contable: true, configurado: true, documentos: 3,
   estructuras: [{ id: 'est-ec', nombre: 'Predeterminada', version: 1, reglas: { remitentes: [], aseguradoras: [] }, documentos: 3 }] }
@@ -227,5 +228,115 @@ describe('Extracción con tipo de documento', () => {
     expect(await screen.findByRole('table', { name: 'Movimientos del estado de cuenta' })).toBeTruthy()
     expect(screen.getByTestId('tipo-documento').textContent).toBe('Estado de cuenta · EC')
     expect(document.getElementById('titulo-validacion')).not.toBeNull()
+  })
+})
+
+describe('Pólizas: datos legibles, sección con su nombre y sin verificación de movimientos', () => {
+  const UNA_VEZ = ['Número de póliza', 'Contratante', 'RFC', 'Vigencia desde', 'Vigencia hasta', 'Suma asegurada', 'Deducible', 'Coaseguro', 'Tope de coaseguro', 'Prima total', 'Forma de pago', 'Producto']
+  const POR_FILA = ['Asegurado', 'Parentesco', 'Fecha de nacimiento', 'Prima']
+  const GMM: TipoDocumento = { id: 'tipo-g', nombre: 'Gastos médicos mayores', codigo: 'G', color: '#d97706', seccion: { nombre: 'Asegurados' }, contable: false, configurado: true, estructuras: [],
+    campos: [...UNA_VEZ.map((nombre, i) => ({ id: `u${i}`, nombre, origen: 'ia' as const, alcance: 'documento' as const })), ...POR_FILA.map((nombre, i) => ({ id: `f${i}`, nombre, origen: 'manual' as const, alcance: 'movimiento' as const }))] }
+  const fila = (n: number) => ({ id: `ia-${n}`, fecha: '', concepto: '', referencia: '', cargo: '', abono: '', saldo: '', origen: 'ia' as const, dudosos: [], extras: Object.fromEntries(POR_FILA.map((nombre, i) => [`f${i}`, `${nombre} ${n}`])) })
+  const gmm = (cambios: Partial<ExtraccionGuardada> = {}): ExtraccionGuardada => ({
+    schema: 1, messageId: 'm-g', partId: '1', attachmentId: 'att-g', filename: 'poliza_gastos_medicos_prueba.pdf', estado: 'borrador', version: 1, creado: '2026-11-19T10:00:00Z', actualizado: '2026-11-19T10:00:00Z',
+    revisado_en: null, revisado_con_problemas: false, enviado_en: null, envios: [], modelo: 'm', prompt_version: 'v', formato_numerico: null,
+    resumen: { banco: '', titular: '', cuenta: '', periodo: '', moneda: '', saldo_inicial: '', total_cargos: '', total_abonos: '', saldo_final: '', dudosos: [] },
+    transacciones: [fila(1), fila(2), fila(3)],
+    campos_extra: GMM.campos.map((campo) => (campo.alcance === 'documento'
+      ? { id: campo.id, nombre: campo.nombre, origen: campo.origen, alcance: 'documento' as const, valor: `valor de ${campo.nombre}`, valor_ia: true, plantilla_id: campo.id }
+      : { id: campo.id, nombre: campo.nombre, origen: campo.origen, plantilla_id: campo.id })),
+    sugerencias_campos: [], validacion: { cuadra: null } as ExtraccionGuardada['validacion'], problemas: { total: 0 } as ExtraccionGuardada['problemas'],
+    tipo_documento: { tipo_id: 'tipo-g', codigo: 'G', nombre: 'Gastos médicos mayores', color: '#d97706', contable: false, metodo: 'manual', confianza: null, requiere_revision: false, motivo: null },
+    ...cambios,
+  })
+  const pintar = () => {
+    const archivo: ArchivoExtraccion = { clave: 'm-g:1', messageId: 'm-g', attachmentId: 'att-g', partId: '1', filename: 'poliza_gastos_medicos_prueba.pdf' }
+    const router = createMemoryRouter([{ path: '*', element: <ExtractionTabsWorkspace archivos={[archivo]} lote={false} mode="gemini" onModeChange={() => undefined} /> }], { initialEntries: ['/extraction'] })
+    render(<RouterProvider router={router} />)
+  }
+  beforeEach(() => {
+    URL.createObjectURL = vi.fn(() => 'blob:prueba')
+    URL.revokeObjectURL = vi.fn()
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => undefined)))
+  })
+
+  it('gastos médicos: los 12 datos "Una vez" se ven con su valor y la sección "Asegurados" trae sus 3 filas', async () => {
+    tiposVigentes.fijar([EC, GMM])
+    guardado = gmm()
+    pintar()
+    const datos = await screen.findByRole('region', { name: 'Datos del documento' })
+    for (const nombre of UNA_VEZ) expect((within(datos).getByLabelText(`${nombre} del documento`) as HTMLInputElement).value).toBe(`valor de ${nombre}`)
+    const tabla = screen.getByRole('table', { name: 'Asegurados del documento' })
+    expect(within(tabla).getAllByRole('columnheader').length).toBe(1 + 3)
+    expect((within(tabla).getByLabelText('Parentesco del movimiento 3') as HTMLInputElement).value).toBe('Parentesco 3')
+    // Los datos "Una vez" no se repiten dentro de la tabla y la columna de nombres es ancha.
+    expect(within(tabla).queryByLabelText('RFC del documento')).toBeNull()
+    expect(tabla.querySelector('col')?.className).toBe('w-44')
+    expect(screen.getByText('3 filas en Asegurados.')).toBeTruthy()
+    expect(screen.queryByText('Filas')).toBeNull()
+  })
+
+  it('un tipo sin sección no muestra una tabla "Filas"', async () => {
+    const sinSeccion: TipoDocumento = { ...GMM, seccion: null, campos: GMM.campos.filter((campo) => campo.alcance === 'documento') }
+    tiposVigentes.fijar([EC, sinSeccion])
+    guardado = gmm({ transacciones: [], campos_extra: gmm().campos_extra?.filter((campo) => campo.alcance === 'documento') })
+    pintar()
+    const datos = await screen.findByRole('region', { name: 'Datos del documento' })
+    expect((within(datos).getByLabelText('Contratante del documento') as HTMLInputElement).value).toBe('valor de Contratante')
+    expect(screen.queryByRole('table')).toBeNull()
+    expect(screen.queryByText('Filas')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Agregar' })).toBeNull()
+    expect(screen.getByText('Este tipo no tiene sección repetible.')).toBeTruthy()
+  })
+
+  it('la verificación visual dice claramente que no aplica', () => {
+    render(<PanelVerificacion noAplica="La verificación visual compara los movimientos de un estado de cuenta; no aplica a Gastos médicos mayores." estado="listo" visible resultado={null} destino={null} onCancelarDestino={vi.fn()} mensaje={null} onCerrarMensaje={vi.fn()} filaPorAgregar={null} onAgregar={vi.fn()} onCancelarAgregar={vi.fn()} />)
+    expect(screen.getByRole('note').textContent).toContain('no aplica a Gastos médicos mayores')
+    expect(screen.queryByText(/tabla de movimientos/)).toBeNull()
+  })
+
+  it('en Tipos y reglas se agrega la sección a un tipo existente y sus campos por fila', async () => {
+    const sinSeccion: TipoDocumento = { ...GMM, seccion: null, campos: GMM.campos.filter((campo) => campo.alcance === 'documento') }
+    listarMock.mockImplementation(async () => ({ tipos: [EC, sinSeccion], umbral_confianza: 0.7 }))
+    editarMock.mockImplementation(async (_id: string, solicitud: { seccion: TipoDocumento['seccion']; campos: TipoDocumento['campos'] }) => {
+      const tipo = { ...sinSeccion, seccion: solicitud.seccion, campos: solicitud.campos }
+      return { tipos: [EC, tipo], umbral_confianza: 0.7, tipo }
+    })
+    render(<TiposDocumentoSeccion onNotice={vi.fn()} onError={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('tab', { name: 'Tipos y reglas' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Gastos médicos mayores/ }))
+    fireEvent.change(screen.getByLabelText('Sección repetible'), { target: { value: 'Asegurados' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Guardar tipo' }))
+    await waitFor(() => expect(editarMock).toHaveBeenCalledTimes(1))
+    expect(editarMock.mock.calls[0][1].seccion).toEqual({ nombre: 'Asegurados' })
+    await waitFor(() => expect(screen.getByTestId('tipo-configurando').textContent).toContain('Sección repetible: Asegurados'))
+    // Campo por fila nuevo en la sección, y renombrar la sección después.
+    fireEvent.change(screen.getByLabelText('Nombre del campo nuevo'), { target: { value: 'Asegurado' } })
+    fireEvent.change(screen.getByLabelText('Dónde va el campo nuevo'), { target: { value: 'movimiento' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Agregar a mano' }))
+    expect((screen.getByLabelText('Dónde va Asegurado') as HTMLSelectElement).selectedOptions[0].textContent).toBe('En asegurados')
+    fireEvent.click(screen.getByRole('button', { name: 'Guardar campos' }))
+    await waitFor(() => expect(editarMock).toHaveBeenCalledTimes(2))
+    const conCampo = editarMock.mock.calls[1][1]
+    expect(conCampo.seccion).toEqual({ nombre: 'Asegurados' })
+    expect(conCampo.campos.slice(-1)[0]).toMatchObject({ nombre: 'Asegurado', alcance: 'movimiento' })
+    fireEvent.change(screen.getByLabelText('Sección repetible'), { target: { value: 'Personas aseguradas' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Guardar tipo' }))
+    await waitFor(() => expect(editarMock).toHaveBeenCalledTimes(3))
+    expect(editarMock.mock.calls[2][1].seccion).toEqual({ nombre: 'Personas aseguradas' })
+    expect(editarMock.mock.calls[2][1].campos.slice(-1)[0]).toMatchObject({ nombre: 'Asegurado', alcance: 'movimiento' })
+  })
+
+  it('"Configurar con este documento" avisa si la IA ve una tabla y el tipo no tiene sección', async () => {
+    sugerirMock.mockImplementation(async () => ({ aseguradora: null, sugerencias: [
+      { clave: 'contratante', nombre: 'Contratante', ejemplo: 'X', alcance: 'documento', filas: 0 },
+      { clave: 'asegurado', nombre: 'Asegurado', ejemplo: 'Y', alcance: 'movimiento', filas: 3 },
+    ] }))
+    render(<TiposDocumentoSeccion onNotice={vi.fn()} onError={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Configurar con este documento' }))
+    const panel = screen.getByRole('dialog', { name: 'poliza-axa.pdf' })
+    fireEvent.click(within(panel).getByRole('button', { name: 'Proponer campos con IA' }))
+    const aviso = await within(panel).findByRole('note')
+    expect(aviso.textContent).toContain('La IA ve una tabla que se repite (Asegurado)')
   })
 })
