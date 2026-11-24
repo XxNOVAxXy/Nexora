@@ -2,6 +2,7 @@
 -- Portable a PostgreSQL: solo tipos estándar (los equivalentes van comentados).
 -- Tipos, estructuras y versiones siguen en JSON en disco (fase actual).
 -- Fechas en UTC. Juego de caracteres utf8mb4 para acentos y ñ.
+-- Alembic 0002 agregó: documentos.recepcion, eventos.origen y eventos.detalle.
 
 CREATE DATABASE IF NOT EXISTS nexora
   CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
@@ -63,6 +64,7 @@ CREATE TABLE documentos (
   datos            JSON         NULL,                    -- PG: JSONB. JSON de extracción (mismo formato que SaveData)
   creado           DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   actualizado      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  recepcion        JSON         NULL,                    -- PG: JSONB. attachment_id, mime, diagnostico, bandeja (Alembic 0002)
   CONSTRAINT fk_documentos_cuenta FOREIGN KEY (cuenta_id) REFERENCES cuentas_correo(id),
   CONSTRAINT uq_documentos_adjunto UNIQUE (cuenta_id, message_id, part_id)
 );
@@ -99,6 +101,8 @@ CREATE TABLE eventos (
   codigo        VARCHAR(50) NULL,                        -- pdf_protegido, sin_conexion, campo_faltante ...
   mensaje       VARCHAR(1000) NULL,
   fecha         DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  origen        VARCHAR(15) NULL,                        -- automatico | manual | reprocesar | configurar (Alembic 0002)
+  detalle       JSON        NULL,                        -- PG: JSONB. Datos pequeños del evento (Alembic 0002)
   CONSTRAINT fk_eventos_documento FOREIGN KEY (documento_id) REFERENCES documentos(id),
   CONSTRAINT fk_eventos_cuenta    FOREIGN KEY (cuenta_id)    REFERENCES cuentas_correo(id),
   CONSTRAINT fk_eventos_usuario   FOREIGN KEY (usuario_id)   REFERENCES usuarios(id)

@@ -4,10 +4,9 @@ Se eligen con ``NEXORA_ALMACEN=db`` (ver ``almacenamiento.py``). Usan las 5 tabl
 que el esquema no tiene como columna se guarda así:
 
 - documentos: los datos de la recepción sin columna propia (``attachment_id``, ``mime``, ``diagnostico``,
-  ``bandeja``) van en ``datos["recepcion"]``. ``estado`` sale de la bandeja (``captura_manual`` mientras está
+  ``bandeja``) van en la columna ``recepcion`` (JSON); ``datos`` queda solo para la extracción. ``estado`` sale de la bandeja (``captura_manual`` mientras está
   pendiente, ``extraido`` al resolverse, ``descartado``) y ``motivo`` es el código del diagnóstico o de la bandeja.
-- eventos: ``resultado`` (ok | aviso | error) se deduce del código. ``origen`` y ``detalle`` no tienen columna:
-  no se guardan (el listado los devuelve en None).
+- eventos: ``resultado`` (ok | aviso | error) se deduce del código; ``origen`` y ``detalle`` van en sus columnas.
 - envios: un renglón por intento; ``intento`` es su número dentro del documento (1, 2, 3…), así que volver a
   sincronizar actualiza el mismo renglón y no duplica. El detalle completo del intento sigue en el JSON de la
   extracción (fuente de lo que lee el resto del código).
@@ -38,7 +37,7 @@ logger = logging.getLogger("nexora.repos.db")
 
 USUARIO_SISTEMA = "sistema"
 
-# Claves del registro JSON que tienen columna propia en ``documentos``; el resto va en datos["recepcion"].
+# Claves del registro JSON que tienen columna propia en ``documentos``; el resto va en la columna ``recepcion``.
 _CON_COLUMNA = {"message_id", "part_id", "nombre", "ruta", "sha256", "tamano", "recibido_en", "asunto", "remitente", "guardado_en", "actualizado"}
 _ESTADO_POR_BANDEJA = {"pendiente": "captura_manual", "resuelto": "extraido", "descartado": "descartado"}
 
@@ -143,8 +142,7 @@ def _id_documento(sesion: Session, cuenta_id: int, message_id: str, part_id: str
 
 def registro_desde_fila(fila: Documento) -> dict[str, Any]:
     """Renglón de ``documentos`` → registro con el mismo formato que ``DocumentosJson``."""
-    datos = fila.datos if isinstance(fila.datos, dict) else {}
-    registro = dict(datos.get("recepcion") or {})
+    registro = dict(fila.recepcion) if isinstance(fila.recepcion, dict) else {}
     registro.update(
         message_id=fila.message_id,
         part_id=fila.part_id,
@@ -182,7 +180,7 @@ def columnas_desde_registro(registro: dict[str, Any], estado_previo: str | None)
         "remitente": _texto(registro.get("remitente"), 255),
         "estado": estado,
         "motivo": _texto(motivo, 50),
-        "datos": {"recepcion": recepcion},
+        "recepcion": recepcion,
         "creado": a_utc(registro.get("guardado_en")) or ahora,
         "actualizado": a_utc(registro.get("actualizado")) or ahora,
     }
@@ -277,12 +275,13 @@ class EventosDb:
 
     def registrar(self, email: str, *, etapa: str, codigo: str, mensaje: str, message_id: str | None = None, part_id: str | None = None,
                   origen: str | None = None, detalle: dict[str, Any] | None = None) -> dict[str, Any]:
-        evento = self.insertar(email, etapa=etapa, codigo=codigo, mensaje=mensaje, message_id=message_id, part_id=part_id, fecha=self.reloj())
+        evento = self.insertar(email, etapa=etapa, codigo=codigo, mensaje=mensaje, message_id=message_id, part_id=part_id, fecha=self.reloj(),
+                               origen=origen, detalle=detalle)
         assert evento is not None
-        return {**evento, "origen": origen, "detalle": detalle or None}
+        return evento
 
     def insertar(self, email: str, *, etapa: str, codigo: str, mensaje: str, message_id: str | None, part_id: str | None, fecha: Any,
-                 omitir_repetido: bool = False) -> dict[str, Any] | None:
+                 origen: str | None = None, detalle: dict[str, Any] | None = None, omitir_repetido: bool = False) -> dict[str, Any] | None:
         """Inserta un evento con su fecha. Con ``omitir_repetido`` (importador) no inserta uno idéntico ya existente."""
         if etapa not in ETAPAS:
             raise ValueError(f"Etapa desconocida: {etapa}")
@@ -298,11 +297,11 @@ class EventosDb:
                 if repetido is not None:
                     return None
             fila = Evento(documento_id=documento_id, cuenta_id=cuenta_id, usuario_id=None, etapa=etapa, resultado=resultado_de(codigo_texto),
-                          codigo=codigo_texto, mensaje=mensaje_texto, fecha=momento)
+                          codigo=codigo_texto, mensaje=mensaje_texto, fecha=momento, origen=_texto(origen, 15), detalle=detalle or None)
             sesion.add(fila)
             sesion.flush()
             return {"id": str(fila.id), "fecha": a_iso(fila.fecha), "etapa": etapa, "codigo": codigo_texto, "mensaje": mensaje_texto,
-                    "message_id": message_id, "part_id": part_id, "resultado": fila.resultado}
+                    "message_id": message_id, "part_id": part_id, "origen": fila.origen, "detalle": fila.detalle, "resultado": fila.resultado}
 
     def listar(self, email: str, *, message_id: str | None = None, part_id: str | None = None, etapa: str | None = None,
                desde: str | None = None, hasta: str | None = None, limite: int = 200) -> list[dict[str, Any]]:
@@ -324,7 +323,7 @@ class EventosDb:
         consulta = consulta.order_by(Evento.fecha.desc(), Evento.id.desc()).limit(max(1, min(limite, MAX_LISTADO)))
         with self.sesiones.begin() as sesion:
             return [{"id": str(fila.id), "fecha": a_iso(fila.fecha), "etapa": fila.etapa, "codigo": fila.codigo, "mensaje": fila.mensaje or "",
-                     "message_id": mid, "part_id": pid, "origen": None, "detalle": None, "resultado": fila.resultado}
+                     "message_id": mid, "part_id": pid, "origen": fila.origen, "detalle": fila.detalle, "resultado": fila.resultado}
                     for fila, mid, pid in sesion.execute(consulta)]
 
 

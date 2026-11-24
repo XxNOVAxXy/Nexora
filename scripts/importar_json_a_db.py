@@ -134,7 +134,9 @@ def importar(motor: Engine, cifrador: Cifrador, datos: Path, *, correos_extra: l
                         continue
                     try:
                         insertado = eventos.insertar(correo, etapa=str(evento["etapa"]), codigo=str(evento.get("codigo") or ""), mensaje=str(evento.get("mensaje") or ""),
-                                                     message_id=evento.get("message_id"), part_id=evento.get("part_id"), fecha=evento.get("fecha"), omitir_repetido=True)
+                                                     message_id=evento.get("message_id"), part_id=evento.get("part_id"), fecha=evento.get("fecha"),
+                                                     origen=evento.get("origen"), detalle=evento.get("detalle") if isinstance(evento.get("detalle"), dict) else None,
+                                                     omitir_repetido=True)
                     except ValueError:
                         conteo["eventos_etapa_desconocida"] += 1
                         continue

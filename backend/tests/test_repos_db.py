@@ -171,12 +171,19 @@ class ContratoDb(Contrato, unittest.TestCase):
         # Fecha del correo en UTC (llegó con -06:00).
         self.assertEqual(fila.fecha_correo, datetime(2026, 11, 20, 10, 0))
         self.assertEqual(fila.creado, INICIO.replace(tzinfo=None))
-        self.assertEqual(fila.datos["recepcion"]["attachment_id"], "att-1")
-        self.assertEqual(fila.datos["recepcion"]["bandeja"]["estado"], "pendiente")
+        self.assertEqual(fila.recepcion["attachment_id"], "att-1")
+        self.assertEqual(fila.recepcion["bandeja"]["estado"], "pendiente")
+        # ``datos`` queda libre para la extracción.
+        self.assertIsNone(fila.datos)
         recepcion.resolver(EMAIL, "m1", "1", "extraido")
         self.assertEqual(self.filas(Documento)[0].estado, "extraido")
-        eventos = {(e.etapa, e.resultado, e.codigo, e.documento_id) for e in self.filas(Evento)}
-        self.assertEqual(eventos, {("lectura", "ok", "ok", fila.id), ("diagnostico", "error", "pdf_protegido", fila.id)})
+        eventos = {(e.etapa, e.resultado, e.codigo, e.documento_id, e.origen) for e in self.filas(Evento)}
+        self.assertEqual(eventos, {("lectura", "ok", "ok", fila.id, "automatico"), ("diagnostico", "error", "pdf_protegido", fila.id, "automatico")})
+        diagnostico = next(e for e in self.filas(Evento) if e.etapa == "diagnostico")
+        self.assertEqual(diagnostico.detalle["formato"], "pdf")
+        # El listado devuelve origen y detalle igual que la versión JSON.
+        listado = self.eventos.listar(EMAIL, etapa="diagnostico")[0]
+        self.assertEqual((listado["origen"], listado["detalle"]["formato"]), ("automatico", "pdf"))
 
     def test_resultado_del_evento(self) -> None:
         self.assertEqual([resultado_de(c) for c in ("ok", "exito", "pdf_escaneado", "pdf_protegido", "error")], ["ok", "ok", "aviso", "error", "error"])

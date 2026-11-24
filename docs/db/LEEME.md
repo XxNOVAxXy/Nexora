@@ -30,7 +30,13 @@ Genera la llave **una sola vez** y guárdala fuera del repo. Si se pierde, las c
 .\.venv\Scripts\alembic -c backend\alembic.ini check          # compara los modelos con tu base
 ```
 
-`alembic upgrade head` solo sirve para una base **vacía**. Si encuentra las tablas, se detiene sin tocar nada. `downgrade` nunca borra tablas.
+La baseline (`0001`) solo se marca con `stamp`. Si alguien la ejecuta sobre una base que ya tiene las tablas, se detiene sin tocar nada, y su `downgrade` nunca borra tablas. Las migraciones siguientes (`0002`…) sí se aplican con `upgrade head`.
+
+## 3b. Aplicar las migraciones nuevas (0002: `documentos.recepcion`, `eventos.origen`, `eventos.detalle`)
+
+```powershell
+.\.venv\Scripts\alembic -c backend\alembic.ini upgrade head     # solo agrega columnas; no toca las existentes
+```
 
 ## 4. Importar lo que hay en JSON
 
@@ -42,7 +48,7 @@ Genera la llave **una sola vez** y guárdala fuera del repo. Si se pierde, las c
 
 ## 5. Encender el modo db
 
-Pon `NEXORA_ALMACEN=db` en el `.env`, reinicia el backend y abre `http://localhost:8787/api/salud/db` (o el puerto de tu `PORT`).
+Pon `NEXORA_ALMACEN=db` en el `.env`, reinicia el backend y abre `http://localhost:8000/api/salud/db`.
 
 Para volver a JSON, pon `NEXORA_ALMACEN=json`: los archivos de `backend/data` siguen ahí.
 
@@ -52,8 +58,8 @@ Para volver a JSON, pon `NEXORA_ALMACEN=json`: los archivos de `backend/data` si
 |---|---|
 | `usuarios` | Solo el usuario `sistema`: está inactivo y su contraseña es aleatoria. Es dueño de las cuentas hasta que exista el login. |
 | `cuentas_correo` | Una por correo. `credencial_cifrada` lleva el token de Gmail cifrado con Fernet. El importador la deja vacía, aunque cifrada. |
-| `documentos` | Un renglón por adjunto (cuenta + message_id + part_id). Lo que no tiene columna (`attachment_id`, `mime`, `diagnostico`, `bandeja`) va en `datos.recepcion`. |
+| `documentos` | Un renglón por adjunto (cuenta + message_id + part_id). La recepción (`attachment_id`, `mime`, `diagnostico`, `bandeja`) va en la columna `recepcion`; `datos` queda para la extracción. |
 | `envios` | Un renglón por intento (`intento` = 1, 2, 3…). El detalle completo sigue en el JSON de la extracción. |
-| `eventos` | Bitácora por etapa. `resultado` (ok, aviso o error) se deduce del código. `origen` y `detalle` no tienen columna, así que no se guardan. |
+| `eventos` | Bitácora por etapa. `resultado` (ok, aviso o error) se deduce del código; `origen` y `detalle` en sus columnas. |
 
 Las fechas se guardan en UTC: la conexión fija `time_zone = '+00:00'`. La interfaz las muestra en hora de México.

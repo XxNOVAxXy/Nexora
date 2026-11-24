@@ -66,7 +66,8 @@ def escribir_datos_ficticios(raiz: Path) -> None:
     (raiz / "eventos").mkdir(parents=True)
     eventos = [
         {"fecha": "2026-11-20T10:00:00+00:00", "etapa": "lectura", "codigo": "ok", "mensaje": "Leido.", "message_id": "m1", "part_id": "1"},
-        {"fecha": "2026-11-20T10:00:00+00:00", "etapa": "diagnostico", "codigo": "pdf_protegido", "mensaje": "Protegido.", "message_id": "m1", "part_id": "1"},
+        {"fecha": "2026-11-20T10:00:00+00:00", "etapa": "diagnostico", "codigo": "pdf_protegido", "mensaje": "Protegido.", "message_id": "m1", "part_id": "1",
+         "origen": "automatico", "detalle": {"formato": "pdf", "paginas": 1}},
         {"fecha": "2026-11-20T10:05:00+00:00", "etapa": "envio", "codigo": "exito", "mensaje": "Enviado.", "message_id": "m2", "part_id": "1"},
     ]
     (raiz / "eventos" / f"{cuenta}.jsonl").write_text("\n".join(json.dumps(e) for e in eventos) + "\n{linea cortada", encoding="utf-8")
@@ -111,10 +112,13 @@ class Importador(unittest.TestCase):
             ligados = conexion.execute(sa.select(sa.func.count()).select_from(Evento).where(Evento.documento_id.is_not(None))).scalar_one()
         self.assertEqual((documentos["m1"].estado, documentos["m1"].motivo), ("captura_manual", "pdf_protegido"))
         self.assertEqual((documentos["m2"].estado, documentos["m2"].tipo, documentos["m2"].aseguradora, documentos["m2"].version), ("enviado", "F", "Afianzadora Ficticia", 1))
-        self.assertEqual((documentos["m2"].ruta_original, documentos["m2"].datos["recepcion"]["sin_original"]), ("", True))
+        self.assertEqual((documentos["m2"].ruta_original, documentos["m2"].recepcion["sin_original"]), ("", True))
         self.assertEqual(documentos["m3"].estado, "extraido")
         self.assertEqual([tuple(e) for e in envios], [(1, "error", "manual", 500), (2, "enviado", "automatico", 200)])
         self.assertEqual(ligados, 3)
+        with self.motor.connect() as conexion:
+            origen, detalle = conexion.execute(sa.select(Evento.origen, Evento.detalle).where(Evento.etapa == "diagnostico")).one()
+        self.assertEqual((origen, detalle), ("automatico", {"formato": "pdf", "paginas": 1}))
 
     def test_correo_explicito_importa_la_carpeta_sin_extracciones(self) -> None:
         resultado = importar(self.motor, self.cifrador, self.datos, correos_extra=["otra@example.com"])

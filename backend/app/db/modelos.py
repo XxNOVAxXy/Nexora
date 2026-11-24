@@ -5,7 +5,8 @@ BIGINT → BigInteger (en SQLite de pruebas, Integer para que el id sea autoincr
 CHAR(64) → CHAR(64), TEXT → Text, BOOLEAN → Boolean, DATETIME → DateTime (sin zona: siempre UTC), JSON → JSON.
 
 Las tablas ya existen (se crearon a mano con ese script): estos modelos no las crean ni las cambian. La migración
-``baseline`` de Alembic solo se marca con ``alembic stamp`` (ver ``backend/migraciones``).
+``baseline`` de Alembic solo se marca con ``alembic stamp``; la ``0002`` agrega ``documentos.recepcion``,
+``eventos.origen`` y ``eventos.detalle`` (ver ``backend/migraciones``).
 
 Fechas: todo se guarda en UTC. Los valores los pone siempre Python (``ahora_utc``) y, además, la conexión a MySQL
 usa ``time_zone = '+00:00'`` para que los ``DEFAULT CURRENT_TIMESTAMP`` del esquema también queden en UTC.
@@ -110,6 +111,8 @@ class Documento(Base):
     datos: Mapped[Any] = mapped_column(JSON, nullable=True)
     creado: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=AHORA)
     actualizado: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=AHORA, onupdate=func.now())
+    # Alembic 0002: datos de la recepción (attachment_id, mime, diagnostico, bandeja); ``datos`` queda para la extracción.
+    recepcion: Mapped[Any] = mapped_column(JSON, nullable=True)
 
 
 class Envio(Base):
@@ -148,3 +151,6 @@ class Evento(Base):
     codigo: Mapped[str | None] = mapped_column(String(50), nullable=True)
     mensaje: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     fecha: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=AHORA)
+    # Alembic 0002.
+    origen: Mapped[str | None] = mapped_column(String(15), nullable=True)
+    detalle: Mapped[Any] = mapped_column(JSON, nullable=True)
