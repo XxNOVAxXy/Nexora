@@ -6,6 +6,8 @@ import logging
 from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
@@ -15,6 +17,9 @@ from .adjuntos import content_disposition
 from .originales import AlmacenOriginales
 from .recepcion import MOTIVOS_BANDEJA, ServicioRecepcion
 from .almacenamiento import crear_repositorios, salud_db
+from .cuentas_imap import CuentaImapRequest
+from .imap import ClienteImap, ImapError, ImapSinConexion, DatosCuentaImap, cuenta_de_id, es_id_imap
+from .seguridad import LlaveCifradoInvalida
 from .automatico import MAX_INTENTOS, ExtractorAutomatico, intervalo_desde_entorno
 from .plantilla_campos import AlmacenPlantillas, PlantillaRequest, aplicar_plantilla, comparable, deducir_campos, sugerencias_para_configurar
 from .config import settings
@@ -52,9 +57,11 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(mess
 async def lifespan(_: FastAPI):
     # El hilo arranca con el backend; si el proceso está pausado, cada ciclo termina sin consultar nada.
     automatico.iniciar()
+    gestor_imap.iniciar()
     try:
         yield
     finally:
+        gestor_imap.detener()
         automatico.detener()
 
 
@@ -112,7 +119,8 @@ def _credencial_gmail(_email: str) -> str | None:
 
 # NEXORA_ALMACEN=json|db (por defecto json): documentos, eventos y envíos en archivos o en la base de datos.
 repositorios = crear_repositorios(settings.almacen, almacen=almacen, documentos_path=settings.documentos_path, eventos_path=settings.eventos_path,
-                                  database_url=settings.database_url, llave_cifrado=settings.llave_cifrado, credencial_de=_credencial_gmail)
+                                  database_url=settings.database_url, llave_cifrado=settings.llave_cifrado, credencial_de=_credencial_gmail,
+                                  imap_path=settings.imap_cuentas_path)
 # Originales en disco, diagnóstico, eventos y Bandeja de captura manual.
 recepcion = ServicioRecepcion(repositorios.documentos, repositorios.eventos, AlmacenOriginales(settings.originales_path))
 # Intentos de envío a SaveData: siguen en el JSON de cada extracción; el repositorio recibe cada cambio.
@@ -123,6 +131,120 @@ envios = ServicioEnvio(almacen, lambda: settings.savedata_url, configurados=lamb
 automatico = ExtractorAutomatico(settings.automatico_path, gmail, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos), plantillas=plantillas, envios=envios, tipos=tipos,
                                  recepcion=recepcion)
 oauth_states: dict[str, datetime] = {}
+
+
+class _ConfigCompartida:
+    """Las cuentas IMAP usan la configuración (tipos de documento y campos) de la cuenta principal (la de Gmail, o la
+    primera que se conozca): así se configura una sola vez en Configuración."""
+
+    def __init__(self, objeto: Any) -> None:
+        self._objeto = objeto
+
+    def __getattr__(self, nombre: str) -> Any:
+        valor = getattr(self._objeto, nombre)
+        if not callable(valor):
+            return valor
+
+        def con_cuenta_principal(*args: Any, **kwargs: Any) -> Any:
+            if args and isinstance(args[0], str) and "@" in args[0]:
+                principal = automatico._cuenta_conocida
+                args = (principal or args[0], *args[1:])
+            return valor(*args, **kwargs)
+        return con_cuenta_principal
+
+
+class GestorImap:
+    """Un proceso automático por cuenta IMAP (el ciclo, "Revisar ahora", la bandeja y los reintentos de siempre)."""
+
+    def __init__(self) -> None:
+        self._activos: dict[str, tuple[ClienteImap, ExtractorAutomatico, str]] = {}
+        self._iniciado = False
+
+    @property
+    def cuentas(self) -> Any:
+        return repositorios.cuentas_imap
+
+    def _crear(self, datos: DatosCuentaImap) -> tuple[ClienteImap, ExtractorAutomatico, str]:
+        cliente = ClienteImap(datos)
+        extractor = ExtractorAutomatico(settings.automatico_path / f"imap-{datos.id}", cliente, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos),
+                                        plantillas=_ConfigCompartida(plantillas), envios=envios, tipos=_ConfigCompartida(tipos), recepcion=recepcion)
+        return cliente, extractor, datos.correo
+
+    def _asegurar(self, cuenta_id: str) -> tuple[ClienteImap, ExtractorAutomatico, str] | None:
+        if cuenta_id in self._activos:
+            return self._activos[cuenta_id]
+        try:
+            datos = self.cuentas.privada(cuenta_id)
+        except Exception:
+            logger.exception("No se pudo leer la cuenta IMAP %s", cuenta_id)
+            return None
+        if datos is None:
+            return None
+        self._activos[cuenta_id] = self._crear(datos)
+        if self._iniciado:
+            self._activos[cuenta_id][1].iniciar()
+        return self._activos[cuenta_id]
+
+    def iniciar(self) -> None:
+        self._iniciado = True
+        try:
+            cuentas = self.cuentas.listar()
+        except Exception:
+            logger.warning("No se pudieron cargar las cuentas IMAP (revisa NEXORA_LLAVE_CIFRADO)")
+            return
+        for cuenta in cuentas:
+            activo = self._asegurar(str(cuenta["id"]))
+            if activo is not None:
+                activo[1].iniciar()
+
+    def detener(self) -> None:
+        for _cliente, extractor, _correo in list(self._activos.values()):
+            extractor.detener()
+        self._iniciado = False
+
+    def quitar(self, cuenta_id: str) -> None:
+        activo = self._activos.pop(cuenta_id, None)
+        if activo is not None:
+            activo[1].detener()
+
+    def cliente(self, cuenta_id: str) -> ClienteImap | None:
+        activo = self._asegurar(cuenta_id)
+        return None if activo is None else activo[0]
+
+    def extractor(self, cuenta_id: str) -> ExtractorAutomatico | None:
+        activo = self._asegurar(cuenta_id)
+        return None if activo is None else activo[1]
+
+    def correo(self, cuenta_id: str) -> str | None:
+        activo = self._asegurar(cuenta_id)
+        return None if activo is None else activo[2]
+
+    def correos(self) -> list[str]:
+        try:
+            return [str(cuenta["correo"]) for cuenta in self.cuentas.listar()]
+        except Exception:
+            return []
+
+    def extractor_de_correo(self, correo: str) -> ExtractorAutomatico | None:
+        try:
+            cuenta = next((item for item in self.cuentas.listar() if item["correo"] == correo), None)
+        except Exception:
+            return None
+        return None if cuenta is None else self.extractor(str(cuenta["id"]))
+
+
+gestor_imap = GestorImap()
+
+
+@app.exception_handler(RequestValidationError)
+async def _validacion_sin_secretos(request: Request, error: RequestValidationError) -> JSONResponse:
+    """Errores 422 de siempre, pero en /api/imap sin repetir lo enviado (podría ser la contraseña)."""
+    from fastapi.encoders import jsonable_encoder
+
+    errores = error.errors()
+    if request.url.path.startswith("/api/imap"):
+        errores = [{clave: valor for clave, valor in item.items() if clave not in {"input", "ctx", "url"}} for item in errores]
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errores)})
 
 
 def _rate_limited(error: GmailRateLimitError) -> HTTPException:
@@ -262,7 +384,7 @@ def disable_gemini_config() -> dict[str, Any]:
 @app.post("/api/gemini/extract")
 def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
     try:
-        data, media_type, filename = gmail.attachment(payload.messageId, payload.attachmentId)
+        data, media_type, filename = _cliente_de(payload.messageId).attachment(payload.messageId, payload.attachmentId)
         logger.info(
             "Gemini extraction input message_id=%s attachment_id=%s filename=%s size=%d mime_type=%s pdf_signature=%s",
             payload.messageId,
@@ -330,10 +452,10 @@ def _recibir_manual(payload: GeminiExtractionRequest, data: bytes, media_type: s
     Devuelve (cuenta, partId, diagnóstico), o None si no se pudo identificar la cuenta o la parte del correo: en ese
     caso se extrae como antes, sin diagnóstico (nunca se bloquea la extracción por no poder registrar)."""
     try:
-        email = gmail.profile().get("email")
+        email = _email_de(payload.messageId)
         if not email:
             return None
-        mensaje = gmail.get_message(payload.messageId)
+        mensaje = _cliente_de(payload.messageId).get_message(payload.messageId)
         part_id = payload.partId
         if not part_id:
             adjunto = next((item for item in mensaje.get("attachments") or [] if str(item.get("id")) == payload.attachmentId), None)
@@ -352,9 +474,9 @@ def _recibir_manual(payload: GeminiExtractionRequest, data: bytes, media_type: s
 def _extraer_con_tipo(payload: GeminiExtractionRequest, data: bytes, media_type: str, filename: str) -> dict[str, Any]:
     """Extracción según el tipo de documento: el elegido (``tipo_id``) o el detectado. Estado de cuenta usa los
     campos que pide el frontend (como siempre); los demás tipos, los campos de su configuración."""
-    email = _cuenta_actual()
+    email = _email_de(payload.messageId)
     lista = tipos.leer(email)
-    mensaje = gmail.get_message(payload.messageId)
+    mensaje = _cliente_de(payload.messageId).get_message(payload.messageId)
     if payload.tipo_id:
         tipo = next((item for item in lista if item["id"] == payload.tipo_id), None)
         if tipo is None:
@@ -383,7 +505,7 @@ def _extraer_con_tipo(payload: GeminiExtractionRequest, data: bytes, media_type:
 def fill_gemini_field(payload: GeminiCampoRequest) -> dict[str, Any]:
     """"Llenar con IA": busca una sola columna en el documento para las filas actuales, sin re-extraer."""
     try:
-        data, media_type, filename = gmail.attachment(payload.messageId, payload.attachmentId)
+        data, media_type, filename = _cliente_de(payload.messageId).attachment(payload.messageId, payload.attachmentId)
         return gemini.fill_field(data, media_type, filename, payload.nombre, [fila.model_dump() for fila in payload.filas])
     except GmailNotConnectedError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
@@ -459,8 +581,9 @@ def list_gmail_messages(
 
 @app.get("/api/gmail/messages/{message_id}")
 def get_gmail_message(message_id: str) -> dict[str, Any]:
+    cliente = _cliente_de(message_id)
     try:
-        return gmail.get_message(message_id)
+        return cliente.get_message(message_id)
     except GmailNotConnectedError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
     except GmailRateLimitError as error:
@@ -471,8 +594,9 @@ def get_gmail_message(message_id: str) -> dict[str, Any]:
 
 @app.get("/api/gmail/messages/{message_id}/attachments/{attachment_id}")
 def download_gmail_attachment(message_id: str, attachment_id: str) -> StreamingResponse:
+    cliente = _cliente_de(message_id)
     try:
-        data, media_type, filename = gmail.attachment(message_id, attachment_id)
+        data, media_type, filename = cliente.attachment(message_id, attachment_id)
     except GmailNotConnectedError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
     except GmailRateLimitError as error:
@@ -509,7 +633,54 @@ def _cuenta_actual() -> str:
         raise HTTPException(status_code=502, detail=f"No se pudo identificar la cuenta de Gmail: {error}") from error
     if not email:
         raise HTTPException(status_code=503, detail="No se pudo identificar la cuenta de Gmail conectada.")
+    # La cuenta principal: su configuración (tipos y campos) también la usan las cuentas IMAP.
+    automatico._cuenta_conocida = email
     return email
+
+
+def _email_de(message_id: str) -> str:
+    """Cuenta de un documento: la de su cuenta IMAP si el id es de IMAP (``imap<id>.<validez>.<uid>``), si no la de Gmail."""
+    if es_id_imap(message_id):
+        correo = gestor_imap.correo(cuenta_de_id(message_id) or "")
+        if correo is None:
+            raise HTTPException(status_code=404, detail="La cuenta IMAP de este documento ya no existe.")
+        return correo
+    return _cuenta_actual()
+
+
+def _cliente_de(message_id: str) -> Any:
+    """Gmail o el cliente IMAP de la cuenta del mensaje (misma interfaz)."""
+    if es_id_imap(message_id):
+        cliente = gestor_imap.cliente(cuenta_de_id(message_id) or "")
+        if cliente is None:
+            raise HTTPException(status_code=404, detail="La cuenta IMAP de este documento ya no existe.")
+        return cliente
+    return gmail
+
+
+def _automatico_de(message_id: str) -> ExtractorAutomatico:
+    """El proceso automático de la cuenta del mensaje (cada cuenta IMAP tiene el suyo)."""
+    if es_id_imap(message_id):
+        extractor = gestor_imap.extractor(cuenta_de_id(message_id) or "")
+        if extractor is None:
+            raise HTTPException(status_code=404, detail="La cuenta IMAP de este documento ya no existe.")
+        return extractor
+    return automatico
+
+
+def _correos() -> list[str]:
+    """Todas las cuentas visibles: la de Gmail (si está conectada) y las IMAP activas."""
+    correos: list[str] = []
+    try:
+        correos.append(_cuenta_actual())
+    except HTTPException:
+        pass
+    for correo in gestor_imap.correos():
+        if correo not in correos:
+            correos.append(correo)
+    if not correos:
+        raise HTTPException(status_code=401, detail="Conecta Gmail o agrega una cuenta IMAP.")
+    return correos
 
 
 def _ids_validos(message_id: str, part_id: str) -> None:
@@ -526,7 +697,7 @@ def listar_extracciones() -> dict[str, Any]:
 @app.get("/api/extracciones/{message_id}/{part_id}")
 def obtener_extraccion(message_id: str, part_id: str) -> dict[str, Any]:
     _ids_validos(message_id, part_id)
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     try:
         documento = almacen.obtener(email, message_id, part_id)
     except ExtraccionDanada as error:
@@ -542,7 +713,7 @@ def obtener_extraccion(message_id: str, part_id: str) -> dict[str, Any]:
 @app.put("/api/extracciones/{message_id}/{part_id}")
 def guardar_extraccion(message_id: str, part_id: str, payload: GuardarExtraccionRequest) -> dict[str, Any]:
     _ids_validos(message_id, part_id)
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     try:
         documento = almacen.guardar(email, message_id, part_id, payload)
     except ConflictoVersion as conflicto:
@@ -586,6 +757,105 @@ def _documento_publico(registro: dict[str, Any]) -> dict[str, Any]:
     return {**{campo: registro.get(campo) for campo in campos}, "estado": estado, "motivo": motivo, "tiene_original": bool(registro.get("ruta"))}
 
 
+# --- Cuentas IMAP corporativas -------------------------------------------------------------------
+
+def _cuentas_imap() -> Any:
+    return repositorios.cuentas_imap
+
+
+def _error_llave(error: Exception) -> HTTPException:
+    return HTTPException(status_code=503, detail=f"Para guardar contrasenas IMAP hace falta la llave de cifrado: {error}")
+
+
+@app.get("/api/imap/cuentas")
+def listar_cuentas_imap() -> dict[str, Any]:
+    """Cuentas IMAP con el estado de su proceso automático (nunca la contraseña)."""
+    try:
+        cuentas = _cuentas_imap().listar()
+    except LlaveCifradoInvalida as error:
+        raise _error_llave(error) from error
+    salida = []
+    for cuenta in cuentas:
+        extractor = gestor_imap.extractor(str(cuenta["id"]))
+        estado = extractor.estado(cuenta["correo"]) if extractor is not None else None
+        salida.append({**cuenta, "automatico": None if estado is None else {k: estado.get(k) for k in ("activo", "en_curso", "ultima_revision", "ultimo_resultado", "ultimo_error", "ultimo_ciclo")}})
+    return {"cuentas": salida}
+
+
+@app.post("/api/imap/probar")
+def probar_cuenta_imap(payload: CuentaImapRequest) -> dict[str, Any]:
+    """"Probar conexión" sin guardar nada."""
+    datos = DatosCuentaImap(id="0", correo=payload.correo, servidor=payload.servidor, puerto=payload.puerto, seguridad=payload.seguridad,
+                            usuario=payload.usuario, contrasena=payload.contrasena)
+    try:
+        return ClienteImap(datos).probar()
+    except (ImapError, ImapSinConexion) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.post("/api/imap/cuentas")
+def agregar_cuenta_imap(payload: CuentaImapRequest) -> dict[str, Any]:
+    """Guarda la cuenta (contraseña cifrada con Fernet) después de probar la conexión, y arranca su proceso automático (en pausa)."""
+    datos = DatosCuentaImap(id="0", correo=payload.correo, servidor=payload.servidor, puerto=payload.puerto, seguridad=payload.seguridad,
+                            usuario=payload.usuario, contrasena=payload.contrasena)
+    try:
+        ClienteImap(datos).probar()
+    except (ImapError, ImapSinConexion) as error:
+        raise HTTPException(status_code=422, detail=f"No se guardo: {error}") from error
+    try:
+        cuenta = _cuentas_imap().agregar(payload)
+    except LlaveCifradoInvalida as error:
+        raise _error_llave(error) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    gestor_imap.extractor(str(cuenta["id"]))
+    logger.info("Cuenta IMAP agregada id=%s", cuenta["id"])
+    return {"cuenta": cuenta}
+
+
+@app.delete("/api/imap/cuentas/{cuenta_id}")
+def quitar_cuenta_imap(cuenta_id: str) -> dict[str, bool]:
+    gestor_imap.quitar(cuenta_id)
+    try:
+        if not _cuentas_imap().desactivar(cuenta_id):
+            raise HTTPException(status_code=404, detail="No existe esa cuenta IMAP.")
+    except LlaveCifradoInvalida as error:
+        raise _error_llave(error) from error
+    return {"ok": True}
+
+
+class AutomaticoImapRequest(BaseModel):
+    activo: bool
+
+
+def _extractor_imap(cuenta_id: str) -> tuple[ExtractorAutomatico, str]:
+    extractor, correo = gestor_imap.extractor(cuenta_id), gestor_imap.correo(cuenta_id)
+    if extractor is None or correo is None:
+        raise HTTPException(status_code=404, detail="No existe esa cuenta IMAP.")
+    return extractor, correo
+
+
+@app.get("/api/imap/cuentas/{cuenta_id}/automatico")
+def estado_automatico_imap(cuenta_id: str) -> dict[str, Any]:
+    extractor, correo = _extractor_imap(cuenta_id)
+    return extractor.estado(correo)
+
+
+@app.put("/api/imap/cuentas/{cuenta_id}/automatico")
+def configurar_automatico_imap(cuenta_id: str, payload: AutomaticoImapRequest) -> dict[str, Any]:
+    extractor, correo = _extractor_imap(cuenta_id)
+    return extractor.configurar(correo, payload.activo)
+
+
+@app.post("/api/imap/cuentas/{cuenta_id}/revisar")
+def revisar_ahora_imap(cuenta_id: str) -> dict[str, Any]:
+    """"Revisar ahora" de una cuenta IMAP."""
+    extractor, correo = _extractor_imap(cuenta_id)
+    if not extractor.revisar_ahora(correo):
+        raise HTTPException(status_code=409, detail="Ya hay una revision en curso para esta cuenta.")
+    return extractor.estado(correo)
+
+
 @app.get("/api/salud/db")
 def salud_base_datos() -> dict[str, Any]:
     """Si la base de datos conecta y cuántos registros hay por tabla (sin datos de conexión ni contraseñas)."""
@@ -594,17 +864,21 @@ def salud_base_datos() -> dict[str, Any]:
 
 @app.get("/api/bandeja")
 def listar_bandeja(estado: str = Query("pendiente", pattern="^(pendiente|resuelto|descartado|error)$")) -> dict[str, Any]:
-    """``error``: documentos en error o que se quedaron sin terminar (``leido``), con el botón "Reintentar"."""
-    email = _cuenta_actual()
-    if estado != "error":
-        return {"documentos": [_documento_publico(registro) for registro in recepcion.bandeja(email, estado)], "motivos": MOTIVOS_BANDEJA}
-    return {"documentos": _documentos_con_error(email), "motivos": MOTIVOS_BANDEJA}
+    """``error``: documentos en error o que se quedaron sin terminar (``leido``), con el botón "Reintentar".
+    Junta todas las cuentas (Gmail e IMAP); cada documento dice de qué cuenta es."""
+    documentos = []
+    for email in _correos():
+        if estado != "error":
+            documentos.extend({**_documento_publico(registro), "cuenta": email} for registro in recepcion.bandeja(email, estado))
+        else:
+            documentos.extend({**documento, "cuenta": email} for documento in _documentos_con_error(email))
+    return {"documentos": documentos, "motivos": MOTIVOS_BANDEJA}
 
 
 def _documentos_con_error(email: str) -> list[dict[str, Any]]:
     """En error, sin terminar (leido) o en espera de reintento automático, con cuántos intentos van y cuándo es el siguiente."""
     try:
-        adjuntos = automatico.registro_adjuntos(email)
+        adjuntos = (gestor_imap.extractor_de_correo(email) or automatico).registro_adjuntos(email)
     except Exception:
         logger.exception("No se pudo leer el registro del proceso automatico")
         adjuntos = {}
@@ -641,9 +915,9 @@ def reintentar_documento(message_id: str, part_id: str) -> dict[str, Any]:
 @app.post("/api/bandeja/{message_id}/{part_id}/reprocesar")
 def reprocesar_bandeja(message_id: str, part_id: str) -> dict[str, Any]:
     _ids_validos(message_id, part_id)
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     try:
-        resultado = automatico.reprocesar_bandeja(email, message_id, part_id)
+        resultado = _automatico_de(message_id).reprocesar_bandeja(email, message_id, part_id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="El documento no esta en la bandeja.") from error
     except ValueError as error:
@@ -665,7 +939,7 @@ def reprocesar_bandeja(message_id: str, part_id: str) -> dict[str, Any]:
 @app.post("/api/bandeja/{message_id}/{part_id}/descartar")
 def descartar_de_bandeja(message_id: str, part_id: str) -> dict[str, Any]:
     _ids_validos(message_id, part_id)
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     registro = recepcion.resolver(email, message_id, part_id, "descartado_por_usuario", estado="descartado")
     if registro is None:
         raise HTTPException(status_code=404, detail="El documento no esta pendiente en la bandeja.")
@@ -676,21 +950,22 @@ def descartar_de_bandeja(message_id: str, part_id: str) -> dict[str, Any]:
 @app.get("/api/documentos/{message_id}/{part_id}/eventos")
 def eventos_del_documento(message_id: str, part_id: str) -> dict[str, Any]:
     _ids_validos(message_id, part_id)
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     return {"eventos": recepcion.eventos.listar(email, message_id=message_id, part_id=part_id)}
 
 
 @app.get("/api/eventos")
 def listar_eventos(etapa: str | None = Query(None, pattern="^(lectura|diagnostico|extraccion|envio)$"), desde: str | None = Query(None, max_length=40),
                    hasta: str | None = Query(None, max_length=40), limite: int = Query(200, ge=1, le=500)) -> dict[str, Any]:
-    email = _cuenta_actual()
-    return {"eventos": recepcion.eventos.listar(email, etapa=etapa, desde=desde, hasta=hasta, limite=limite)}
+    eventos = [evento for email in _correos() for evento in recepcion.eventos.listar(email, etapa=etapa, desde=desde, hasta=hasta, limite=limite)]
+    eventos.sort(key=lambda evento: str(evento.get("fecha") or ""), reverse=True)
+    return {"eventos": eventos[:limite]}
 
 
 @app.get("/api/documentos/{message_id}/{part_id}/original")
 def descargar_original(message_id: str, part_id: str) -> StreamingResponse:
     _ids_validos(message_id, part_id)
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     original = recepcion.original(email, message_id, part_id)
     if original is None:
         raise HTTPException(status_code=404, detail="El original no esta guardado en disco.")
@@ -732,7 +1007,7 @@ def eliminar_envio(message_id: str, part_id: str, payload: EliminarRequest) -> d
     _ids_validos(message_id, part_id)
     if not payload.confirmar:
         raise HTTPException(status_code=400, detail={"code": "requiere_confirmar", "message": "Confirma que quieres eliminar el registro de SaveData."})
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     try:
         respuesta, intento, documento = eliminar_de_savedata(envios, email, message_id, part_id)
     except NoSePuedeEnviar as error:
@@ -758,14 +1033,16 @@ def eliminar_envio(message_id: str, part_id: str, payload: EliminarRequest) -> d
 @app.get("/api/envios")
 def listar_envios() -> dict[str, Any]:
     """Historial de todos los documentos enviados a SaveData, con lo que faltó en cada intento."""
-    return {"documentos": historial_envios(almacen, _cuenta_actual())}
+    documentos = [{**documento, "cuenta": email} for email in _correos() for documento in historial_envios(almacen, email)]
+    documentos.sort(key=lambda item: (item.get("ultimo") or {}).get("terminado_en") or (item.get("ultimo") or {}).get("iniciado_en") or "", reverse=True)
+    return {"documentos": documentos}
 
 
 @app.post("/api/extracciones/{message_id}/{part_id}/enviar/vista-previa")
 def vista_previa_envio(message_id: str, part_id: str, payload: VistaPreviaEnvioRequest) -> dict[str, Any]:
     """Cuerpo exacto que se enviaría a SaveData. No contacta SaveData."""
     _ids_validos(message_id, part_id)
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     try:
         return envios.vista_previa(email, message_id, part_id, sucursal=payload.sucursal, articulo=payload.articulo.strip(), carga_inicial=payload.carga_inicial)
     except NoSePuedeEnviar as error:
@@ -778,7 +1055,7 @@ def vista_previa_envio(message_id: str, part_id: str, payload: VistaPreviaEnvioR
 def enviar_extraccion(message_id: str, part_id: str, payload: EnvioRequest) -> dict[str, Any]:
     """Envía la extracción revisada a SaveData. Éxito solo con HTTP 200 y code 200; cualquier otro caso queda auditado."""
     _ids_validos(message_id, part_id)
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     try:
         respuesta, intento, documento = envios.enviar(email, message_id, part_id, payload)
     except NoSePuedeEnviar as error:
@@ -835,7 +1112,7 @@ def obtener_clasificaciones() -> dict[str, Any]:
 
 @app.put("/api/clasificaciones/{message_id}")
 def poner_clasificacion(message_id: str, payload: ClasificacionRequest) -> dict[str, Any]:
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     try:
         return clasificaciones.poner(email, message_id, payload)
     except ValueError as error:
@@ -845,7 +1122,7 @@ def poner_clasificacion(message_id: str, payload: ClasificacionRequest) -> dict[
 @app.delete("/api/clasificaciones/{message_id}")
 def quitar_clasificacion(message_id: str) -> dict[str, bool]:
     """Vuelve a la clasificación automática."""
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     try:
         clasificaciones.quitar(email, message_id)
     except ValueError as error:
@@ -1136,9 +1413,9 @@ def elegir_version(tipo_id: str, estructura_id: str, payload: VersionActivaReque
 def comparar_con_ia(message_id: str, part_id: str, payload: CompararRequest) -> dict[str, Any]:
     """«Comparar con IA»: reglas y Gemini sobre el mismo documento, lado a lado."""
     _ids_validos(message_id, part_id)
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     try:
-        return automatico.comparar(email, message_id, part_id, payload.attachmentId)
+        return _automatico_de(message_id).comparar(email, message_id, part_id, payload.attachmentId)
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error.args[0]) if error.args else "No se encontro el documento.") from error
     except ValueError as error:
@@ -1155,9 +1432,9 @@ def comparar_con_ia(message_id: str, part_id: str, payload: CompararRequest) -> 
 def reprocesar_con_version(message_id: str, part_id: str, payload: ReprocesarVersionRequest) -> dict[str, Any]:
     """Reprocesa el documento con otra versión de los campos de su estructura (reemplaza la extracción; queda en borrador)."""
     _ids_validos(message_id, part_id)
-    email = _cuenta_actual()
+    email = _email_de(message_id)
     try:
-        return automatico.reprocesar_version(email, message_id, part_id, payload.version, payload.attachmentId)
+        return _automatico_de(message_id).reprocesar_version(email, message_id, part_id, payload.version, payload.attachmentId)
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error.args[0]) if error.args else "No existe esa version.") from error
     except ValueError as error:
@@ -1245,9 +1522,9 @@ class SugerirTipoRequest(BaseModel):
 @app.post("/api/tipos/sugerir")
 def sugerir_campos_tipo(payload: SugerirTipoRequest) -> dict[str, Any]:
     """La IA lee el documento y propone campos con un ejemplo de su valor y si van "Una vez" o en la sección."""
-    _cuenta_actual()
+    _email_de(payload.messageId)
     try:
-        data, media_type, filename = gmail.attachment(payload.messageId, payload.attachmentId)
+        data, media_type, filename = _cliente_de(payload.messageId).attachment(payload.messageId, payload.attachmentId)
         resultado = gemini.extract_document(data, media_type, filename, campos_solicitados=payload.campos, tipo={"nombre": payload.nombre_tipo or "Documento", "seccion": payload.seccion or ""})
     except GmailNotConnectedError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
@@ -1302,7 +1579,7 @@ def configurar_con_documento(payload: ConfigurarDocumentoRequest) -> dict[str, A
     """Crea o actualiza el tipo, agrega las reglas a su estructura y guarda los campos. Con ``extraer_y_enviar``
     vuelve a extraer el documento con la configuración nueva y lo envía a SaveData; si no, solo le asigna el tipo."""
     _ids_validos(payload.messageId, payload.partId)
-    email = _cuenta_actual()
+    email = _email_de(payload.messageId)
     try:
         if payload.nuevo is not None:
             seccion = {"nombre": payload.nuevo.seccion} if payload.nuevo.seccion and payload.nuevo.seccion.strip() else None
@@ -1325,7 +1602,7 @@ def configurar_con_documento(payload: ConfigurarDocumentoRequest) -> dict[str, A
     resultado: dict[str, Any] = {"tipo": tipo, "estructura": estructura, "documento": None, "envio": None, "motivos": [], "mensaje": None}
     if payload.extraer_y_enviar:
         try:
-            resultado.update(automatico.reprocesar(email, payload.messageId, payload.partId, tipo["id"], attachment_id=payload.attachmentId, enviar=True))
+            resultado.update(_automatico_de(payload.messageId).reprocesar(email, payload.messageId, payload.partId, tipo["id"], attachment_id=payload.attachmentId, enviar=True))
         except GmailNotConnectedError as error:
             raise HTTPException(status_code=401, detail=str(error)) from error
         except GmailRateLimitError as error:

@@ -32,6 +32,8 @@ class Settings:
     # Repositorios en JSON (después, la base de datos): documentos recibidos y eventos del proceso.
     documentos_path: Path = PROJECT_ROOT / "backend" / "data" / "documentos"
     eventos_path: Path = PROJECT_ROOT / "backend" / "data" / "eventos"
+    # Cuentas IMAP en modo json (en modo db van en cuentas_correo). Contraseñas cifradas con NEXORA_LLAVE_CIFRADO.
+    imap_cuentas_path: Path = PROJECT_ROOT / "backend" / "data" / "imap" / "cuentas.json"
     # Archivos originales: storage/originales/<cuenta>/<aaaa>/<mm>/<sha256>.<ext> (fuera de git).
     originales_path: Path = PROJECT_ROOT / "storage" / "originales"
     # Opcional: minutos entre revisiones de la extracción automática (por defecto 20).

@@ -27,6 +27,7 @@ import { PanelVerificacion, VisorPdf, type EstadoTextoDocumento, type Resaltado 
 import { HistorialEnviosPage } from './HistorialEnvios'
 import { BandejaCapturaPage } from './BandejaCaptura'
 import { ComparacionIA } from './ComparacionIA'
+import { CuentasImapPage } from './CuentasImap'
 import { deteccionManual, esContable, solicitudDe, textoDeteccion, tiposDocumentoApi, tiposVigentes, type TipoDocumento, type TipoDocumentoDetectado } from './services/tiposDocumentoApi'
 import { TiposDocumentoSeccion } from './TiposDocumento'
 import {
@@ -50,6 +51,7 @@ import {
   Globe2,
   Inbox,
   ClipboardPen,
+  Server,
   Landmark,
   Mail,
   Pencil,
@@ -76,7 +78,7 @@ type ExtractionMode = 'manual' | 'gemini'
 
 const navSections: { label: string; items: { to: string; label: string; icon: Icon }[] }[] = [
   { label: 'Operación', items: [{ to: '/emails', label: 'Correos', icon: Mail }, { to: '/extraction', label: 'Extracción', icon: FileSearch }, { to: '/bandeja', label: 'Captura manual', icon: ClipboardPen }, { to: '/envios', label: 'Envíos', icon: Send }] },
-  { label: 'Sistema', items: [{ to: '/configuracion', label: 'Configuración', icon: SettingsIcon }] },
+  { label: 'Sistema', items: [{ to: '/configuracion', label: 'Configuración', icon: SettingsIcon }, { to: '/imap', label: 'Cuentas IMAP', icon: Server }] },
 ]
 
 /** Campos de la configuración que se aplican a un resultado de Gemini: los de su tipo o, en un estado de cuenta, los de siempre. */
@@ -100,6 +102,7 @@ function App() {
             <Route path="/extraction" element={<ExtractionWorkspace />} />
             <Route path="/envios" element={<HistorialEnviosPage />} />
             <Route path="/bandeja" element={<BandejaCapturaPage />} />
+            <Route path="/imap" element={<CuentasImapPage />} />
             <Route path="/settings" element={<Navigate to="/configuracion/conexiones" replace />} />
             <Route path="/configuracion" element={<Navigate to="/configuracion/conexiones" replace />} />
             <Route path="/configuracion/:seccion" element={<SettingsPageV3 />} />

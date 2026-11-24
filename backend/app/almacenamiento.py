@@ -35,15 +35,23 @@ class Repositorios:
     eventos: Any
     envios: Any
     motor: "Engine | None" = None
+    # Cuentas IMAP guardadas (json o cuentas_correo con proveedor='imap').
+    cuentas_imap: Any = None
 
 
 def crear_repositorios(modo: str, *, almacen: "AlmacenExtracciones", documentos_path: Path, eventos_path: Path, database_url: str = "",
-                       llave_cifrado: str = "", credencial_de: Callable[[str], str | None] = lambda _email: None) -> Repositorios:
+                       llave_cifrado: str = "", credencial_de: Callable[[str], str | None] = lambda _email: None,
+                       imap_path: Path | None = None) -> Repositorios:
     modo = (modo or "json").strip().lower()
     if modo not in MODOS:
         raise ConfiguracionAlmacenInvalida(f"NEXORA_ALMACEN debe ser 'json' o 'db' (se recibio '{modo}').")
     if modo == "json":
-        return Repositorios("json", DocumentosJson(documentos_path), EventosJson(eventos_path), EnviosJson(almacen))
+        from .cuentas_imap import CuentasImapJson
+        from .seguridad import Cifrador
+
+        # La llave se pide hasta que se guarda o se usa una cuenta IMAP (sin cuentas IMAP, el modo json no la necesita).
+        imap = CuentasImapJson(imap_path or documentos_path.parent / "imap" / "cuentas.json", lambda: Cifrador(llave_cifrado))
+        return Repositorios("json", DocumentosJson(documentos_path), EventosJson(eventos_path), EnviosJson(almacen), cuentas_imap=imap)
 
     from .db import UrlBaseDatosInvalida, crear_motor, fabrica_sesiones
     from .repos.db import CuentasDb, DocumentosDb, EnviosDb, EventosDb
@@ -57,7 +65,10 @@ def crear_repositorios(modo: str, *, almacen: "AlmacenExtracciones", documentos_
     sesiones = fabrica_sesiones(motor)
     cuentas = CuentasDb(sesiones, cifrador, credencial_de)
     logger.info("Almacenamiento en base de datos (%s)", motor.dialect.name)
-    return Repositorios("db", DocumentosDb(sesiones, cuentas), EventosDb(sesiones, cuentas), EnviosDb(sesiones, cuentas), motor)
+    from .cuentas_imap import CuentasImapDb
+
+    return Repositorios("db", DocumentosDb(sesiones, cuentas), EventosDb(sesiones, cuentas), EnviosDb(sesiones, cuentas), motor,
+                        cuentas_imap=CuentasImapDb(sesiones, cifrador))
 
 
 def _sin_secretos(mensaje: str, url: str) -> str:
