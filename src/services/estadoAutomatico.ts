@@ -1,5 +1,6 @@
 import type { AdjuntoAutomatico, AvisoAutomatico, EstadoAutomatico, UltimoCiclo } from './automaticoApi'
 import type { EntradaListado, EstadoExtraccion } from './extraccionesApi'
+import { formatoMexico } from './fechas'
 
 /** Estado que muestra la bandeja por adjunto: el de la extracción guardada más los de la extracción automática. */
 export type EstadoDocumento = EstadoExtraccion | 'sin_extraer' | 'automatico' | 'error_auto' | 'enviado_auto' | 'requiere_revision' | 'error_envio' | 'incierto_envio'
@@ -32,7 +33,7 @@ export function estadoDocumento(guardado: EntradaListado | undefined, automatico
   return 'sin_extraer'
 }
 
-const hora = (valor: string | null) => (valor ? new Intl.DateTimeFormat('es-MX', { hour: '2-digit', minute: '2-digit' }).format(new Date(valor)) : null)
+const hora = (valor: string | null) => (valor ? formatoMexico({ hour: '2-digit', minute: '2-digit' }).format(new Date(valor)) : null)
 
 /** Texto del indicador discreto del proceso automático. */
 export function textoIndicador(estado: EstadoAutomatico | null): string | null {
@@ -149,7 +150,7 @@ export function envioAutomaticoSinEnviar(estado: EstadoAutomatico | null, messag
 }
 
 /** Fecha y hora con el mismo formato que el historial de envíos. */
-export const fechaHoraEnvio = (valor: string | null | undefined) => (valor ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'medium' }).format(new Date(valor)) : '—')
+export const fechaHoraEnvio = (valor: string | null | undefined) => (valor ? formatoMexico({ dateStyle: 'medium', timeStyle: 'medium' }).format(new Date(valor)) : '—')
 
 /** Cómo afecta el envío automático a un adjunto que se va a extraer a mano. */
 export type GrupoEnvio = 'pendiente' | 'enviado_auto' | 'manual'

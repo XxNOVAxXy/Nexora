@@ -8,3 +8,9 @@ google-genai>=2.34,<3
 # Lectura de PDF en el backend (diagnostico; despues, extraccion por reglas). BSD-3 y MIT. Nunca PyMuPDF (AGPL).
 pypdf>=6,<7
 pdfplumber>=0.11,<0.12
+# Base de datos (MySQL con PyMySQL; portable a PostgreSQL), migraciones, cifrado de credenciales y hash de contraseñas.
+SQLAlchemy>=2,<3
+PyMySQL>=1.1,<2
+alembic>=1.13,<2
+cryptography>=43
+argon2-cffi>=23,<26

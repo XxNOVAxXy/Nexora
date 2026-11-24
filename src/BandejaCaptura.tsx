@@ -4,6 +4,7 @@ import { AlertTriangle, ChevronDown, ChevronRight, ExternalLink, FileText, Loade
 import { bandejaApi, type CodigoBandeja, type DocumentoBandeja, type EstadoBandeja, type EventoProceso } from './services/bandejaApi'
 import { gmailApi } from './services/gmailApi'
 import { urlAbrirEnvio } from './HistorialEnvios'
+import { formatoMexico } from './services/fechas'
 
 export const MOTIVO_BANDEJA: Record<CodigoBandeja, { texto: string; ayuda: string; clase: string }> = {
   pdf_protegido: { texto: 'PDF con contraseña', ayuda: 'Pide el documento sin contraseña o captúralo a mano.', clase: 'bg-red-50 text-red-700' },
@@ -16,7 +17,7 @@ export const MOTIVO_BANDEJA: Record<CodigoBandeja, { texto: string; ayuda: strin
 const ETAPA: Record<EventoProceso['etapa'], string> = { lectura: 'Lectura', diagnostico: 'Diagnóstico', extraccion: 'Extracción', envio: 'Envío' }
 const ESTADOS: { valor: EstadoBandeja; texto: string }[] = [{ valor: 'pendiente', texto: 'Pendientes' }, { valor: 'resuelto', texto: 'Resueltos' }, { valor: 'descartado', texto: 'Descartados' }]
 
-const fechaHora = (valor: string | null | undefined) => (valor ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
+const fechaHora = (valor: string | null | undefined) => (valor ? formatoMexico({ dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
 const clave = (documento: DocumentoBandeja) => `${documento.message_id}__${documento.part_id}`
 type Aviso = { id: string; ok: boolean; mensaje: string }
 

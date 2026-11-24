@@ -5,6 +5,7 @@ import { ejecutarEliminacion, savedataApi, type DocumentoEnviado, type IntentoHi
 import { gmailApi } from './services/gmailApi'
 import type { ResultadoIntento } from './services/extraccionesApi'
 import type { EstadoEnvioAutomatico } from './services/automaticoApi'
+import { formatoMexico } from './services/fechas'
 
 const etiquetaResultado: Record<ResultadoIntento, { texto: string; clase: string }> = {
   exito: { texto: 'Éxito', clase: 'bg-emerald-50 text-emerald-700' },
@@ -23,7 +24,7 @@ export const etiquetaEnvioAutomatico: Partial<Record<EstadoEnvioAutomatico, { te
   sin_savedata: { texto: 'Sin SaveData configurado', clase: 'bg-slate-200 text-slate-700' },
 }
 
-const fechaHora = (valor: string | null) => (valor ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
+const fechaHora = (valor: string | null) => (valor ? formatoMexico({ dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
 
 /** URL de Extracción con el documento original y lo que se extrajo (sin volver a extraer). */
 export function urlAbrirEnvio(documento: Pick<DocumentoEnviado, 'messageId' | 'partId' | 'filename'>, attachmentId: string): string {

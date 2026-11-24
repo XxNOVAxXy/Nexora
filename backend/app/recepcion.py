@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .diagnostico import diagnosticar
-from .originales import AlmacenOriginales, extension_segura
+from .originales import AlmacenOriginales, extension_segura, sha256_de
 from .repos import RepoDocumentos, RepoEventos
 
 logger = logging.getLogger("nexora.recepcion")
@@ -70,7 +70,8 @@ class ServicioRecepcion:
         diagnostico = diagnosticar(data, mime_type, filename)
         extension = diagnostico.get("extension") or extension_segura(_sufijo(filename))
         ruta: str | None = None
-        sha: str | None = None
+        # La huella se calcula siempre, aunque el original no se pueda guardar (documentos.sha256 no admite nulos).
+        sha: str = sha256_de(data)
         error_guardado: str | None = None
         try:
             ruta, sha, _nuevo = self.originales.guardar(email, data, extension, _fecha(recibido_en) or self.reloj())

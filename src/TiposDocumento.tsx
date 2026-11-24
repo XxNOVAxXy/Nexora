@@ -18,6 +18,7 @@ import {
   type SugerenciaEstructura,
   type TipoDocumento,
 } from './services/tiposDocumentoApi'
+import { formatoMexico } from './services/fechas'
 
 type Avisos = { onNotice: (texto: string) => void; onError: (texto: string) => void }
 type Pestana = 'documentos' | 'tipos'
@@ -94,7 +95,7 @@ const TONO_ENVIO: Record<EstadoEnvio['estado'], string> = {
 function DocumentosRecibidos({ documentos, onConfigurar, filtro, onFiltro, tipo, onQuitarTipo }: { documentos: DocumentoRecibido[] | null; onConfigurar: (documento: DocumentoRecibido) => void; filtro: FiltroEnvio; onFiltro: (filtro: FiltroEnvio) => void; tipo: TipoDocumento | null; onQuitarTipo: () => void }) {
   if (documentos === null) return <div className="panel flex items-center gap-2 p-5 text-xs text-slate-400"><RefreshCw size={14} className="animate-spin" />Cargando documentos…</div>
   if (documentos.length === 0) return <div className="panel p-5 text-xs text-slate-500">Todavía no llegó ningún documento con extracción. Aparecerán aquí cuando el proceso automático (o tú) extraiga alguno.</div>
-  const fecha = (valor: string | null | undefined) => (valor ? new Intl.DateTimeFormat('es-MX', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
+  const fecha = (valor: string | null | undefined) => (valor ? formatoMexico({ dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
   const delTipo = tipo ? documentos.filter((documento) => documento.tipo_documento.tipo_id === tipo.id) : documentos
   const visibles = filtro === 'todos' ? delTipo : delTipo.filter((documento) => documento.estado_envio?.filtro === filtro)
   return <section className="panel overflow-hidden" aria-labelledby="titulo-documentos-recibidos">

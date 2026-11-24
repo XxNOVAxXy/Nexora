@@ -5,10 +5,17 @@ La recepción de ``main`` (originales, documentos y eventos) se redirige a una c
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
 import pytest
+
+# Las pruebas nunca usan la base de datos real: aunque el .env diga NEXORA_ALMACEN=db, aquí todo es JSON y sin
+# DATABASE_URL (python-dotenv no sobrescribe variables que ya existen). Las pruebas de db usan SQLite en memoria.
+os.environ["NEXORA_ALMACEN"] = "json"
+os.environ["DATABASE_URL"] = ""
+os.environ["NEXORA_LLAVE_CIFRADO"] = ""
 
 
 @pytest.fixture(autouse=True)

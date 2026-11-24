@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .adjuntos import content_disposition
 from .originales import AlmacenOriginales
 from .recepcion import MOTIVOS_BANDEJA, ServicioRecepcion
-from .repos import DocumentosJson, EnviosJson, EventosJson
+from .almacenamiento import crear_repositorios, salud_db
 from .automatico import ExtractorAutomatico, intervalo_desde_entorno
 from .plantilla_campos import AlmacenPlantillas, PlantillaRequest, aplicar_plantilla, comparable, deducir_campos, sugerencias_para_configurar
 from .config import settings
@@ -93,10 +93,21 @@ def campos_del_documento(email: str, documento: dict[str, Any]) -> list[dict[str
     return plantillas.efectiva(email) if tipo.get("contable") else list(tipo.get("campos") or [])
 
 
-# Originales en disco, diagnóstico, eventos y Bandeja de captura manual (repositorios en JSON por ahora).
-recepcion = ServicioRecepcion(DocumentosJson(settings.documentos_path), EventosJson(settings.eventos_path), AlmacenOriginales(settings.originales_path))
+def _credencial_gmail(_email: str) -> str | None:
+    """Token OAuth de la cuenta conectada: se guarda cifrado al registrar la cuenta en la base (modo db)."""
+    try:
+        return settings.token_path.read_text(encoding="utf-8") if settings.token_path.exists() else None
+    except OSError:
+        return None
+
+
+# NEXORA_ALMACEN=json|db (por defecto json): documentos, eventos y envíos en archivos o en la base de datos.
+repositorios = crear_repositorios(settings.almacen, almacen=almacen, documentos_path=settings.documentos_path, eventos_path=settings.eventos_path,
+                                  database_url=settings.database_url, llave_cifrado=settings.llave_cifrado, credencial_de=_credencial_gmail)
+# Originales en disco, diagnóstico, eventos y Bandeja de captura manual.
+recepcion = ServicioRecepcion(repositorios.documentos, repositorios.eventos, AlmacenOriginales(settings.originales_path))
 # Intentos de envío a SaveData: siguen en el JSON de cada extracción; el repositorio recibe cada cambio.
-almacen.envios = EnviosJson(almacen)
+almacen.envios = repositorios.envios
 # La URL se lee en cada envío para que las pruebas puedan sustituirla.
 envios = ServicioEnvio(almacen, lambda: settings.savedata_url, configurados=lambda email: plantillas.efectiva(email), tipo_de=lambda email, documento: tipo_del_documento(email, documento),
                        registrar_evento=lambda *args, **kwargs: recepcion.evento(*args, **kwargs))
@@ -563,6 +574,12 @@ def _documento_publico(registro: dict[str, Any]) -> dict[str, Any]:
     campos = ("message_id", "part_id", "attachment_id", "nombre", "mime", "tamano", "sha256", "recibido_en", "asunto", "remitente", "guardado_en",
               "actualizado", "diagnostico", "bandeja")
     return {**{campo: registro.get(campo) for campo in campos}, "tiene_original": bool(registro.get("ruta"))}
+
+
+@app.get("/api/salud/db")
+def salud_base_datos() -> dict[str, Any]:
+    """Si la base de datos conecta y cuántos registros hay por tabla (sin datos de conexión ni contraseñas)."""
+    return {"almacen": repositorios.modo, **salud_db(repositorios.motor, settings.database_url)}
 
 
 @app.get("/api/bandeja")

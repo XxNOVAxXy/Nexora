@@ -3,8 +3,9 @@ import { AlertTriangle, Bell, CheckCircle2, X } from 'lucide-react'
 import { automaticoApi, type AvisoAutomatico, type Descartado, type EstadoAutomatico } from './services/automaticoApi'
 import { EVENTO_ESTADO_AUTOMATICO, publicarEstadoAutomatico } from './services/eventosAutomatico'
 import { avisosSinLeer, motivosAgrupados, resumenCiclo, textoMotivo, textoResultadoCiclo } from './services/estadoAutomatico'
+import { formatoMexico } from './services/fechas'
 
-const fechaHora = (valor: string | null | undefined) => (valor ? new Intl.DateTimeFormat('es-MX', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }).format(new Date(valor)) : '—')
+const fechaHora = (valor: string | null | undefined) => (valor ? formatoMexico({ day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }).format(new Date(valor)) : '—')
 
 const ESTILO_AVISO: Record<string, string> = {
   enviado: 'border-emerald-200 bg-emerald-50 text-emerald-800',

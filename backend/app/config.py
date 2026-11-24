@@ -38,6 +38,12 @@ class Settings:
     intervalo_minutos: str = os.getenv("NEXORA_INTERVALO_MINUTOS", "")
     # URL del servicio SaveData; el frontend nunca la llama directamente.
     savedata_url: str = os.getenv("SAVEDATA_URL", "")
+    # Almacenamiento de documentos, eventos y envíos: "json" (por defecto) o "db" (DATABASE_URL).
+    almacen: str = os.getenv("NEXORA_ALMACEN", "json").strip().lower() or "json"
+    # mysql+pymysql://usuario:contrasena@localhost:3306/nexora?charset=utf8mb4 (o postgresql+psycopg://...).
+    database_url: str = os.getenv("DATABASE_URL", "").strip()
+    # Llave Fernet para cuentas_correo.credencial_cifrada; obligatoria con NEXORA_ALMACEN=db.
+    llave_cifrado: str = os.getenv("NEXORA_LLAVE_CIFRADO", "").strip()
 
 
 settings = Settings()
