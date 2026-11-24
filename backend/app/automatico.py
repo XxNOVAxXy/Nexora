@@ -64,6 +64,7 @@ from .gemini import GeminiRequestError, GeminiUnavailableError, clave_campo, nor
 from .gmail import GmailNotConnectedError, GmailRateLimitError
 from .orden_fechas import ordenar_por_fecha
 from .plantilla_campos import AlmacenPlantillas, deducir_campos
+from .recepcion import ServicioRecepcion
 from .tipos_documento import AlmacenTipos, deteccion_manual, direccion, detectar_tipo, huella_documento, para_clasificar, tipo_para_extraer
 
 logger = logging.getLogger("nexora.automatico")
@@ -76,7 +77,8 @@ MARGEN_BUSQUEDA = timedelta(days=1)
 BLOQUEO_CADUCA_SEGUNDOS = 30 * 60
 INTERVALO_PREDETERMINADO = 20
 
-TERMINALES = {"extraido", "omitido", "error"}
+# "bandeja": el diagnóstico no fue ok (o se agotaron los intentos); queda en la Bandeja de captura manual.
+TERMINALES = {"extraido", "omitido", "error", "bandeja"}
 # Estados finales del envío automático: nunca se vuelve a enviar solo.
 TERMINALES_ENVIO = {"enviado", "requiere_revision", "error", "incierto", "sin_savedata", "omitido"}
 
@@ -133,7 +135,7 @@ def _proceso_vivo(pid: int) -> bool:
 
 def _resumen_vacio() -> dict[str, int]:
     return {"correos_encontrados": 0, "extraidos": 0, "enviados": 0, "requieren_revision": 0, "inciertos": 0,
-            "omitidos": 0, "errores": 0, "ya_revisados": 0}
+            "omitidos": 0, "errores": 0, "ya_revisados": 0, "en_bandeja": 0}
 
 
 def _tipos_adjuntos(adjuntos: list[dict[str, Any]]) -> str:
@@ -308,8 +310,12 @@ class ExtractorAutomatico:
         plantillas: AlmacenPlantillas | None = None,
         envios: Any = None,
         tipos: AlmacenTipos | None = None,
+        recepcion: ServicioRecepcion | None = None,
     ) -> None:
         self.raiz = raiz
+        # Originales en disco, diagnóstico, eventos y Bandeja de captura manual. Sin ella (pruebas antiguas), el
+        # adjunto va directo a la extracción como antes.
+        self.recepcion = recepcion
         # ServicioEnvio de savedata.py: el envío automático reutiliza exactamente el envío manual.
         self.envios = envios
         # Configuración de campos; sin ella, la lista efectiva es la deducida de las extracciones guardadas.
@@ -717,6 +723,9 @@ class ExtractorAutomatico:
         if claves["incierto"]:
             n = len(claves["incierto"])
             avisos.append(self._aviso("incierto", f"{n} envío{'' if n == 1 else 's'} incierto{'' if n == 1 else 's'} ({self._por_tipo(claves['incierto'], tipo_de)}): verifica en SaveData si {'llegó' if n == 1 else 'llegaron'}.", claves["incierto"]))
+        if claves.get("bandeja"):
+            n = len(claves["bandeja"])
+            avisos.append(self._aviso("bandeja", f"{n} documento{'' if n == 1 else 's'} {'pasó' if n == 1 else 'pasaron'} a la bandeja de captura manual (contraseña, dañado, escaneado o formato no soportado).", claves["bandeja"]))
         if claves["error"]:
             n = len(claves["error"])
             avisos.append(self._aviso("error", f"{n} documento{'' if n == 1 else 's'} con error al extraer o enviar ({self._por_tipo(claves['error'], tipo_de)}).", claves["error"]))
@@ -823,15 +832,24 @@ class ExtractorAutomatico:
                 continue
             adjuntos = list(mensaje.get("attachments") or [])
             validos = [a for a in adjuntos if filtro_estados.es_documento_extraible(a) and ID_DOCUMENTO_SEGURO.fullmatch(str(a.get("partId") or ""))]
+            otros = [a for a in adjuntos if a not in validos]
+            if self.recepcion is not None:
+                # Con la recepción, un adjunto que no parece PDF ni imagen también se guarda y se diagnostica: si por su
+                # contenido sí lo es, se extrae; si no, va a la bandeja (formato no soportado) en lugar de descartarse.
+                for adjunto in list(otros):
+                    part_id = str(adjunto.get("partId") or "")
+                    if not ID_DOCUMENTO_SEGURO.fullmatch(part_id):
+                        continue
+                    otros.remove(adjunto)
+                    if self._recibir_no_extraible(email, ctx, message_id, part_id, adjunto, mensaje):
+                        validos.append(adjunto)
             if not validos:
                 detalle = (f"{MOTIVOS['sin_adjunto_valido']} Adjuntos encontrados: {_tipos_adjuntos(adjuntos)}." if adjuntos
                            else f"{MOTIVOS['sin_adjunto_valido']} El correo no trae adjuntos (el documento puede venir como enlace o insertado en el cuerpo).")
                 self._descartar(email, ctx, message_id, "sin_adjunto_valido", message_id=message_id, detalle=detalle, mensaje=mensaje)
                 self._avanzar(email, "revisado_hasta", _iso(recibido))
                 continue
-            for adjunto in adjuntos:
-                if adjunto in validos:
-                    continue
+            for adjunto in otros:
                 part_id = str(adjunto.get("partId") or "")
                 motivo = "adjunto_no_extraible" if not filtro_estados.es_documento_extraible(adjunto) else "id_invalido"
                 clave = f"{message_id}__{part_id}" if ID_DOCUMENTO_SEGURO.fullmatch(part_id) else f"{message_id}__invalido"
@@ -874,6 +892,12 @@ class ExtractorAutomatico:
         attachment_id = str(adjunto.get("id") or "")
         try:
             data, media_type, nombre = self.gmail.attachment(message_id, attachment_id)
+            if self.recepcion is not None:
+                documento_recibido = self._recibir(email, message_id, part_id, data, media_type, nombre or filename, attachment_id, mensaje, "automatico")
+                diagnostico = documento_recibido.get("diagnostico") or {}
+                if diagnostico.get("codigo") != "ok":
+                    return self._a_bandeja(email, ctx, clave, diagnostico)
+                media_type = diagnostico.get("mime") or media_type
             deteccion, campos_tipo, extraer = self._detectar(email, data, media_type, nombre or filename, mensaje or {}, campos)
             resultado = self.gemini.extract_document(data, media_type, nombre or filename, campos_solicitados=[campo["nombre"] for campo in campos_tipo], **extraer)
             if not deteccion.get("aseguradora") and resultado.get("aseguradora"):
@@ -881,6 +905,8 @@ class ExtractorAutomatico:
         except (GmailRateLimitError, GmailNotConnectedError, GeminiUnavailableError) as error:
             # No es culpa del documento: el intento no cuenta y se sigue en el siguiente ciclo.
             self._anotar(email, clave, estado="pendiente", intentos=intentos, error=str(error))
+            etapa = "extraccion" if isinstance(error, GeminiUnavailableError) else "lectura"
+            self._evento(email, etapa, "servicio_no_disponible", str(error), message_id, part_id)
             logger.info("Ciclo automatico adjunto pendiente message_id=%s part_id=%s motivo=%s", message_id, part_id, error.__class__.__name__)
             raise _CortarCiclo(str(error)) from error
         except GeminiRequestError as error:
@@ -908,6 +934,8 @@ class ExtractorAutomatico:
         # Solo lo extraído con el envío automático encendido se envía solo.
         enviar_auto = bool(self._leer(email).get("envio_activo"))
         self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"), enviar_auto=enviar_auto)
+        self._evento(email, "extraccion", "ok", f"Extraido con IA ({resultado.get('model') or 'Gemini'}).", message_id, part_id,
+                     detalle={"tipo": deteccion.get("codigo"), "filas": len(documento.get("transacciones", []))})
         resumen["extraidos"] += 1
         logger.info("Ciclo automatico adjunto extraido message_id=%s part_id=%s transacciones=%d envio_auto=%s", message_id, part_id, len(documento.get("transacciones", [])), enviar_auto)
         if enviar_auto:
@@ -932,9 +960,117 @@ class ExtractorAutomatico:
         except Exception:
             logger.exception("No se pudieron registrar los avisos de estructura")
 
+    # --- Recepción: originales, diagnóstico, eventos y bandeja ------------------------------------
+
+    def _evento(self, email: str, etapa: str, codigo: str, mensaje: str, message_id: str | None, part_id: str | None, *, origen: str = "automatico",
+                detalle: dict[str, Any] | None = None) -> None:
+        if self.recepcion is not None:
+            self.recepcion.evento(email, etapa, codigo, mensaje, message_id=message_id, part_id=part_id, origen=origen, detalle=detalle)
+
+    def _recibir(self, email: str, message_id: str, part_id: str, data: bytes, media_type: str, filename: str, attachment_id: str | None,
+                 mensaje: dict[str, Any] | None, origen: str) -> dict[str, Any]:
+        assert self.recepcion is not None
+        mensaje = mensaje or {}
+        return self.recepcion.recibir(email, message_id=message_id, part_id=part_id, data=data, mime_type=media_type, filename=filename,
+                                      attachment_id=attachment_id, recibido_en=mensaje.get("receivedAt"), asunto=mensaje.get("subject"),
+                                      remitente=direccion(mensaje.get("senderEmail", "")) or None, origen=origen)
+
+    def _a_bandeja(self, email: str, ctx: dict[str, Any], clave: str, diagnostico: dict[str, Any]) -> str:
+        """El diagnóstico no fue ok: el adjunto queda en la bandeja (estado terminal ``bandeja``) y no se extrae."""
+        self._anotar(email, clave, estado="bandeja", error=str(diagnostico.get("mensaje") or "")[:500], diagnostico=diagnostico.get("codigo"))
+        ctx["resumen"]["en_bandeja"] += 1
+        ctx["claves"].setdefault("bandeja", []).append(clave)
+        logger.info("Ciclo automatico adjunto a la bandeja clave=%s diagnostico=%s", clave, diagnostico.get("codigo"))
+        return "bandeja"
+
+    def _recibir_no_extraible(self, email: str, ctx: dict[str, Any], message_id: str, part_id: str, adjunto: dict[str, Any], mensaje: dict[str, Any]) -> bool:
+        """Adjunto que por su tipo no parece extraíble: se guarda y diagnostica. True si en realidad es PDF o imagen."""
+        clave = f"{message_id}__{part_id}"
+        entrada = self._leer(email)["adjuntos"].get(clave) or {}
+        if entrada.get("estado") in TERMINALES:
+            ctx["resumen"]["ya_revisados"] += 1
+            return False
+        attachment_id = str(adjunto.get("id") or "")
+        if not attachment_id:
+            return False
+        data, media_type, nombre = self.gmail.attachment(message_id, attachment_id)
+        documento = self._recibir(email, message_id, part_id, data, media_type, nombre or str(adjunto.get("filename") or ""), attachment_id, mensaje, "automatico")
+        diagnostico = documento.get("diagnostico") or {}
+        if diagnostico.get("codigo") == "ok":
+            return True
+        self._a_bandeja(email, ctx, clave, diagnostico)
+        return False
+
+    def reprocesar_bandeja(self, email: str, message_id: str, part_id: str) -> dict[str, Any]:
+        """Botón "Reprocesar" de la bandeja: vuelve a leer el original (del disco o, si no está, de Gmail), lo
+        diagnostica otra vez y, si se puede, lo extrae con la IA como borrador (no lo envía solo).
+
+        Un PDF escaneado sí se extrae aquí: la IA lo lee como imagen. Devuelve {"estado": "extraido" | "sigue_en_bandeja"
+        | "ya_extraido", "documento", "diagnostico", "mensaje"}.
+        """
+        if self.recepcion is None:
+            raise RuntimeError("La recepcion de documentos no esta configurada.")
+        registro = self.recepcion.documentos.obtener(email, message_id, part_id)
+        if registro is None:
+            raise KeyError(f"{message_id}__{part_id}")
+        clave = f"{message_id}__{part_id}"
+        if self.almacen.obtener(email, message_id, part_id) is not None:
+            self.recepcion.resolver(email, message_id, part_id, "ya_tenia_extraccion")
+            return {"estado": "ya_extraido", "documento": self.recepcion.documentos.obtener(email, message_id, part_id),
+                    "mensaje": "El documento ya tiene una extraccion guardada."}
+        mensaje = {"senderEmail": registro.get("remitente") or "", "subject": registro.get("asunto") or "", "receivedAt": registro.get("recibido_en")}
+        original = self.recepcion.original(email, message_id, part_id)
+        if original is None:
+            mensaje_gmail = self.gmail.get_message(message_id)
+            adjunto = next((item for item in mensaje_gmail.get("attachments") or [] if str(item.get("partId")) == part_id), None)
+            attachment_id = str((adjunto or {}).get("id") or registro.get("attachment_id") or "")
+            if not attachment_id:
+                raise ValueError("El original no esta en disco y no se encontro el adjunto en el correo.")
+            data, media_type, nombre = self.gmail.attachment(message_id, attachment_id)
+        else:
+            data, media_type, nombre = original
+            attachment_id = registro.get("attachment_id")
+        nombre = nombre or str(registro.get("nombre") or "")
+        documento_recibido = self._recibir(email, message_id, part_id, data, media_type, nombre, attachment_id, mensaje, "reprocesar")
+        diagnostico = documento_recibido.get("diagnostico") or {}
+        if diagnostico.get("codigo") not in {"ok", "pdf_escaneado"}:
+            return {"estado": "sigue_en_bandeja", "documento": documento_recibido, "diagnostico": diagnostico, "mensaje": diagnostico.get("mensaje")}
+        if not self.gemini.status().get("enabled"):
+            raise GeminiUnavailableError("Gemini no esta configurado.")
+        media_type = diagnostico.get("mime") or media_type
+        campos = self.campos_configurados(email)
+        try:
+            deteccion, campos_tipo, extraer = self._detectar(email, data, media_type, nombre, mensaje, campos)
+            resultado = self.gemini.extract_document(data, media_type, nombre, campos_solicitados=[campo["nombre"] for campo in campos_tipo], **extraer)
+        except Exception as error:
+            causa = f"gemini_http_{error.status_code}" if isinstance(error, GeminiRequestError) else error.__class__.__name__
+            self._evento(email, "extraccion", causa, str(error) or causa, message_id, part_id, origen="reprocesar")
+            raise
+        if not deteccion.get("aseguradora") and resultado.get("aseguradora"):
+            deteccion["aseguradora"] = resultado["aseguradora"]
+        solicitud = borrador_desde_extraccion(resultado, campos_tipo, filename=nombre, attachment_id=attachment_id or None, lote=uuid.uuid4().hex[:8],
+                                              tipo_documento=TipoDocumentoGuardado.model_validate(deteccion).model_dump())
+        documento = self.almacen.guardar(email, message_id, part_id, solicitud)
+        self._registrar_estructura(email, deteccion, resultado, data)
+        # El proceso automático ya no lo vuelve a tomar; no se envía solo (lo revisa el usuario).
+        self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"), enviar_auto=False)
+        self._evento(email, "extraccion", "ok", f"Extraido con IA al reprocesar ({resultado.get('model') or 'Gemini'}).", message_id, part_id, origen="reprocesar",
+                     detalle={"tipo": deteccion.get("codigo"), "filas": len(documento.get("transacciones", []))})
+        self.recepcion.resolver(email, message_id, part_id, "extraido")
+        return {"estado": "extraido", "documento": self.recepcion.documentos.obtener(email, message_id, part_id), "extraccion": documento,
+                "diagnostico": diagnostico, "mensaje": "Extraido: revisalo en Extraccion antes de enviarlo."}
+
     def _fallo(self, email: str, clave: str, intentos: int, mensaje: str, ctx: dict[str, Any], causa: str = "error") -> str:
         estado = "error" if intentos >= MAX_INTENTOS else "pendiente"
         self._anotar(email, clave, estado=estado, intentos=intentos, error=mensaje[:500])
+        message_id, _, part_id = clave.partition("__")
+        self._evento(email, "extraccion", causa, mensaje, message_id, part_id, detalle={"intento": intentos, "de": MAX_INTENTOS})
+        if estado == "error" and self.recepcion is not None:
+            # Agotó sus intentos: pasa a captura manual.
+            try:
+                self.recepcion.a_bandeja(email, message_id, part_id, "error_extraccion", f"Se agotaron los {MAX_INTENTOS} intentos de extraccion: {mensaje}"[:500])
+            except Exception:
+                logger.exception("No se pudo pasar a la bandeja %s", clave)
         logger.info("Ciclo automatico adjunto fallo clave=%s intento=%d/%d causa=%s estado=%s", clave, intentos, MAX_INTENTOS, causa, estado)
         if estado == "error":
             ctx["resumen"]["errores"] += 1

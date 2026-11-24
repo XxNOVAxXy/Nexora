@@ -4,4 +4,7 @@ python-dotenv>=1.0,<2
 google-api-python-client>=2.150,<3
 google-auth>=2.36,<3
 google-auth-oauthlib>=1.2,<2
-google-genai>=1.0,<2
+google-genai>=2.34,<3
+# Lectura de PDF en el backend (diagnostico; despues, extraccion por reglas). BSD-3 y MIT. Nunca PyMuPDF (AGPL).
+pypdf>=6,<7
+pdfplumber>=0.11,<0.12

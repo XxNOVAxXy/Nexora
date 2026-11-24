@@ -25,6 +25,7 @@ import { tieneCapaDeTexto, type PaginaTexto } from './services/textoPdf'
 import { compatibles, ETIQUETA_CAMPO, movimientoDesdeFila, posicionParaInsertar, valorParaCaptura, verificar, type MarcaVerificacion } from './services/verificacion'
 import { PanelVerificacion, VisorPdf, type EstadoTextoDocumento, type Resaltado } from './VisorPdf'
 import { HistorialEnviosPage } from './HistorialEnvios'
+import { BandejaCapturaPage } from './BandejaCaptura'
 import { deteccionManual, esContable, solicitudDe, textoDeteccion, tiposDocumentoApi, tiposVigentes, type TipoDocumento, type TipoDocumentoDetectado } from './services/tiposDocumentoApi'
 import { TiposDocumentoSeccion } from './TiposDocumento'
 import {
@@ -47,6 +48,7 @@ import {
   Gem,
   Globe2,
   Inbox,
+  ClipboardPen,
   Landmark,
   Mail,
   Pencil,
@@ -71,7 +73,7 @@ type Icon = typeof Inbox
 type ExtractionMode = 'manual' | 'gemini'
 
 const navSections: { label: string; items: { to: string; label: string; icon: Icon }[] }[] = [
-  { label: 'Operación', items: [{ to: '/emails', label: 'Correos', icon: Mail }, { to: '/extraction', label: 'Extracción', icon: FileSearch }, { to: '/envios', label: 'Envíos', icon: Send }] },
+  { label: 'Operación', items: [{ to: '/emails', label: 'Correos', icon: Mail }, { to: '/extraction', label: 'Extracción', icon: FileSearch }, { to: '/bandeja', label: 'Captura manual', icon: ClipboardPen }, { to: '/envios', label: 'Envíos', icon: Send }] },
   { label: 'Sistema', items: [{ to: '/configuracion', label: 'Configuración', icon: SettingsIcon }] },
 ]
 
@@ -95,6 +97,7 @@ function App() {
             <Route path="/emails" element={<FilteredGmailInboxPage />} />
             <Route path="/extraction" element={<ExtractionWorkspace />} />
             <Route path="/envios" element={<HistorialEnviosPage />} />
+            <Route path="/bandeja" element={<BandejaCapturaPage />} />
             <Route path="/settings" element={<Navigate to="/configuracion/conexiones" replace />} />
             <Route path="/configuracion" element={<Navigate to="/configuracion/conexiones" replace />} />
             <Route path="/configuracion/:seccion" element={<SettingsPageV3 />} />

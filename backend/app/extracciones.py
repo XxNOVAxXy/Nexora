@@ -377,6 +377,9 @@ class AlmacenExtracciones:
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._envios_en_curso: set[str] = set()
+        # Repositorio de envíos (repos/envios.py): se le avisa cada vez que cambia la lista ``envios`` de un documento.
+        # Los intentos siguen guardándose aquí, con su formato; en modo db, además, en la tabla ``envios``.
+        self.envios: Any = None
 
     def _ruta(self, email: str, message_id: str, part_id: str) -> Path:
         _validar_id(message_id, "messageId")
@@ -493,9 +496,19 @@ class AlmacenExtracciones:
         """Lee, aplica ``cambio`` y escribe atómicamente bajo el lock del documento."""
         ruta = self._ruta(email, message_id, part_id)
         with self._lock(ruta):
-            documento = cambio(self._leer(ruta))
+            previo = self._leer(ruta)
+            documento = cambio(previo)
             escribir_atomico(ruta, documento)
+            if self.envios is not None and documento.get("envios") != (previo or {}).get("envios"):
+                self._sincronizar_envios(email, message_id, part_id, list(documento.get("envios") or []))
             return self._publica(documento)
+
+    def _sincronizar_envios(self, email: str, message_id: str, part_id: str, envios: list[dict[str, Any]]) -> None:
+        """Un fallo del repositorio nunca pierde el envío: ya quedó en el JSON y se vuelve a sincronizar en el siguiente cambio."""
+        try:
+            self.envios.sincronizar(email, message_id, part_id, envios)
+        except Exception:
+            logger.exception("No se pudieron sincronizar los envios message_id=%s part_id=%s", message_id, part_id)
 
     def leer_completo(self, email: str, message_id: str, part_id: str) -> dict[str, Any] | None:
         return self._leer(self._ruta(email, message_id, part_id))

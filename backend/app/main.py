@@ -12,6 +12,9 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 
 from .adjuntos import content_disposition
+from .originales import AlmacenOriginales
+from .recepcion import MOTIVOS_BANDEJA, ServicioRecepcion
+from .repos import DocumentosJson, EnviosJson, EventosJson
 from .automatico import ExtractorAutomatico, intervalo_desde_entorno
 from .plantilla_campos import AlmacenPlantillas, PlantillaRequest, aplicar_plantilla, comparable, deducir_campos, sugerencias_para_configurar
 from .config import settings
@@ -90,9 +93,15 @@ def campos_del_documento(email: str, documento: dict[str, Any]) -> list[dict[str
     return plantillas.efectiva(email) if tipo.get("contable") else list(tipo.get("campos") or [])
 
 
+# Originales en disco, diagnóstico, eventos y Bandeja de captura manual (repositorios en JSON por ahora).
+recepcion = ServicioRecepcion(DocumentosJson(settings.documentos_path), EventosJson(settings.eventos_path), AlmacenOriginales(settings.originales_path))
+# Intentos de envío a SaveData: siguen en el JSON de cada extracción; el repositorio recibe cada cambio.
+almacen.envios = EnviosJson(almacen)
 # La URL se lee en cada envío para que las pruebas puedan sustituirla.
-envios = ServicioEnvio(almacen, lambda: settings.savedata_url, configurados=lambda email: plantillas.efectiva(email), tipo_de=lambda email, documento: tipo_del_documento(email, documento))
-automatico = ExtractorAutomatico(settings.automatico_path, gmail, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos), plantillas=plantillas, envios=envios, tipos=tipos)
+envios = ServicioEnvio(almacen, lambda: settings.savedata_url, configurados=lambda email: plantillas.efectiva(email), tipo_de=lambda email, documento: tipo_del_documento(email, documento),
+                       registrar_evento=lambda *args, **kwargs: recepcion.evento(*args, **kwargs))
+automatico = ExtractorAutomatico(settings.automatico_path, gmail, gemini, almacen, intervalo_desde_entorno(settings.intervalo_minutos), plantillas=plantillas, envios=envios, tipos=tipos,
+                                 recepcion=recepcion)
 oauth_states: dict[str, datetime] = {}
 
 
@@ -119,6 +128,12 @@ class GeminiExtractionRequest(BaseModel):
     # Tipos de documento: ``detectar`` detecta el tipo (reglas o IA); ``tipo_id`` lo fija. Sin ninguno, estado de cuenta.
     detectar: bool = False
     tipo_id: str | None = Field(default=None, max_length=64)
+    # Parte del correo (clave estable del documento); sin ella se busca por attachmentId en el correo.
+    partId: str | None = Field(default=None, max_length=128)
+
+
+# Diagnósticos con los que "Extraer" no llama a la IA. Un PDF escaneado sí se extrae: la IA lo lee como imagen.
+DIAGNOSTICOS_BLOQUEANTES = {"pdf_protegido", "pdf_danado", "formato_no_soportado"}
 
 
 class FilaParaCampo(BaseModel):
@@ -237,10 +252,24 @@ def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
             media_type,
             data.startswith(b"%PDF-"),
         )
-        if payload.detectar or payload.tipo_id:
-            result = _extraer_con_tipo(payload, data, media_type, filename)
-        else:
-            result = gemini.extract_document(data, media_type, filename, forzar=payload.forzar, campos_solicitados=payload.campos_solicitados)
+        recibido = _recibir_manual(payload, data, media_type, filename)
+        if recibido is not None:
+            email_recibido, part_id, diagnostico = recibido
+            if diagnostico.get("codigo") in DIAGNOSTICOS_BLOQUEANTES:
+                raise HTTPException(status_code=422, detail={"code": diagnostico["codigo"], "message": f"{diagnostico.get('mensaje')} Quedo en la Bandeja de captura manual.",
+                                                             "retryable": False, "bandeja": True})
+            media_type = diagnostico.get("mime") or media_type
+        try:
+            if payload.detectar or payload.tipo_id:
+                result = _extraer_con_tipo(payload, data, media_type, filename)
+            else:
+                result = gemini.extract_document(data, media_type, filename, forzar=payload.forzar, campos_solicitados=payload.campos_solicitados)
+        except GeminiRequestError as error:
+            if recibido is not None:
+                recepcion.evento(email_recibido, "extraccion", f"gemini_http_{error.status_code}", str(error), message_id=payload.messageId, part_id=part_id, origen="manual")
+            raise
+        if recibido is not None:
+            recepcion.evento(email_recibido, "extraccion", "ok", f"Extraido con IA ({result.get('model') or 'Gemini'}).", message_id=payload.messageId, part_id=part_id, origen="manual")
         logger.info(
             "Gemini extraction result attachment_id=%s result=success transacciones=%d cuadra=%s",
             payload.attachmentId,
@@ -248,6 +277,8 @@ def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
             result.get("validacion", {}).get("cuadra"),
         )
         return result
+    except HTTPException:
+        raise
     except GmailNotConnectedError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
     except GmailRateLimitError as error:
@@ -271,6 +302,31 @@ def extract_gemini_document(payload: GeminiExtractionRequest) -> dict[str, Any]:
     except Exception as error:
         logger.exception("Document extraction failed for message=%s attachment=%s", payload.messageId, payload.attachmentId)
         raise HTTPException(status_code=502, detail=f"No se pudo extraer el documento: {error}") from error
+
+
+def _recibir_manual(payload: GeminiExtractionRequest, data: bytes, media_type: str, filename: str) -> tuple[str, str, dict[str, Any]] | None:
+    """"Extraer" a mano: guarda el original, lo diagnostica y registra el evento de lectura.
+
+    Devuelve (cuenta, partId, diagnóstico), o None si no se pudo identificar la cuenta o la parte del correo: en ese
+    caso se extrae como antes, sin diagnóstico (nunca se bloquea la extracción por no poder registrar)."""
+    try:
+        email = gmail.profile().get("email")
+        if not email:
+            return None
+        mensaje = gmail.get_message(payload.messageId)
+        part_id = payload.partId
+        if not part_id:
+            adjunto = next((item for item in mensaje.get("attachments") or [] if str(item.get("id")) == payload.attachmentId), None)
+            part_id = str((adjunto or {}).get("partId") or "")
+        if not part_id or not ID_DOCUMENTO_SEGURO.fullmatch(part_id) or not ID_DOCUMENTO_SEGURO.fullmatch(payload.messageId):
+            return None
+        documento = recepcion.recibir(email, message_id=payload.messageId, part_id=part_id, data=data, mime_type=media_type, filename=filename,
+                                      attachment_id=payload.attachmentId, recibido_en=mensaje.get("receivedAt"), asunto=mensaje.get("subject"),
+                                      remitente=direccion(mensaje.get("senderEmail", "")) or None, origen="manual")
+    except Exception:
+        logger.exception("No se pudo registrar la lectura del documento message_id=%s", payload.messageId)
+        return None
+    return email, part_id, documento.get("diagnostico") or {}
 
 
 def _extraer_con_tipo(payload: GeminiExtractionRequest, data: bytes, media_type: str, filename: str) -> dict[str, Any]:
@@ -492,7 +548,87 @@ def guardar_extraccion(message_id: str, part_id: str, payload: GuardarExtraccion
         logger.exception("No se pudo escribir la extraccion")
         raise HTTPException(status_code=500, detail=f"No se pudo guardar la extraccion en disco: {error}") from error
     logger.info("Extraccion guardada message_id=%s part_id=%s version=%s estado=%s", message_id, part_id, documento["version"], documento["estado"])
+    try:
+        # Capturado a mano: si estaba en la Bandeja de captura manual, sale de ella.
+        if recepcion.resolver(email, message_id, part_id, "capturado_a_mano") is not None:
+            recepcion.evento(email, "extraccion", "captura_manual", "Capturado a mano desde la bandeja.", message_id=message_id, part_id=part_id, origen="manual")
+    except Exception:
+        logger.exception("No se pudo actualizar la bandeja message_id=%s part_id=%s", message_id, part_id)
     return documento
+
+
+# --- Bandeja de captura manual y eventos -------------------------------------------------------
+
+def _documento_publico(registro: dict[str, Any]) -> dict[str, Any]:
+    campos = ("message_id", "part_id", "attachment_id", "nombre", "mime", "tamano", "sha256", "recibido_en", "asunto", "remitente", "guardado_en",
+              "actualizado", "diagnostico", "bandeja")
+    return {**{campo: registro.get(campo) for campo in campos}, "tiene_original": bool(registro.get("ruta"))}
+
+
+@app.get("/api/bandeja")
+def listar_bandeja(estado: str = Query("pendiente", pattern="^(pendiente|resuelto|descartado)$")) -> dict[str, Any]:
+    email = _cuenta_actual()
+    return {"documentos": [_documento_publico(registro) for registro in recepcion.bandeja(email, estado)], "motivos": MOTIVOS_BANDEJA}
+
+
+@app.post("/api/bandeja/{message_id}/{part_id}/reprocesar")
+def reprocesar_bandeja(message_id: str, part_id: str) -> dict[str, Any]:
+    _ids_validos(message_id, part_id)
+    email = _cuenta_actual()
+    try:
+        resultado = automatico.reprocesar_bandeja(email, message_id, part_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="El documento no esta en la bandeja.") from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except GmailNotConnectedError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    except GmailRateLimitError as error:
+        raise _rate_limited(error) from error
+    except GeminiUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except GeminiRequestError as error:
+        raise HTTPException(status_code=error.status_code, detail={"code": error.code, "message": str(error), "retryable": error.retryable}) from error
+    except (ConflictoVersion, EnvioEnCurso) as error:
+        raise HTTPException(status_code=409, detail="El documento se guardo mientras se reprocesaba; recarga la bandeja.") from error
+    documento = resultado.get("documento")
+    return {**resultado, "documento": _documento_publico(documento) if documento else None}
+
+
+@app.post("/api/bandeja/{message_id}/{part_id}/descartar")
+def descartar_de_bandeja(message_id: str, part_id: str) -> dict[str, Any]:
+    _ids_validos(message_id, part_id)
+    email = _cuenta_actual()
+    registro = recepcion.resolver(email, message_id, part_id, "descartado_por_usuario", estado="descartado")
+    if registro is None:
+        raise HTTPException(status_code=404, detail="El documento no esta pendiente en la bandeja.")
+    recepcion.evento(email, "lectura", "descartado", "Quitado de la bandeja por el usuario.", message_id=message_id, part_id=part_id, origen="manual")
+    return {"documento": _documento_publico(registro)}
+
+
+@app.get("/api/documentos/{message_id}/{part_id}/eventos")
+def eventos_del_documento(message_id: str, part_id: str) -> dict[str, Any]:
+    _ids_validos(message_id, part_id)
+    email = _cuenta_actual()
+    return {"eventos": recepcion.eventos.listar(email, message_id=message_id, part_id=part_id)}
+
+
+@app.get("/api/eventos")
+def listar_eventos(etapa: str | None = Query(None, pattern="^(lectura|diagnostico|extraccion|envio)$"), desde: str | None = Query(None, max_length=40),
+                   hasta: str | None = Query(None, max_length=40), limite: int = Query(200, ge=1, le=500)) -> dict[str, Any]:
+    email = _cuenta_actual()
+    return {"eventos": recepcion.eventos.listar(email, etapa=etapa, desde=desde, hasta=hasta, limite=limite)}
+
+
+@app.get("/api/documentos/{message_id}/{part_id}/original")
+def descargar_original(message_id: str, part_id: str) -> StreamingResponse:
+    _ids_validos(message_id, part_id)
+    email = _cuenta_actual()
+    original = recepcion.original(email, message_id, part_id)
+    if original is None:
+        raise HTTPException(status_code=404, detail="El original no esta guardado en disco.")
+    data, mime, nombre = original
+    return StreamingResponse(iter([data]), media_type=mime, headers={"Content-Disposition": content_disposition(nombre, mime)})
 
 
 # --- SaveData ----------------------------------------------------------------------------------

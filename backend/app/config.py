@@ -29,6 +29,11 @@ class Settings:
     automatico_path: Path = PROJECT_ROOT / "backend" / "data" / "automatico"
     plantilla_campos_path: Path = PROJECT_ROOT / "backend" / "data" / "plantilla_campos"
     tipos_documento_path: Path = PROJECT_ROOT / "backend" / "data" / "tipos_documento"
+    # Repositorios en JSON (después, la base de datos): documentos recibidos y eventos del proceso.
+    documentos_path: Path = PROJECT_ROOT / "backend" / "data" / "documentos"
+    eventos_path: Path = PROJECT_ROOT / "backend" / "data" / "eventos"
+    # Archivos originales: storage/originales/<cuenta>/<aaaa>/<mm>/<sha256>.<ext> (fuera de git).
+    originales_path: Path = PROJECT_ROOT / "storage" / "originales"
     # Opcional: minutos entre revisiones de la extracción automática (por defecto 20).
     intervalo_minutos: str = os.getenv("NEXORA_INTERVALO_MINUTOS", "")
     # URL del servicio SaveData; el frontend nunca la llama directamente.

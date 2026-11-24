@@ -47,6 +47,7 @@ describe('textos del diagnóstico', () => {
   it('resumen del ciclo y omitidos por motivo', () => {
     expect(resumenCiclo(ciclo())).toBe('3 correos encontrados · 1 extraído · 1 enviado · 2 omitidos · 0 errores')
     expect(resumenCiclo(ciclo({ requieren_revision: 2, inciertos: 1 }))).toContain('2 requieren revisión · 1 envío incierto')
+    expect(resumenCiclo(ciclo({ en_bandeja: 2 }))).toContain('1 enviado · 2 a captura manual · 2 omitidos')
     expect(motivosAgrupados(ciclo())).toBe('Sin adjunto válido (1), El asunto no coincide (1)')
     expect(textoMotivo('ya_tenia_extraccion')).toBe('Ya tenía extracción')
   })

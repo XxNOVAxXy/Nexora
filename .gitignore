@@ -5,6 +5,8 @@ dist/
 !.env.example
 *.local
 backend/data/
+storage/
 .venv/
 __pycache__/
 *.py[cod]
+Nexora/

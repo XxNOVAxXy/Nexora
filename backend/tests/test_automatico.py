@@ -16,9 +16,11 @@ from backend.app.automatico import ExtractorAutomatico, borrador_desde_extraccio
 from backend.app.extracciones import AlmacenExtracciones, GuardarExtraccionRequest
 from backend.app.gemini import GeminiRequestError
 from backend.app.gmail import GmailRateLimitError
+from backend.tests.pdf_ficticio import pdf_con_texto
 
 EMAIL = "a@example.com"
 INICIO = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+PDF_FICTICIO = pdf_con_texto()
 PDF = {"id": "att-1", "filename": "estado.pdf", "mimeType": "application/pdf", "size": 10, "partId": "1"}
 
 
@@ -64,7 +66,8 @@ class GmailFalso:
 
     def attachment(self, message_id: str, attachment_id: str) -> tuple[bytes, str, str]:
         self.descargas += 1
-        return b"%PDF-1.7", "application/pdf", "estado.pdf"
+        # PDF ficticio con texto: pasa el diagnóstico (las pruebas de la bandeja usan otros).
+        return PDF_FICTICIO, "application/pdf", "estado.pdf"
 
 
 class GeminiFalso:

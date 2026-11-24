@@ -1,7 +1,8 @@
 import { request } from './extraccionesApi'
 
 /** Estado de un adjunto en el registro de la extracción automática del backend. */
-export type EstadoAdjuntoAutomatico = 'pendiente' | 'en_curso' | 'extraido' | 'omitido' | 'error'
+/** `bandeja`: el diagnóstico no fue ok (contraseña, dañado, escaneado, formato) y quedó en la Bandeja de captura manual. */
+export type EstadoAdjuntoAutomatico = 'pendiente' | 'en_curso' | 'extraido' | 'omitido' | 'error' | 'bandeja'
 
 /** Estado del envío automático a SaveData de un adjunto extraído automáticamente. */
 export type EstadoEnvioAutomatico = 'pendiente' | 'en_curso' | 'enviado' | 'requiere_revision' | 'error' | 'incierto' | 'sin_savedata' | 'omitido'
@@ -72,6 +73,8 @@ export type UltimoCiclo = {
   omitidos: number
   errores: number
   ya_revisados: number
+  /** Adjuntos que pasaron a la Bandeja de captura manual en el ciclo (ausente en ciclos anteriores a la bandeja). */
+  en_bandeja?: number
   descartes: DescarteCiclo[]
   descartes_total: number
   /** "Se enviaron 2 (1 Fianzas, 1 Autos individuales) · 1 requiere revisión (Gastos médicos mayores)". */

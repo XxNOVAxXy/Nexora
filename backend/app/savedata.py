@@ -427,8 +427,11 @@ def motivos_para_no_enviar(documento: dict[str, Any], sin_url: bool) -> list[str
 
 class ServicioEnvio:
     def __init__(self, almacen: AlmacenExtracciones, url: Callable[[], str], timeout: float = SAVEDATA_TIMEOUT_SECONDS, cliente: Callable[[str, str, float], RespuestaSaveData] = enviar_a_savedata, configurados: Callable[[str], list[dict[str, Any]]] = lambda _email: [],
-                 tipo_de: Callable[[str, dict[str, Any]], dict[str, Any] | None] = lambda _email, _documento: None) -> None:
+                 tipo_de: Callable[[str, dict[str, Any]], dict[str, Any] | None] = lambda _email, _documento: None,
+                 registrar_evento: Callable[..., Any] | None = None) -> None:
         self.almacen = almacen
+        # Evento de la etapa "envio" (ServicioRecepcion.evento); None: sin bitácora de eventos.
+        self.registrar_evento = registrar_evento
         # Configuración de campos de la cuenta: los campos configurados que falten en el documento van como null.
         self.configurados = configurados
         # Tipo de documento actual de un documento (código, sección y campos); None: estado de cuenta de siempre.
@@ -552,9 +555,21 @@ class ServicioEnvio:
 
             documento = self.almacen.actualizar(email, message_id, part_id, registrar_fin)
             intento = next(item for item in documento["envios"] if item["id"] == intento_id)
+            self.evento_envio(email, message_id, part_id, "enviar", respuesta, origen, intento_id)
             return respuesta, intento, documento
         finally:
             self.almacen.liberar_envio(reserva)
+
+    def evento_envio(self, email: str, message_id: str, part_id: str, accion: str, respuesta: "RespuestaSaveData", origen: str, intento_id: str) -> None:
+        """Evento de la etapa "envio" con el resultado de SaveData. Nunca interrumpe el envío."""
+        if self.registrar_evento is None:
+            return
+        try:
+            mensaje = respuesta.mensaje or ("Enviado a SaveData." if respuesta.resultado == "exito" else "")
+            self.registrar_evento(email, "envio", respuesta.resultado, mensaje, message_id=message_id, part_id=part_id, origen=origen,
+                                  detalle={"accion": accion, "http_status": respuesta.http_status, "intento_id": intento_id})
+        except Exception:
+            logger.exception("No se pudo registrar el evento de envio")
 
 
 # --- Eliminar de SaveData --------------------------------------------------------------------------
@@ -631,6 +646,7 @@ def eliminar_de_savedata(servicio: "ServicioEnvio", email: str, message_id: str,
 
         documento = servicio.almacen.actualizar(email, message_id, part_id, registrar_fin)
         intento = next(item for item in documento["envios"] if item["id"] == intento_id)
+        servicio.evento_envio(email, message_id, part_id, "eliminar", respuesta, "manual", intento_id)
         return respuesta, intento, documento
     finally:
         servicio.almacen.liberar_envio(reserva)
