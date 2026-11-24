@@ -42,7 +42,8 @@ USUARIO_SISTEMA = "sistema"
 _CON_COLUMNA = {"message_id", "part_id", "nombre", "ruta", "sha256", "tamano", "recibido_en", "asunto", "remitente", "guardado_en", "actualizado"}
 
 CODIGOS_OK = {"ok", "exito"}
-CODIGOS_AVISO = {"pdf_escaneado", "descartado", "omitido", "incierto", "requiere_revision", "sin_savedata", "no_existe", "original_no_guardado"}
+CODIGOS_AVISO = {"pdf_escaneado", "descartado", "omitido", "incierto", "requiere_revision", "sin_savedata", "no_existe", "original_no_guardado",
+                 "reintento_programado", "reintento_en_espera", "estado_recuperado"}
 
 # resultado del intento (JSON) ↔ estado del renglón de envios (enviado | pendiente | error | incierto | no_enviado).
 ESTADO_ENVIO = {"exito": "enviado", "en_curso": "pendiente", "error": "error", "incierto": "incierto", "no_existe": "no_enviado"}
@@ -83,8 +84,19 @@ class CuentasDb:
         return email.strip().lower()
 
     def _buscar(self, sesion: Session, correo: str) -> int | None:
-        return sesion.scalars(select(CuentaCorreo.id).where(func.lower(CuentaCorreo.correo) == correo)
+        return sesion.scalars(select(CuentaCorreo.id).where(func.lower(func.trim(CuentaCorreo.correo)) == correo)
                               .order_by(CuentaCorreo.activo.desc(), CuentaCorreo.id)).first()
+
+    def ids_de(self, email: str) -> list[int]:
+        """Todas las cuentas con ese correo (la principal primero). Si hay más de una (p. ej. una creada a mano y otra
+        por el proceso), los documentos de cualquiera de ellas son de esta cuenta: así nunca se "pierde" uno."""
+        correo = self._correo(email)
+        with self.sesiones.begin() as sesion:
+            ids = list(sesion.scalars(select(CuentaCorreo.id).where(func.lower(func.trim(CuentaCorreo.correo)) == correo)
+                                      .order_by(CuentaCorreo.activo.desc(), CuentaCorreo.id)))
+        if len(ids) > 1:
+            logger.warning("Hay %d renglones de cuentas_correo con el mismo correo (ids=%s); se usan todos", len(ids), ids)
+        return ids
 
     def id_de(self, email: str, *, crear: bool = True) -> int | None:
         correo = self._correo(email)
@@ -134,8 +146,9 @@ class CuentasDb:
         return usuario.id
 
 
-def _id_documento(sesion: Session, cuenta_id: int, message_id: str, part_id: str) -> int | None:
-    return sesion.scalars(select(Documento.id).where(Documento.cuenta_id == cuenta_id, Documento.message_id == message_id, Documento.part_id == part_id)).first()
+def _id_documento(sesion: Session, cuenta_ids: list[int], message_id: str, part_id: str) -> int | None:
+    return sesion.scalars(select(Documento.id).where(Documento.cuenta_id.in_(cuenta_ids), Documento.message_id == message_id, Documento.part_id == part_id)
+                          .order_by(Documento.actualizado.desc(), Documento.id.desc())).first()
 
 
 # --- Documentos ------------------------------------------------------------------------------------
@@ -185,25 +198,35 @@ class DocumentosDb:
         self.sesiones = sesiones
         self.cuentas = cuentas
 
-    def _consulta(self, cuenta_id: int, message_id: str, part_id: str) -> Any:
-        return select(Documento).where(Documento.cuenta_id == cuenta_id, Documento.message_id == message_id, Documento.part_id == part_id)
+    def _consulta(self, cuenta_ids: list[int], message_id: str, part_id: str) -> Any:
+        return (select(Documento).where(Documento.cuenta_id.in_(cuenta_ids), Documento.message_id == message_id, Documento.part_id == part_id)
+                .order_by(Documento.actualizado.desc(), Documento.id.desc()))
 
     def obtener(self, email: str, message_id: str, part_id: str) -> dict[str, Any] | None:
-        cuenta_id = self.cuentas.id_de(email, crear=False)
-        if cuenta_id is None:
+        cuenta_ids = self.cuentas.ids_de(email)
+        if not cuenta_ids:
             return None
         with self.sesiones.begin() as sesion:
-            fila = sesion.scalars(self._consulta(cuenta_id, message_id, part_id)).first()
+            fila = sesion.scalars(self._consulta(cuenta_ids, message_id, part_id)).first()
             return registro_desde_fila(fila) if fila else None
+
+    def id_fila(self, email: str, message_id: str, part_id: str) -> int | None:
+        """Id del renglón de ``documentos`` (para el diagnóstico)."""
+        cuenta_ids = self.cuentas.ids_de(email)
+        if not cuenta_ids:
+            return None
+        with self.sesiones.begin() as sesion:
+            return _id_documento(sesion, cuenta_ids, message_id, part_id)
 
     def actualizar(self, email: str, message_id: str, part_id: str, cambio: Callable[[dict[str, Any] | None], dict[str, Any]]) -> dict[str, Any]:
         """Lee el renglón (bloqueado hasta terminar), aplica ``cambio`` y lo escribe en la misma transacción."""
         cuenta_id = self.cuentas.id_de(email)
         assert cuenta_id is not None
         for intento in range(2):
+            cuenta_ids = self.cuentas.ids_de(email) or [cuenta_id]
             try:
                 with self.sesiones.begin() as sesion:
-                    fila = sesion.scalars(self._consulta(cuenta_id, message_id, part_id).with_for_update()).first()
+                    fila = sesion.scalars(self._consulta(cuenta_ids, message_id, part_id).with_for_update()).first()
                     previo = registro_desde_fila(fila) if fila else None
                     nuevo = {**cambio(dict(previo) if previo else None), "message_id": message_id, "part_id": part_id}
                     valores = columnas_desde_registro(nuevo, fila.estado if fila else None)
@@ -223,20 +246,24 @@ class DocumentosDb:
         raise RuntimeError("No se pudo guardar el documento")  # pragma: no cover
 
     def buscar_sha256(self, email: str, sha256: str) -> dict[str, Any] | None:
-        cuenta_id = self.cuentas.id_de(email, crear=False)
-        if cuenta_id is None:
+        cuenta_ids = self.cuentas.ids_de(email)
+        if not cuenta_ids:
             return None
         with self.sesiones.begin() as sesion:
-            fila = sesion.scalars(select(Documento).where(Documento.cuenta_id == cuenta_id, Documento.sha256 == sha256, Documento.ruta_original != "")
+            fila = sesion.scalars(select(Documento).where(Documento.cuenta_id.in_(cuenta_ids), Documento.sha256 == sha256, Documento.ruta_original != "")
                                   .order_by(Documento.id)).first()
             return registro_desde_fila(fila) if fila else None
 
     def listar(self, email: str, *, bandeja: str | None = None) -> list[dict[str, Any]]:
-        cuenta_id = self.cuentas.id_de(email, crear=False)
-        if cuenta_id is None:
+        cuenta_ids = self.cuentas.ids_de(email)
+        if not cuenta_ids:
             return []
         with self.sesiones.begin() as sesion:
-            registros = [registro_desde_fila(fila) for fila in sesion.scalars(select(Documento).where(Documento.cuenta_id == cuenta_id).order_by(Documento.id))]
+            # Un mismo adjunto en dos cuentas con el mismo correo: se queda el más reciente.
+            unicos: dict[tuple[str, str], dict[str, Any]] = {}
+            for fila in sesion.scalars(select(Documento).where(Documento.cuenta_id.in_(cuenta_ids)).order_by(Documento.actualizado, Documento.id)):
+                unicos[(fila.message_id, fila.part_id)] = registro_desde_fila(fila)
+            registros = list(unicos.values())
         if bandeja is not None:
             registros = [registro for registro in registros if (registro.get("bandeja") or {}).get("estado") == bandeja]
         return registros
@@ -245,10 +272,11 @@ class DocumentosDb:
 
     def anotar_extraccion(self, email: str, message_id: str, part_id: str, extraccion: dict[str, Any]) -> None:
         """Tipo, aseguradora, estructura y estado (extraido/enviado) de una extracción guardada en JSON."""
-        cuenta_id = self.cuentas.id_de(email)
+        self.cuentas.id_de(email)
+        cuenta_ids = self.cuentas.ids_de(email)
         tipo_documento = extraccion.get("tipo_documento") or {}
         with self.sesiones.begin() as sesion:
-            fila = sesion.scalars(self._consulta(cuenta_id, message_id, part_id).with_for_update()).first()
+            fila = sesion.scalars(self._consulta(cuenta_ids, message_id, part_id).with_for_update()).first()
             if fila is None:
                 return
             fila.tipo = _texto(tipo_documento.get("codigo") or ("EC" if not tipo_documento else None), 10)
@@ -283,8 +311,9 @@ class EventosDb:
         momento = a_utc(fecha) or ahora_utc()
         codigo_texto = str(codigo)[:50]
         mensaje_texto = str(mensaje or "")[:min(MAX_MENSAJE, 1000)]
+        cuenta_ids = self.cuentas.ids_de(email) or [cuenta_id]
         with self.sesiones.begin() as sesion:
-            documento_id = _id_documento(sesion, cuenta_id, message_id, part_id) if message_id and part_id else None
+            documento_id = _id_documento(sesion, cuenta_ids, message_id, part_id) if message_id and part_id else None
             if omitir_repetido:
                 repetido = sesion.scalars(select(Evento.id).where(Evento.cuenta_id == cuenta_id, Evento.documento_id.is_(None) if documento_id is None else Evento.documento_id == documento_id,
                                                                   Evento.etapa == etapa, Evento.codigo == codigo_texto, Evento.fecha == momento, Evento.mensaje == mensaje_texto)).first()
@@ -299,11 +328,11 @@ class EventosDb:
 
     def listar(self, email: str, *, message_id: str | None = None, part_id: str | None = None, etapa: str | None = None,
                desde: str | None = None, hasta: str | None = None, limite: int = 200) -> list[dict[str, Any]]:
-        cuenta_id = self.cuentas.id_de(email, crear=False)
-        if cuenta_id is None:
+        cuenta_ids = self.cuentas.ids_de(email)
+        if not cuenta_ids:
             return []
         consulta = (select(Evento, Documento.message_id, Documento.part_id).outerjoin(Documento, Evento.documento_id == Documento.id)
-                    .where(Evento.cuenta_id == cuenta_id))
+                    .where(Evento.cuenta_id.in_(cuenta_ids)))
         if message_id is not None:
             consulta = consulta.where(Documento.message_id == message_id)
         if part_id is not None:
@@ -364,9 +393,9 @@ class EnviosDb:
 
     def sincronizar_contando(self, email: str, message_id: str, part_id: str, envios: list[dict[str, Any]]) -> tuple[int, int]:
         """(nuevos, actualizados). Un documento que no está en la tabla ``documentos`` no se puede ligar: se omite."""
-        cuenta_id = self.cuentas.id_de(email)
+        cuenta_ids = self.cuentas.ids_de(email) or [self.cuentas.id_de(email)]
         with self.sesiones.begin() as sesion:
-            documento_id = _id_documento(sesion, cuenta_id, message_id, part_id)
+            documento_id = _id_documento(sesion, cuenta_ids, message_id, part_id)
             if documento_id is None:
                 logger.warning("Envios sin documento en la base (se ligan al importar) message_id=%s part_id=%s", message_id, part_id)
                 return 0, 0
@@ -387,11 +416,11 @@ class EnviosDb:
             return nuevos, actualizados
 
     def listar(self, email: str, message_id: str, part_id: str) -> list[dict[str, Any]]:
-        cuenta_id = self.cuentas.id_de(email, crear=False)
-        if cuenta_id is None:
+        cuenta_ids = self.cuentas.ids_de(email)
+        if not cuenta_ids:
             return []
         with self.sesiones.begin() as sesion:
-            documento_id = _id_documento(sesion, cuenta_id, message_id, part_id)
+            documento_id = _id_documento(sesion, cuenta_ids, message_id, part_id)
             if documento_id is None:
                 return []
             filas = sesion.scalars(select(Envio).where(Envio.documento_id == documento_id).order_by(Envio.intento, Envio.id)).all()

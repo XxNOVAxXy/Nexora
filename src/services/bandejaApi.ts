@@ -29,6 +29,8 @@ export type DocumentoBandeja = {
   /** Código del motivo: `gemini_http_502`, `ia_no_disponible`, `pdf_protegido`… */
   motivo?: string | null
   proceso?: { estado: EstadoDocumento; motivo: string | null; mensaje: string | null; actualizado: string | null } | null
+  /** Solo en «Con error»: intentos de la extracción automática y cuándo es el siguiente. */
+  reintento?: { intentos: number; max: number; proximo_intento: string | null; en_espera: boolean; causa: string | null; automatico: boolean }
 }
 
 export type EventoProceso = {

@@ -15,6 +15,16 @@ export const MOTIVO_BANDEJA: Record<CodigoBandeja, { texto: string; ayuda: strin
   ia_no_disponible: { texto: 'IA no disponible', ayuda: 'La IA no respondió en 3 intentos. «Reprocesar» lo intenta de nuevo o captúralo a mano.', clase: 'bg-red-50 text-red-700' },
 }
 
+/** «Intento 1/3 · siguiente intento automático: 24 nov 2026, 12:40» (hora de México). */
+export function textoReintento(documento: DocumentoBandeja): string | null {
+  const reintento = documento.reintento
+  if (!reintento) return null
+  const intentos = `Intento ${Math.min(reintento.intentos, reintento.max)}/${reintento.max}`
+  if (!reintento.automatico) return reintento.intentos > 0 ? `${intentos} · sin reintento automático` : null
+  if (reintento.en_espera && reintento.proximo_intento) return `${intentos} · siguiente intento automático: ${fechaHora(reintento.proximo_intento)}`
+  return `${intentos} · se reintenta en la siguiente revisión`
+}
+
 /** Motivo de un documento en error, en palabras. */
 export function textoMotivoError(documento: DocumentoBandeja): string {
   const motivo = documento.motivo ?? ''
@@ -28,10 +38,10 @@ export function textoMotivoError(documento: DocumentoBandeja): string {
   return motivo ? motivo.replace(/_/g, ' ') : 'Error'
 }
 
+const fechaHora = (valor: string | null | undefined) => (valor ? formatoMexico({ dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
 const ETAPA: Record<EventoProceso['etapa'], string> = { lectura: 'Lectura', diagnostico: 'Diagnóstico', extraccion: 'Extracción', envio: 'Envío' }
 const ESTADOS: { valor: EstadoBandeja; texto: string }[] = [{ valor: 'pendiente', texto: 'Pendientes' }, { valor: 'error', texto: 'Con error' }, { valor: 'resuelto', texto: 'Resueltos' }, { valor: 'descartado', texto: 'Descartados' }]
 
-const fechaHora = (valor: string | null | undefined) => (valor ? formatoMexico({ dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
 const clave = (documento: DocumentoBandeja) => `${documento.message_id}__${documento.part_id}`
 type Aviso = { id: string; ok: boolean; mensaje: string }
 
@@ -140,6 +150,7 @@ export function BandejaCapturaPage() {
             <div className="flex flex-wrap items-center gap-2"><FileText size={16} className="shrink-0 text-slate-400" /><span className="truncate font-semibold text-ink">{documento.nombre || 'Documento'}</span>{motivo && <span className={`rounded-full px-2 py-0.5 text-[11px] font-bold ${motivo.clase}`}>{motivo.texto}</span>}{enError && <span className="rounded-full bg-red-50 px-2 py-0.5 text-[11px] font-bold text-red-700">{textoMotivoError(documento)}</span>}</div>
             <div className="mt-1 text-xs text-slate-500">{documento.asunto || 'Sin asunto'}{documento.remitente ? ` · ${documento.remitente}` : ''} · Recibido {fechaHora(documento.recibido_en)} · En la bandeja desde {fechaHora(bandeja?.entrada_en)}</div>
             {enError && <div className="mt-1.5 flex items-start gap-1.5 text-xs text-red-700"><AlertTriangle size={13} className="mt-0.5 shrink-0" /><span>{documento.proceso?.mensaje ?? 'El documento se recibió pero no terminó de procesarse.'} «Reintentar» lo vuelve a extraer ahora.</span></div>}
+            {enError && textoReintento(documento) && <div data-testid="reintento" className="mt-1 text-xs font-semibold text-slate-600">{textoReintento(documento)}</div>}
             {!enError && bandeja?.mensaje && <div className="mt-1.5 flex items-start gap-1.5 text-xs text-slate-700"><AlertTriangle size={13} className="mt-0.5 shrink-0 text-amber-600" /><span>{bandeja.mensaje}{motivo ? ` ${motivo.ayuda}` : ''}</span></div>}
             {!enError && bandeja && bandeja.estado !== 'pendiente' && <div className="mt-1 text-xs text-slate-500">{bandeja.estado === 'resuelto' ? 'Resuelto' : 'Descartado'} {fechaHora(bandeja.resuelto_en)}{bandeja.resolucion ? ` (${bandeja.resolucion.replace(/_/g, ' ')})` : ''}</div>}
           </div>

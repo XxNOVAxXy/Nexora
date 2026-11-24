@@ -139,6 +139,7 @@ class ServicioRecepcion:
         documento ya recibido; nunca detiene el proceso (un fallo queda en el log)."""
         try:
             if self.documentos.obtener(email, message_id, part_id) is None:
+                logger.warning("No se encontro el documento para marcarlo estado=%s motivo=%s message_id=%s part_id=%s", estado, motivo, message_id, part_id)
                 return None
             ahora = self._ahora()
 
@@ -147,10 +148,18 @@ class ServicioRecepcion:
                 registro["proceso"] = {"estado": estado, "motivo": (motivo or None) and str(motivo)[:50], "mensaje": (mensaje or None) and str(mensaje)[:300], "actualizado": ahora}
                 registro["actualizado"] = ahora
                 return registro
-            return self.documentos.actualizar(email, message_id, part_id, cambio)
-        except Exception:
+            registro = self.documentos.actualizar(email, message_id, part_id, cambio)
+        except Exception as error:
             logger.exception("No se pudo marcar el estado del documento message_id=%s part_id=%s", message_id, part_id)
+            self.evento(email, "extraccion", "estado_no_guardado", f"No se pudo guardar el estado {estado} ({motivo or '-'}): {error.__class__.__name__}: {error}"[:500],
+                        message_id=message_id, part_id=part_id, detalle={"estado": estado, "motivo": motivo})
             return None
+        # Se vuelve a leer: lo que importa es lo que quedó guardado.
+        guardado = self.documentos.obtener(email, message_id, part_id)
+        if guardado is None or estado_y_motivo(guardado)[0] not in {estado, "captura_manual", "descartado"}:
+            logger.error("El estado del documento no quedo guardado estado=%s message_id=%s part_id=%s", estado, message_id, part_id)
+            self.evento(email, "extraccion", "estado_no_guardado", f"El estado {estado} ({motivo or '-'}) no quedo guardado.", message_id=message_id, part_id=part_id)
+        return guardado or registro
 
     @staticmethod
     def estado(registro: dict[str, Any]) -> tuple[str, str | None]:

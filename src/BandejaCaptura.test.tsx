@@ -94,7 +94,9 @@ describe('Bandeja de captura manual', () => {
 
   it('«Con error»: muestra el motivo (como el 502 de Gemini o un documento sin terminar) y «Reintentar»', async () => {
     const conError = documento({ nombre: 'GNP GMM.pdf', bandeja: null, estado: 'error', motivo: 'gemini_http_502',
-      proceso: { estado: 'error', motivo: 'gemini_http_502', mensaje: 'El modelo de Gemini no esta disponible: gemini-2.5-flash-lite', actualizado: '2026-11-24T18:00:00Z' } })
+      proceso: { estado: 'error', motivo: 'gemini_http_502', mensaje: 'El modelo de Gemini no esta disponible: gemini-2.5-flash-lite', actualizado: '2026-11-24T18:00:00Z' },
+      // En espera: 18:40 UTC = 12:40 en hora de México.
+      reintento: { intentos: 1, max: 3, proximo_intento: '2026-11-24T18:40:00+00:00', en_espera: true, causa: 'gemini_http_502', automatico: true } })
     const sinTerminar = documento({ message_id: 'm2', nombre: 'otro.pdf', bandeja: null, estado: 'leido', motivo: null, proceso: null })
     listarMock.mockResolvedValue({ documentos: [conError, sinTerminar], motivos: {} })
     reintentarMock.mockResolvedValue({ estado: 'extraido', mensaje: 'Extraido: revisalo en Extraccion antes de enviarlo.', documento: null })
@@ -104,6 +106,9 @@ describe('Bandeja de captura manual', () => {
     const fila = (await screen.findByText('GNP GMM.pdf')).closest('li')!
     expect(within(fila).getByText('IA no disponible (502)')).toBeTruthy()
     expect(within(fila).getByText(/gemini-2.5-flash-lite/)).toBeTruthy()
+    const reintento = within(fila).getByTestId('reintento').textContent ?? ''
+    expect(reintento).toContain('Intento 1/3 · siguiente intento automático:')
+    expect(reintento).toContain('12:40')
     expect(within(screen.getByText('otro.pdf').closest('li')!).getByText('Sin terminar')).toBeTruthy()
     fireEvent.click(within(fila).getByRole('button', { name: /Reintentar/ }))
     await waitFor(() => expect(screen.queryByText('GNP GMM.pdf')).toBeNull())

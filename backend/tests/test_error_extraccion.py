@@ -59,7 +59,7 @@ class Caso502:
         resumen = self.extractor.ejecutar_ciclo()
         self.assertEqual((resumen["correos_encontrados"], resumen["extraidos"], resumen["errores"]), (1, 0, 1))
         self.assertEqual(self.estado(), ("error", "gemini_http_502"))
-        self.assertEqual(self.eventos(), [("lectura", "ok"), ("diagnostico", "ok"), ("extraccion", "gemini_http_502")])
+        self.assertEqual(self.eventos(), [("lectura", "ok"), ("diagnostico", "ok"), ("extraccion", "gemini_http_502"), ("extraccion", "reintento_programado")])
         # Aviso rojo del ciclo y texto del resumen.
         avisos = self.extractor.estado(EMAIL)["avisos"]
         self.assertTrue(any(aviso["tipo"] == "error" and "1 documento con error" in aviso["texto"] for aviso in avisos))
@@ -78,7 +78,10 @@ class Caso502:
         self.assertEqual(self.estado(), ("captura_manual", "ia_no_disponible"))
         bandeja = self.recepcion.bandeja(EMAIL)
         self.assertEqual([(r["message_id"], r["bandeja"]["codigo"]) for r in bandeja], [("m29", "ia_no_disponible")])
-        self.assertEqual([codigo for etapa, codigo in self.eventos() if etapa == "extraccion"], ["gemini_http_502"] * MAX_INTENTOS)
+        self.assertEqual([codigo for _etapa, codigo in self.eventos() if codigo.startswith("gemini_")], ["gemini_http_502"] * MAX_INTENTOS)
+        # Dos reintentos programados (antes del 2.º y del 3.er intento) y la espera del ciclo que no llamó a la IA.
+        self.assertEqual([codigo for _etapa, codigo in self.eventos()].count("reintento_programado"), 2)
+        self.assertIn(("extraccion", "reintento_en_espera"), self.eventos())
 
     def test_si_la_ia_vuelve_se_extrae_en_el_siguiente_intento(self) -> None:
         self.gemini.fallar = ERROR_502
@@ -104,8 +107,14 @@ class Caso502:
         self.assertEqual(len(self.gemini.llamadas), 3)
 
     def test_ningun_documento_se_queda_en_leido(self) -> None:
-        # Aunque un paso no deje estado (aquí se apaga a propósito), la red de seguridad lo deja en error con su evento.
+        # Aunque un paso no deje estado (aquí se apaga a propósito), la red de seguridad lo toma del registro del proceso.
         with patch.object(ExtractorAutomatico, "_marcar", lambda *_args, **_kwargs: None):
+            self.extractor.ejecutar_ciclo()
+        self.assertEqual(self.estado(), ("extraido", None))
+        self.assertIn(("extraccion", "estado_recuperado"), self.eventos())
+
+    def test_sin_forma_de_saber_el_estado_queda_en_error(self) -> None:
+        with patch.object(ExtractorAutomatico, "_marcar", lambda *_args, **_kwargs: None), patch.object(ExtractorAutomatico, "_estado_final", return_value=None):
             self.extractor.ejecutar_ciclo()
         self.assertEqual(self.estado(), ("error", "sin_estado_final"))
         self.assertIn(("extraccion", "sin_estado_final"), self.eventos())
@@ -158,9 +167,14 @@ class Caso502Db(Caso502, unittest.TestCase):
         fila = self.fila()
         self.assertEqual((fila.nombre_archivo, fila.estado, fila.motivo), ("GNP GMM.pdf", "error", "gemini_http_502"))
         with self.sesiones() as sesion:
-            evento = sesion.scalars(sa.select(Evento).where(Evento.etapa == "extraccion")).one()
+            evento = sesion.scalars(sa.select(Evento).where(Evento.codigo == "gemini_http_502")).one()
+            programado = sesion.scalars(sa.select(Evento).where(Evento.codigo == "reintento_programado")).one()
         self.assertEqual((evento.resultado, evento.codigo, evento.documento_id, evento.origen), ("error", "gemini_http_502", fila.id, "automatico"))
         self.assertEqual(evento.detalle["temporal"], True)
+        # Aviso con la hora del siguiente intento (UTC en detalle, hora de México en el mensaje).
+        self.assertEqual((programado.resultado, programado.documento_id), ("aviso", fila.id))
+        self.assertEqual(programado.detalle["proximo_intento"], (INICIO + ESPERAS_REINTENTO[0]).isoformat(timespec="seconds"))
+        self.assertIn("(hora de Mexico)", programado.mensaje)
         for espera in ESPERAS_REINTENTO:
             self.ahora += espera
             self.extractor.ejecutar_ciclo()

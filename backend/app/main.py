@@ -15,7 +15,7 @@ from .adjuntos import content_disposition
 from .originales import AlmacenOriginales
 from .recepcion import MOTIVOS_BANDEJA, ServicioRecepcion
 from .almacenamiento import crear_repositorios, salud_db
-from .automatico import ExtractorAutomatico, intervalo_desde_entorno
+from .automatico import MAX_INTENTOS, ExtractorAutomatico, intervalo_desde_entorno
 from .plantilla_campos import AlmacenPlantillas, PlantillaRequest, aplicar_plantilla, comparable, deducir_campos, sugerencias_para_configurar
 from .config import settings
 from .preferencias import AlmacenClasificaciones, ClasificacionRequest, ConfiguracionCuenta, MigracionRequest, RemitentesRequest
@@ -587,8 +587,40 @@ def salud_base_datos() -> dict[str, Any]:
 def listar_bandeja(estado: str = Query("pendiente", pattern="^(pendiente|resuelto|descartado|error)$")) -> dict[str, Any]:
     """``error``: documentos en error o que se quedaron sin terminar (``leido``), con el botón "Reintentar"."""
     email = _cuenta_actual()
-    registros = recepcion.con_error(email) if estado == "error" else recepcion.bandeja(email, estado)
-    return {"documentos": [_documento_publico(registro) for registro in registros], "motivos": MOTIVOS_BANDEJA}
+    if estado != "error":
+        return {"documentos": [_documento_publico(registro) for registro in recepcion.bandeja(email, estado)], "motivos": MOTIVOS_BANDEJA}
+    return {"documentos": _documentos_con_error(email), "motivos": MOTIVOS_BANDEJA}
+
+
+def _documentos_con_error(email: str) -> list[dict[str, Any]]:
+    """En error, sin terminar (leido) o en espera de reintento automático, con cuántos intentos van y cuándo es el siguiente."""
+    try:
+        adjuntos = automatico.registro_adjuntos(email)
+    except Exception:
+        logger.exception("No se pudo leer el registro del proceso automatico")
+        adjuntos = {}
+    registros = {f"{r['message_id']}__{r['part_id']}": r for r in recepcion.con_error(email)}
+    # En espera de reintento aunque su estado guardado diga otra cosa (nunca deben faltar en esta lista).
+    for clave, entrada in adjuntos.items():
+        if clave in registros or entrada.get("estado") != "pendiente" or not (entrada.get("proximo_intento") or entrada.get("intentos")):
+            continue
+        message_id, _, part_id = clave.partition("__")
+        registro = recepcion.documentos.obtener(email, message_id, part_id)
+        if registro is not None and recepcion.estado(registro)[0] not in {"captura_manual", "descartado", "extraido", "enviado"}:
+            registros[clave] = registro
+    ahora = datetime.now(timezone.utc)
+    resultado = []
+    for clave, registro in registros.items():
+        entrada = adjuntos.get(clave) or {}
+        proximo = entrada.get("proximo_intento") if entrada.get("estado") == "pendiente" else None
+        try:
+            en_espera = bool(proximo) and datetime.fromisoformat(str(proximo)) > ahora
+        except ValueError:
+            en_espera = False
+        resultado.append({**_documento_publico(registro), "reintento": {
+            "intentos": int(entrada.get("intentos") or 0), "max": MAX_INTENTOS, "proximo_intento": proximo, "en_espera": en_espera,
+            "causa": entrada.get("causa"), "automatico": entrada.get("estado") == "pendiente"}})
+    return resultado
 
 
 @app.post("/api/documentos/{message_id}/{part_id}/reintentar")
