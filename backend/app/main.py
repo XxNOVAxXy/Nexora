@@ -35,6 +35,7 @@ from .tipos_documento import (
     direccion,
     para_clasificar,
     tipo_para_extraer,
+    campos_version,
 )
 from .plantilla_campos import CampoPlantilla
 from .estado_envio import estado_envio
@@ -83,7 +84,15 @@ def tipo_del_documento(email: str, documento: dict[str, Any]) -> dict[str, Any] 
     tipo_documento = documento.get("tipo_documento")
     if not tipo_documento:
         return tipos.obtener(email, TIPO_EC_ID)
-    return tipos.obtener(email, tipo_documento.get("tipo_id")) if tipo_documento.get("tipo_id") else None
+    tipo = tipos.obtener(email, tipo_documento.get("tipo_id")) if tipo_documento.get("tipo_id") else None
+    if tipo is None or tipo.get("contable"):
+        return tipo
+    # Los campos de la versión con que se extrajo el documento (v1, v2…), no siempre los de la versión activa.
+    try:
+        campos, _numero = campos_version(tipo, tipo_documento.get("estructura_id"), tipo_documento.get("version_campos"))
+    except KeyError:
+        campos, _numero = campos_version(tipo, tipo_documento.get("estructura_id"))
+    return {**tipo, "campos": campos}
 
 
 def campos_del_documento(email: str, documento: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1076,6 +1085,89 @@ def editar_tipo(tipo_id: str, payload: TipoRequest) -> dict[str, Any]:
     except (ConflictoTipos, KeyError) as error:
         raise _error_tipos(error) from error
     return {"tipo": tipo, **_tipos_publicos(email)}
+
+
+class VersionNuevaRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    estructura_id: str | None = Field(default=None, max_length=64)
+    campos: list[dict[str, Any]] = Field(min_length=1, max_length=30)
+    nota: str | None = Field(default=None, max_length=300)
+
+
+class VersionActivaRequest(BaseModel):
+    version: int = Field(ge=1, le=999)
+
+
+class CompararRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    attachmentId: str | None = Field(default=None, max_length=512)
+
+
+class ReprocesarVersionRequest(CompararRequest):
+    version: int = Field(ge=1, le=999)
+
+
+@app.post("/api/tipos/{tipo_id}/versiones")
+def crear_version(tipo_id: str, payload: VersionNuevaRequest) -> dict[str, Any]:
+    """«Tienes 5 campos, la IA encontró 10. ¿Agregar?»: crea una versión nueva de la estructura (v1 → v2) sin borrar la anterior."""
+    email = _cuenta_actual()
+    try:
+        resultado = tipos.nueva_version(email, tipo_id, payload.estructura_id, payload.campos, nota=payload.nota)
+    except (ConflictoTipos, KeyError) as error:
+        raise _error_tipos(error) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {**resultado, **_tipos_publicos(email)}
+
+
+@app.put("/api/tipos/{tipo_id}/estructuras/{estructura_id}/version-activa")
+def elegir_version(tipo_id: str, estructura_id: str, payload: VersionActivaRequest) -> dict[str, Any]:
+    email = _cuenta_actual()
+    try:
+        tipos.activar_version(email, tipo_id, estructura_id, payload.version)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="No existe esa estructura o esa version.") from error
+    return _tipos_publicos(email)
+
+
+@app.post("/api/extracciones/{message_id}/{part_id}/comparar")
+def comparar_con_ia(message_id: str, part_id: str, payload: CompararRequest) -> dict[str, Any]:
+    """«Comparar con IA»: reglas y Gemini sobre el mismo documento, lado a lado."""
+    _ids_validos(message_id, part_id)
+    email = _cuenta_actual()
+    try:
+        return automatico.comparar(email, message_id, part_id, payload.attachmentId)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error.args[0]) if error.args else "No se encontro el documento.") from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except GeminiUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except GeminiRequestError as error:
+        raise HTTPException(status_code=error.status_code, detail={"code": error.code, "message": str(error), "retryable": error.retryable}) from error
+    except GmailNotConnectedError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+
+
+@app.post("/api/extracciones/{message_id}/{part_id}/reprocesar-version")
+def reprocesar_con_version(message_id: str, part_id: str, payload: ReprocesarVersionRequest) -> dict[str, Any]:
+    """Reprocesa el documento con otra versión de los campos de su estructura (reemplaza la extracción; queda en borrador)."""
+    _ids_validos(message_id, part_id)
+    email = _cuenta_actual()
+    try:
+        return automatico.reprocesar_version(email, message_id, part_id, payload.version, payload.attachmentId)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error.args[0]) if error.args else "No existe esa version.") from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except (ConflictoVersion, EnvioEnCurso) as error:
+        raise HTTPException(status_code=409, detail="El documento cambio mientras se reprocesaba; recargalo.") from error
+    except GeminiUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except GeminiRequestError as error:
+        raise HTTPException(status_code=error.status_code, detail={"code": error.code, "message": str(error), "retryable": error.retryable}) from error
 
 
 @app.post("/api/tipos/{tipo_id}/estructuras")

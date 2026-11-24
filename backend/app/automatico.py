@@ -66,7 +66,7 @@ from .orden_fechas import ordenar_por_fecha
 from .plantilla_campos import AlmacenPlantillas, deducir_campos
 from .recepcion import ServicioRecepcion
 from .reglas_extraccion import extraer_por_reglas, leer_documento, ocr_disponible, texto_de
-from .tipos_documento import (AlmacenTipos, detectar_por_reglas, detectar_por_texto, deteccion_manual, direccion, finalizar_deteccion, huella_documento,
+from .tipos_documento import (AlmacenTipos, campos_version, detectar_por_reglas, detectar_por_texto, deteccion_manual, direccion, finalizar_deteccion, huella_documento,
                               modo_predeterminado, para_clasificar, resolver_clasificacion, tipo_para_extraer)
 
 logger = logging.getLogger("nexora.automatico")
@@ -116,6 +116,18 @@ HORA_MEXICO = timezone(timedelta(hours=-6), "hora de Mexico")
 def hora_mexico(momento: datetime) -> str:
     """"24/11/2026 12:40 (hora de Mexico)" para los mensajes de los eventos (la fecha del evento va en UTC)."""
     return momento.astimezone(HORA_MEXICO).strftime("%d/%m/%Y %H:%M") + " (hora de Mexico)"
+
+
+def valores_por_campo(resultado: dict[str, Any]) -> dict[str, str]:
+    """{nombre del campo: valor} de un resultado (reglas o IA); los de cada fila se juntan con " | "."""
+    valores: dict[str, str] = {}
+    for item in resultado.get("resultados_campos") or []:
+        nombre = str(item.get("nombre") or "")
+        if not nombre:
+            continue
+        filas = [str(valor.get("valor") or "") for valor in item.get("valores") or [] if valor.get("valor")]
+        valores[nombre] = (str(item.get("valor_documento") or "") if item.get("encontrado") and not filas else " | ".join(filas))[:500] if item.get("encontrado") else ""
+    return valores
 
 
 def texto_extraccion(deteccion: dict[str, Any], resultado: dict[str, Any], *, al_reprocesar: bool = False) -> str:
@@ -1116,15 +1128,20 @@ class ExtractorAutomatico:
         return deteccion, tipo
 
     def _extraer_documento(self, email: str, data: bytes, media_type: str, filename: str, mensaje: dict[str, Any], campos_ec: list[dict[str, Any]], *,
-                           tipo: dict[str, Any] | None = None, deteccion: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+                           tipo: dict[str, Any] | None = None, deteccion: dict[str, Any] | None = None, version: int | None = None,
+                           modo_forzado: str | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         """Detecta el tipo (si no se da) y extrae según su modo: ``manual`` con las reglas de sus campos (nunca Gemini),
         ``ia`` con Gemini. Devuelve (detección, campos del tipo, resultado con la forma del de Gemini)."""
         lectura = leer_documento(data, media_type)
         if tipo is None:
             deteccion, tipo = self._detectar(email, data, media_type, filename, mensaje, texto_de(lectura))
         assert deteccion is not None
-        campos = campos_ec if tipo is not None and tipo.get("contable") else list((tipo or {}).get("campos") or [])
-        modo = (tipo or {}).get("modo") or modo_predeterminado()
+        if tipo is not None and tipo.get("contable"):
+            campos, numero_version = campos_ec, None
+        else:
+            # Los campos de la versión activa de la estructura (o la versión pedida al reprocesar).
+            campos, numero_version = campos_version(tipo, deteccion.get("estructura_id"), version) if tipo is not None else ([], None)
+        modo = modo_forzado or (tipo or {}).get("modo") or modo_predeterminado()
         if modo == "ia":
             extraer = tipo_para_extraer(tipo)
             if not self.gemini.status().get("enabled"):
@@ -1138,12 +1155,105 @@ class ExtractorAutomatico:
             resultado = extraer_por_reglas(data, media_type, filename, campos, seccion=((tipo or {}).get("seccion") or {}).get("nombre"), contable=bool((tipo or {}).get("contable")),
                                            codigo_tipo=(tipo or {}).get("codigo"), aseguradoras=aseguradoras, lectura=lectura)
         faltantes = list(resultado.get("faltantes") or [])
-        deteccion = {**deteccion, "modo": modo, "encontrados": resultado.get("encontrados"), "total_campos": resultado.get("total_campos"), "faltantes": faltantes or None}
+        deteccion = {**deteccion, "modo": modo, "encontrados": resultado.get("encontrados"), "total_campos": resultado.get("total_campos"), "faltantes": faltantes or None,
+                     "version_campos": numero_version}
         if faltantes and not deteccion.get("requiere_revision"):
             # Campos obligatorios sin encontrar: se guarda como borrador revisable y no se envía solo.
             deteccion.update(requiere_revision=True, motivo=f"Faltan campos obligatorios: {', '.join(faltantes)}"[:300])
         logger.info("Extraccion modo=%s encontrados=%s/%s faltantes=%d ocr=%s", modo, resultado.get("encontrados"), resultado.get("total_campos"), len(faltantes), resultado.get("ocr"))
         return deteccion, campos, resultado
+
+    # --- Comparación reglas vs IA y reprocesar con otra versión (Fase 4) ----------------------------
+
+    def _original(self, email: str, message_id: str, part_id: str, attachment_id: str | None = None) -> tuple[bytes, str, str]:
+        """El archivo del documento: el original guardado en disco o, si no está, el adjunto del correo."""
+        if self.recepcion is not None:
+            original = self.recepcion.original(email, message_id, part_id)
+            if original is not None:
+                return original
+        if not attachment_id:
+            mensaje = self.gmail.get_message(message_id)
+            adjunto = next((item for item in mensaje.get("attachments") or [] if str(item.get("partId")) == part_id), None)
+            attachment_id = str((adjunto or {}).get("id") or "")
+        if not attachment_id:
+            raise ValueError("No se encontro el archivo del documento.")
+        return self.gmail.attachment(message_id, attachment_id)
+
+    def _tipo_del_guardado(self, email: str, message_id: str, part_id: str) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any] | None]:
+        actual = self.almacen.obtener(email, message_id, part_id)
+        tipo_documento = (actual or {}).get("tipo_documento") or {}
+        tipos = self.tipos.leer(email)
+        tipo = next((item for item in tipos if item["id"] == tipo_documento.get("tipo_id")), None) if tipo_documento else self.tipos.obtener(email, "tipo-ec")
+        return tipo, tipo_documento, actual
+
+    def comparar(self, email: str, message_id: str, part_id: str, attachment_id: str | None = None) -> dict[str, Any]:
+        """Corre las reglas y Gemini sobre el mismo documento y devuelve los valores de cada campo lado a lado, más los
+        campos que la IA encontró y que la estructura no tiene ("Tienes 5 campos, la IA encontró 10")."""
+        tipo, tipo_documento, _actual = self._tipo_del_guardado(email, message_id, part_id)
+        if tipo is None:
+            raise KeyError("El documento no tiene un tipo; configúralo antes de comparar.")
+        if not self.gemini.status().get("enabled"):
+            raise GeminiUnavailableError("Gemini no esta configurado: la comparacion necesita la IA.")
+        data, media_type, nombre = self._original(email, message_id, part_id, attachment_id)
+        contable = bool(tipo.get("contable"))
+        if contable:
+            campos, numero = self.campos_configurados(email), None
+        else:
+            campos, numero = campos_version(tipo, tipo_documento.get("estructura_id"), tipo_documento.get("version_campos"))
+        lectura = leer_documento(data, media_type)
+        reglas = extraer_por_reglas(data, media_type, nombre, campos, seccion=(tipo.get("seccion") or {}).get("nombre"), contable=contable, codigo_tipo=tipo.get("codigo"), lectura=lectura)
+        extraer = tipo_para_extraer(tipo)
+        ia = self.gemini.extract_document(data, media_type, nombre, campos_solicitados=[campo["nombre"] for campo in campos], **({} if extraer is None else {"tipo": extraer}))
+        manual_valores = valores_por_campo(reglas)
+        ia_valores = valores_por_campo(ia)
+        configurados = {clave_campo(campo["nombre"]) for campo in campos}
+        sugerencias = []
+        for sugerencia in ia.get("sugerencias_campos") or []:
+            nombre_campo = str(sugerencia.get("nombre") or "").strip()
+            if not nombre_campo or clave_campo(nombre_campo) in configurados:
+                continue
+            valores = [str(item.get("valor") or "") for item in sugerencia.get("valores") or [] if item.get("valor")]
+            alcance = "movimiento" if valores and tipo.get("seccion") and not sugerencia.get("valor_documento") else "documento"
+            ejemplo = str(sugerencia.get("valor_documento") or (valores[0] if valores else ""))[:200]
+            sugerencias.append({"nombre": nombre_campo, "alcance": alcance, "ejemplo": ejemplo})
+            ia_valores[nombre_campo] = ejemplo or " | ".join(valores)[:500]
+        estructura = None if contable else next((item for item in tipo.get("estructuras") or [] if item.get("id") == tipo_documento.get("estructura_id")), None)
+        from .tipos_documento import estructura_de
+
+        estructura = None if contable else (estructura or estructura_de(tipo, tipo_documento.get("estructura_id")))
+        self._evento(email, "extraccion", "comparacion", f"Comparacion reglas vs IA: reglas {reglas.get('encontrados')} de {len(campos)}, IA {sum(1 for v in ia_valores.values() if v)} campos.",
+                     message_id, part_id, origen="manual", detalle={"version": numero, "sugerencias": len(sugerencias)})
+        return {
+            "tipo": {"id": tipo["id"], "nombre": tipo["nombre"], "codigo": tipo["codigo"], "contable": contable},
+            "estructura": None if estructura is None else {"id": estructura["id"], "nombre": estructura["nombre"], "version_activa": estructura.get("version_activa") or 1,
+                                                          "versiones": [item["numero"] for item in estructura.get("versiones") or []] or [1]},
+            "version_usada": numero,
+            "campos": [{"nombre": campo["nombre"], "alcance": campo.get("alcance")} for campo in campos],
+            "manual": manual_valores,
+            "ia": ia_valores,
+            "sugerencias": sugerencias,
+            "campos_configurados": len(campos),
+            "ia_encontrados": sum(1 for valor in ia_valores.values() if valor),
+            "modelo": ia.get("model"),
+        }
+
+    def reprocesar_version(self, email: str, message_id: str, part_id: str, version: int, attachment_id: str | None = None) -> dict[str, Any]:
+        """Vuelve a extraer el documento con OTRA versión de los campos de su estructura y reemplaza la extracción guardada
+        (queda como borrador para revisarla). Usa el modo del tipo (manual: reglas; ia: Gemini)."""
+        tipo, tipo_documento, actual = self._tipo_del_guardado(email, message_id, part_id)
+        if tipo is None or tipo.get("contable"):
+            raise KeyError("Solo los tipos con estructuras tienen versiones (Estado de cuenta no).")
+        data, media_type, nombre = self._original(email, message_id, part_id, attachment_id)
+        deteccion = {**finalizar_deteccion(tipo, metodo="manual", estructura=None), **{k: v for k, v in tipo_documento.items() if k in ("estructura_id", "estructura", "aseguradora", "remitente")}}
+        deteccion, campos, resultado = self._extraer_documento(email, data, media_type, nombre, {}, self.campos_configurados(email), tipo=tipo, deteccion=deteccion, version=version)
+        solicitud = borrador_desde_extraccion(resultado, campos, filename=nombre or str((actual or {}).get("filename") or ""), attachment_id=attachment_id or (actual or {}).get("attachmentId"),
+                                              lote=uuid.uuid4().hex[:8], tipo_documento=TipoDocumentoGuardado.model_validate(deteccion).model_dump())
+        solicitud.version_base = None if actual is None else actual.get("version")
+        documento = self.almacen.guardar(email, message_id, part_id, solicitud)
+        self._evento(email, "extraccion", "ok", f"Reprocesado con la version {version}: {texto_extraccion(deteccion, resultado)}"[:500], message_id, part_id, origen="manual",
+                     detalle={**detalle_extraccion(deteccion, resultado, documento), "version": version})
+        self._marcar_extraido(email, message_id, part_id, deteccion)
+        return {"documento": documento, "version": version, "encontrados": resultado.get("encontrados"), "total_campos": resultado.get("total_campos")}
 
     def _marcar_extraido(self, email: str, message_id: str, part_id: str, deteccion: dict[str, Any]) -> None:
         if self.recepcion is None:

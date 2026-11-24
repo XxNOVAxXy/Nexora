@@ -448,6 +448,82 @@ class AlmacenTipos:
                 self._escribir(email, datos)
             return self._publico(email, tipo), agregados
 
+    # --- Versiones de campos de una estructura (v1 → v2…) ------------------------------------------
+
+    def nueva_version(self, email: str, tipo_id: str, estructura_id: str | None, campos_nuevos: list[dict[str, Any]], *, origen: str = "ia",
+                      nota: str | None = None) -> dict[str, Any]:
+        """Crea una VERSIÓN NUEVA de los campos de la estructura (la activa + ``campos_nuevos``) sin borrar las anteriores,
+        y la deja como activa. La primera vez guarda los campos de entonces como v1. Sin estructura, usa (o crea)
+        «Predeterminada». Estado de cuenta no tiene versiones: sus campos son la configuración de campos."""
+        if tipo_id == TIPO_EC_ID:
+            raise ConflictoTipos("Estado de cuenta no tiene versiones: sus campos se editan en Configuración de campos.")
+        with self._lock:
+            datos = self._leer_archivo(email)
+            tipo = next((item for item in datos["tipos"] if item["id"] == tipo_id), None)
+            if tipo is None:
+                raise KeyError(tipo_id)
+            estructura = self._estructura_para_versiones(tipo, estructura_id)
+            ahora = _ahora()
+            versiones = estructura.setdefault("versiones", [])
+            if not versiones:
+                versiones.append({"numero": 1, "campos": [dict(campo) for campo in tipo.get("campos") or []], "creado": ahora, "origen": "inicial", "nota": None})
+            activa = next((item for item in versiones if item["numero"] == estructura.get("version_activa")), versiones[-1])
+            campos = [dict(campo) for campo in activa["campos"]]
+            existentes = {comparable(campo.get("nombre", "")) for campo in campos}
+            ids = {campo.get("id") for campo in campos}
+            agregados = []
+            for nuevo in campos_nuevos:
+                nombre = _texto(str(nuevo.get("nombre") or ""), 60)
+                if not nombre or comparable(nombre) in existentes:
+                    continue
+                nuevo_id = plantillas_tipos.id_campo(nombre).replace("pd-", "pl-", 1)
+                while nuevo_id in ids:
+                    nuevo_id = f"{nuevo_id}-{len(campos) + 1}"
+                alcance = "movimiento" if nuevo.get("alcance") == "movimiento" and tipo.get("seccion") else "documento"
+                campos.append({"id": nuevo_id, "nombre": nombre, "origen": "ia" if origen == "ia" else "manual", "alcance": alcance})
+                existentes.add(comparable(nombre))
+                ids.add(nuevo_id)
+                agregados.append(nombre)
+            if not agregados:
+                raise ConflictoTipos("No hay campos nuevos que agregar: ya están todos en la versión activa.")
+            if len(campos) > MAX_CAMPOS_EXTRA:
+                raise ConflictoTipos(f"Se admiten como máximo {MAX_CAMPOS_EXTRA} campos por tipo.")
+            TipoRequest.model_validate({**tipo, "campos": campos})
+            numero = max(item["numero"] for item in versiones) + 1
+            versiones.append({"numero": numero, "campos": campos, "creado": ahora, "origen": origen, "nota": (nota or f"Agregados: {', '.join(agregados)}")[:300]})
+            estructura["version_activa"] = numero
+            estructura["actualizado"] = ahora
+            self._escribir(email, datos)
+            return {"tipo": self._publico(email, tipo), "estructura": estructura, "version": numero, "agregados": agregados}
+
+    def activar_version(self, email: str, tipo_id: str, estructura_id: str, numero: int) -> dict[str, Any]:
+        """Elige qué versión de los campos usa la estructura desde ahora (las otras se conservan)."""
+        with self._lock:
+            datos = self._leer_archivo(email)
+            tipo = next((item for item in datos["tipos"] if item["id"] == tipo_id), None)
+            estructura = next((item for item in (tipo or {}).get("estructuras") or [] if item["id"] == estructura_id), None)
+            if tipo is None or estructura is None:
+                raise KeyError(estructura_id)
+            if not any(item["numero"] == numero for item in estructura.get("versiones") or []):
+                raise KeyError(f"v{numero}")
+            estructura["version_activa"] = numero
+            estructura["actualizado"] = _ahora()
+            self._escribir(email, datos)
+            return self._publico(email, tipo)
+
+    @staticmethod
+    def _estructura_para_versiones(tipo: dict[str, Any], estructura_id: str | None) -> dict[str, Any]:
+        estructuras = tipo.setdefault("estructuras", [])
+        estructura = next((item for item in estructuras if item["id"] == estructura_id), None) if estructura_id else None
+        if estructura is None:
+            estructura = next((item for item in estructuras if comparable(item.get("nombre", "")) == "predeterminada"), None)
+        if estructura is None:
+            ahora = _ahora()
+            estructura = {"id": f"est-{uuid.uuid4().hex[:10]}", "nombre": "Predeterminada", "version": 1, "reglas": {"remitentes": [], "aseguradoras": []},
+                          "creado": ahora, "actualizado": ahora}
+            estructuras.append(estructura)
+        return estructura
+
     def color_libre(self, email: str) -> str:
         usados = {tipo.get("color") for tipo in self.leer(email)}
         return next((color for color in COLORES if color not in usados), COLORES[0])
@@ -617,6 +693,30 @@ def para_clasificar(tipos: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def huella_documento(data: bytes) -> str:
     """Identifica un documento por su contenido (los avisos de estructura no cuentan dos veces el mismo PDF)."""
     return hashlib.sha256(data or b"").hexdigest()[:16]
+
+
+def estructura_de(tipo: dict[str, Any] | None, estructura_id: str | None) -> dict[str, Any] | None:
+    """La estructura con ese id; sin id, «Predeterminada» si existe (la que reciben los documentos sin aseguradora)."""
+    estructuras = (tipo or {}).get("estructuras") or []
+    if estructura_id:
+        encontrada = next((item for item in estructuras if item.get("id") == estructura_id), None)
+        if encontrada is not None:
+            return encontrada
+    return next((item for item in estructuras if comparable(item.get("nombre", "")) == "predeterminada"), None)
+
+
+def campos_version(tipo: dict[str, Any] | None, estructura_id: str | None = None, version: int | None = None) -> tuple[list[dict[str, Any]], int]:
+    """(campos, número de versión) con que se extrae: la versión pedida (o la activa) de la estructura; si la estructura no
+    tiene versiones, los campos del tipo como v1."""
+    estructura = estructura_de(tipo, estructura_id)
+    versiones = (estructura or {}).get("versiones") or []
+    if not versiones:
+        return list((tipo or {}).get("campos") or []), 1
+    numero = version or (estructura or {}).get("version_activa") or versiones[-1]["numero"]
+    elegida = next((item for item in versiones if item["numero"] == numero), None)
+    if elegida is None:
+        raise KeyError(f"v{numero}")
+    return [dict(campo) for campo in elegida["campos"]], int(elegida["numero"])
 
 
 def tipo_para_extraer(tipo: dict[str, Any] | None) -> dict[str, Any] | None:

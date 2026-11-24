@@ -8,7 +8,10 @@ export type ReglasEstructura = { remitentes: string[]; aseguradoras: string[] }
 export type ModoExtraccion = 'manual' | 'ia'
 
 /** Formato de una aseguradora (o banco) dentro de un tipo. */
-export type Estructura = { id: string; nombre: string; version: number; reglas: ReglasEstructura; creado?: string; actualizado?: string; documentos?: number }
+/** Versión de los campos de una estructura (v1, v2…): se crea al aceptar campos de la IA, sin borrar la anterior. */
+export type VersionCampos = { numero: number; campos: CampoPlantilla[]; creado: string; origen: string; nota: string | null }
+/** `version`: sube cuando cambian las reglas para reconocerla. `versiones`/`version_activa`: los campos que se extraen. */
+export type Estructura = { id: string; nombre: string; version: number; reglas: ReglasEstructura; creado?: string; actualizado?: string; documentos?: number; versiones?: VersionCampos[]; version_activa?: number }
 
 export type TipoDocumento = {
   id: string
@@ -146,6 +149,8 @@ const json = (cuerpo: unknown) => JSON.stringify(cuerpo)
 export const tiposDocumentoApi = {
   listar: () => request<ListaTipos>('/tipos'),
   crear: (tipo: SolicitudTipo) => request<ListaTipos & { tipo: TipoDocumento }>('/tipos', { method: 'POST', body: json(tipo) }),
+  activarVersion: (tipoId: string, estructuraId: string, version: number) =>
+    request<ListaTipos>(`/tipos/${encodeURIComponent(tipoId)}/estructuras/${encodeURIComponent(estructuraId)}/version-activa`, { method: 'PUT', body: json({ version }) }),
   editar: (id: string, tipo: SolicitudTipo) => request<ListaTipos & { tipo: TipoDocumento }>(`/tipos/${encodeURIComponent(id)}`, { method: 'PUT', body: json(tipo) }),
   crearEstructura: (tipoId: string, estructura: { nombre: string; reglas: ReglasEstructura }) => request<ListaTipos>(`/tipos/${encodeURIComponent(tipoId)}/estructuras`, { method: 'POST', body: json(estructura) }),
   editarEstructura: (tipoId: string, id: string, estructura: { nombre: string; reglas: ReglasEstructura }) => request<ListaTipos>(`/tipos/${encodeURIComponent(tipoId)}/estructuras/${encodeURIComponent(id)}`, { method: 'PUT', body: json(estructura) }),

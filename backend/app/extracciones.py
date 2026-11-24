@@ -183,6 +183,8 @@ class TipoDocumentoGuardado(BaseModel):
     estructura_id: str | None = Field(default=None, max_length=64)
     estructura: str | None = Field(default=None, max_length=120)
     estructura_version: int | None = None
+    # Versión de los campos de la estructura con que se extrajo (v1, v2…); en la base, documentos.version.
+    version_campos: int | None = None
     metodo: Literal["remitente", "aseguradora", "asunto", "ia", "manual", "texto"] = "manual"
     # Cómo se extrajo: manual (reglas, sin IA) o ia (Gemini); y cuántos campos se encontraron de cuántos.
     modo: Literal["manual", "ia"] | None = None

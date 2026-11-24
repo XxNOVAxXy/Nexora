@@ -506,8 +506,9 @@ function FilaEstructura({ tipo, estructura, onTipos, onError }: { tipo: TipoDocu
   const quitar = (clave: 'remitentes' | 'aseguradoras', valor: string) => void guardar({ ...estructura.reglas, [clave]: estructura.reglas[clave].filter((item) => item !== valor) })
   const chips = (clave: 'remitentes' | 'aseguradoras', titulo: string) => <div className="flex flex-wrap items-center gap-1"><span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{titulo}</span>{estructura.reglas[clave].length === 0 && <span className="text-[11px] text-slate-400">ninguno</span>}{estructura.reglas[clave].map((valor) => <span key={valor} className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-700">{valor}<button type="button" onClick={() => quitar(clave, valor)} aria-label={`Quitar regla ${valor}`} className="text-slate-400 hover:text-red-600"><X size={11} /></button></span>)}</div>
   return <li className="px-5 py-3 text-xs">
-    <div className="flex flex-wrap items-center gap-2"><span className="font-bold text-ink">{estructura.nombre}</span><span className="rounded-full bg-blue-50 px-1.5 py-0.5 text-[10px] font-bold text-blue-700">v{estructura.version}</span><span className="text-[11px] text-slate-500">{estructura.documentos ?? 0} documento{estructura.documentos === 1 ? '' : 's'}</span></div>
+    <div className="flex flex-wrap items-center gap-2"><span className="font-bold text-ink">{estructura.nombre}</span><span className="rounded-full bg-blue-50 px-1.5 py-0.5 text-[10px] font-bold text-blue-700" title="Sube cuando cambian sus reglas">reglas v{estructura.version}</span><span className="text-[11px] text-slate-500">{estructura.documentos ?? 0} documento{estructura.documentos === 1 ? '' : 's'}</span></div>
     <div className="mt-2 space-y-1.5">{chips('remitentes', 'Remitentes')}{chips('aseguradoras', 'Aseguradoras')}</div>
+    {(estructura.versiones?.length ?? 0) > 0 && <VersionesEstructura tipo={tipo} estructura={estructura} onTipos={onTipos} onError={onError} />}
     <div className="mt-2 flex flex-wrap items-center gap-2">
       <input aria-label={`Remitente nuevo para ${estructura.nombre}`} value={remitente} onChange={(event) => setRemitente(event.target.value)} placeholder="correo@aseguradora.com o @dominio.com" className="input max-w-[15rem] py-1 text-[11px]" />
       <button type="button" onClick={() => void agregar('remitentes', remitente, () => setRemitente(''))} disabled={!remitente.trim()} className="btn-soft px-2 py-1 text-[11px]"><Plus size={12} />Remitente</button>
@@ -515,6 +516,28 @@ function FilaEstructura({ tipo, estructura, onTipos, onError }: { tipo: TipoDocu
       <button type="button" onClick={() => void agregar('aseguradoras', aseguradora, () => setAseguradora(''))} disabled={!aseguradora.trim()} className="btn-soft px-2 py-1 text-[11px]"><Plus size={12} />Aseguradora</button>
     </div>
   </li>
+}
+
+/** Versiones de los campos de la estructura: ver v1/v2… y elegir cuál es la activa (las demás se conservan). */
+export function VersionesEstructura({ tipo, estructura, onTipos, onError }: { tipo: TipoDocumento; estructura: Estructura; onTipos: (tipos: TipoDocumento[]) => void; onError: (texto: string) => void }) {
+  const versiones = estructura.versiones ?? []
+  const activa = estructura.version_activa ?? versiones[versiones.length - 1]?.numero ?? 1
+  const [vista, setVista] = useState(activa)
+  const elegida = versiones.find((item) => item.numero === vista) ?? versiones[versiones.length - 1]
+  const activar = async () => {
+    try {
+      const respuesta = await tiposDocumentoApi.activarVersion(tipo.id, estructura.id, vista)
+      onTipos(respuesta.tipos)
+    } catch (error) { onError(mensaje(error, 'No se pudo cambiar la versión activa.')) }
+  }
+  return <div className="mt-2 rounded-md bg-slate-50 p-2" role="group" aria-label={`Versiones de ${estructura.nombre}`}>
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Versiones de campos</span>
+      <select aria-label={`Versión de ${estructura.nombre}`} value={vista} onChange={(event) => setVista(Number(event.target.value))} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[11px]">{versiones.map((item) => <option key={item.numero} value={item.numero}>v{item.numero}{item.numero === activa ? ' (activa)' : ''}</option>)}</select>
+      {vista !== activa && <button type="button" onClick={() => void activar()} className="btn-soft px-2 py-1 text-[11px]">Usar v{vista}</button>}
+    </div>
+    {elegida && <p className="mt-1 text-[11px] text-slate-600"><strong>{elegida.campos.length} campos:</strong> {elegida.campos.map((campo) => campo.nombre).join(', ')}{elegida.nota ? ` · ${elegida.nota}` : ''}</p>}
+  </div>
 }
 
 function EditorCamposTipo({ tipo, onTipos, onNotice, onError }: Avisos & { tipo: TipoDocumento; onTipos: (tipos: TipoDocumento[]) => void }) {

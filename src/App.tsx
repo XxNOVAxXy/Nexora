@@ -26,6 +26,7 @@ import { compatibles, ETIQUETA_CAMPO, movimientoDesdeFila, posicionParaInsertar,
 import { PanelVerificacion, VisorPdf, type EstadoTextoDocumento, type Resaltado } from './VisorPdf'
 import { HistorialEnviosPage } from './HistorialEnvios'
 import { BandejaCapturaPage } from './BandejaCaptura'
+import { ComparacionIA } from './ComparacionIA'
 import { deteccionManual, esContable, solicitudDe, textoDeteccion, tiposDocumentoApi, tiposVigentes, type TipoDocumento, type TipoDocumentoDetectado } from './services/tiposDocumentoApi'
 import { TiposDocumentoSeccion } from './TiposDocumento'
 import {
@@ -1270,6 +1271,7 @@ function ExtractionReviewWorkspace({ archivo, mode, onModeChange, barraPestanas 
     </div>
     {barraPestanas}
     {contable && <PanelValidacion validacion={validacion} transacciones={transactions} conResumen={documento.resumen !== null} />}
+    {partId && <ComparacionIA key={`comparar-${documentKey ?? 'sin-documento'}`} messageId={messageId} partId={partId} attachmentId={attachmentId} />}
     <PanelEnvioSaveData key={documentKey ?? 'sin-documento'} messageId={messageId} partId={partId} guardado={versionGuardada} sinGuardar={sinGuardar} modificadoTrasEnvio={modificadoTrasEnvio} onActualizado={alActualizarEnvio} />
     {contable && <ResumenEditable filename={filename} modelo={documento.modelo} resumen={documento.resumen} movimientos={transactions.length} warnings={deEsteDocumento ? lista.warnings : []} habilitado={cargaLista} destino={verificando && destino?.tipo === 'resumen' ? destino.campo : null} onCambiar={cambiarResumen} onEnfocar={enfocarCampoResumen} />}
   </div>
