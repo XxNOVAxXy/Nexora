@@ -17,6 +17,7 @@ import {
   type ResultadoConfigurar,
   type SugerenciaEstructura,
   type TipoDocumento,
+  type ModoExtraccion,
 } from './services/tiposDocumentoApi'
 import { formatoMexico } from './services/fechas'
 
@@ -281,6 +282,7 @@ function ListaCamposEditable({ campos, onCampos, seccion, etiqueta, permitirFijo
     onCampos(agregarAPlantilla(campos, { nombre, origen: 'manual', alcance: seccion ? alcance : 'documento' }, permitirFijos))
     setNombre('')
   }
+  const [reglasDe, setReglasDe] = useState<string | null>(null)
   const confirmarRenombre = () => {
     if (!renombrando || errorNombrePlantilla(renombrando.nombre, campos, renombrando.id, permitirFijos)) return
     onCampos(renombrarEnPlantilla(campos, renombrando.id, renombrando.nombre, permitirFijos))
@@ -296,8 +298,11 @@ function ListaCamposEditable({ campos, onCampos, seccion, etiqueta, permitirFijo
           : <span className="min-w-0 flex-1 truncate font-semibold text-ink">{campo.nombre}</span>}
         <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-bold ${campo.origen === 'ia' ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-600'}`}>{campo.origen === 'ia' ? 'IA' : 'Manual'}</span>
         <select aria-label={`Dónde va ${campo.nombre}`} value={seccion ? campo.alcance : 'documento'} disabled={!seccion} onChange={(event) => onCampos(cambiarTipoEnPlantilla(campos, campo.id, event.target.value as AlcanceCampo))} className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[11px]"><option value="documento">Una vez</option>{seccion && <option value="movimiento">{etiquetaAlcanceTipo('movimiento', seccion)}</option>}</select>
+        {campo.obligatorio && <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-[9px] font-bold text-amber-800">Obligatorio</span>}
+        <button type="button" onClick={() => setReglasDe(reglasDe === campo.id ? null : campo.id)} aria-expanded={reglasDe === campo.id} aria-label={`Reglas de ${campo.nombre}`} className="rounded px-1.5 py-1 text-[10px] font-bold text-slate-500 hover:bg-slate-100 hover:text-ink">Reglas</button>
         <button type="button" onClick={() => setRenombrando({ id: campo.id, nombre: campo.nombre })} aria-label={`Renombrar ${campo.nombre}`} className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-ink"><Pencil size={12} /></button>
         <button type="button" onClick={() => onCampos(quitarDePlantilla(campos, campo.id))} aria-label={`Quitar ${campo.nombre}`} className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600"><X size={12} /></button>
+        {reglasDe === campo.id && <ReglasCampo campo={campo} onCambio={(cambio) => onCampos(campos.map((item) => (item.id === campo.id ? { ...item, ...cambio } : item)))} />}
       </li>)}
     </ul>
     <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -310,6 +315,27 @@ function ListaCamposEditable({ campos, onCampos, seccion, etiqueta, permitirFijo
 }
 
 // --- Tipos y reglas --------------------------------------------------------------------------------
+
+/** Reglas de la extracción sin IA de un campo: otras etiquetas con que aparece, regex opcional y si es obligatorio. */
+export function ReglasCampo({ campo, onCambio }: { campo: CampoPlantilla; onCambio: (cambio: Partial<CampoPlantilla>) => void }) {
+  const [sinonimos, setSinonimos] = useState((campo.sinonimos ?? []).join(', '))
+  const [regex, setRegex] = useState(campo.regex ?? '')
+  const errorRegex = (() => {
+    if (!regex.trim()) return null
+    try { new RegExp(regex) } catch { return 'La regex no es válida.' }
+    return null
+  })()
+  const aplicarSinonimos = (texto: string) => {
+    setSinonimos(texto)
+    const lista = texto.split(',').map((item) => item.trim()).filter(Boolean).slice(0, 10)
+    onCambio({ sinonimos: lista.length ? lista : null })
+  }
+  return <div className="mt-1 grid w-full gap-2 rounded-md bg-slate-50 p-2 sm:grid-cols-[1fr_1fr_auto]" role="group" aria-label={`Reglas de extracción de ${campo.nombre}`}>
+    <label className="text-[10px] font-bold text-slate-500">Sinónimos (separados por coma)<input aria-label={`Sinónimos de ${campo.nombre}`} value={sinonimos} onChange={(event) => aplicarSinonimos(event.target.value)} placeholder="Póliza no., Folio" className="input mt-0.5 py-1 text-[11px]" /></label>
+    <label className="text-[10px] font-bold text-slate-500">Regex (opcional; el grupo 1 es el valor)<input aria-label={`Regex de ${campo.nombre}`} value={regex} maxLength={300} onChange={(event) => { setRegex(event.target.value); onCambio({ regex: event.target.value.trim() || null }) }} placeholder="POLIZA[:\s]+(\S+)" className="input mt-0.5 py-1 font-mono text-[11px]" />{errorRegex && <span role="alert" className="text-[10px] text-red-700">{errorRegex}</span>}</label>
+    <label className="flex items-center gap-1.5 self-end pb-1 text-[11px] font-semibold text-ink"><input type="checkbox" aria-label={`${campo.nombre} es obligatorio`} checked={Boolean(campo.obligatorio)} onChange={(event) => onCambio({ obligatorio: event.target.checked })} />Obligatorio</label>
+  </div>
+}
 
 function TiposYReglas({ tipos, onTipos, onNotice, onError, editorEstadoDeCuenta, onVerDocumentos }: Avisos & { tipos: TipoDocumento[] | null; onTipos: (tipos: TipoDocumento[]) => void; editorEstadoDeCuenta?: ReactNode; onVerDocumentos?: (tipoId: string) => void }) {
   const [elegido, setElegido] = useState<string | 'nuevo' | null>(null)
@@ -413,16 +439,17 @@ function FormularioTipo({ tipo, tipos, onGuardado, onError }: { tipo?: TipoDocum
   const [codigo, setCodigo] = useState(tipo?.codigo ?? '')
   const [color, setColor] = useState(tipo?.color ?? '#7c3aed')
   const [seccion, setSeccion] = useState(tipo?.seccion?.nombre ?? '')
+  const [modo, setModo] = useState<ModoExtraccion>(tipo?.modo ?? 'manual')
   const [guardando, setGuardando] = useState(false)
   const codigoLimpio = codigo.trim().toUpperCase()
   const error = !nombre.trim() ? 'Escribe el nombre del tipo.'
     : !/^[A-Z0-9]{1,5}$/.test(codigoLimpio) ? 'El código admite de 1 a 5 letras o números.'
       : tipos.some((otro) => otro.id !== tipo?.id && otro.codigo === codigoLimpio) ? `El código ${codigoLimpio} ya lo usa otro tipo.` : null
-  const cambio = !tipo || nombre !== tipo.nombre || codigoLimpio !== tipo.codigo || color !== tipo.color || seccion.trim() !== (tipo.seccion?.nombre ?? '')
+  const cambio = !tipo || nombre !== tipo.nombre || codigoLimpio !== tipo.codigo || color !== tipo.color || seccion.trim() !== (tipo.seccion?.nombre ?? '') || modo !== (tipo.modo ?? 'manual')
   const guardar = async () => {
     setGuardando(true)
     try {
-      const solicitud = { nombre: nombre.trim(), codigo: codigoLimpio, color, seccion: seccion.trim() ? { nombre: seccion.trim() } : null, campos: (tipo?.campos ?? []).map((campo) => (seccion.trim() ? campo : { ...campo, alcance: 'documento' as const })) }
+      const solicitud = { nombre: nombre.trim(), codigo: codigoLimpio, color, modo, seccion: seccion.trim() ? { nombre: seccion.trim() } : null, campos: (tipo?.campos ?? []).map((campo) => (seccion.trim() ? campo : { ...campo, alcance: 'documento' as const })) }
       const respuesta = tipo ? await tiposDocumentoApi.editar(tipo.id, solicitud) : await tiposDocumentoApi.crear(solicitud)
       onGuardado(respuesta.tipos, respuesta.tipo)
     } catch (requestError) { onError(mensaje(requestError, 'No se pudo guardar el tipo.')) } finally { setGuardando(false) }
@@ -433,6 +460,7 @@ function FormularioTipo({ tipo, tipos, onGuardado, onError }: { tipo?: TipoDocum
       <label className="text-[11px] font-bold text-slate-500">Nombre<input aria-label="Nombre del tipo" value={nombre} maxLength={80} onChange={(event) => setNombre(event.target.value)} placeholder="Gastos médicos mayores" className="input mt-1 py-1.5 text-xs" /></label>
       <label className="text-[11px] font-bold text-slate-500">Código para la base de datos<input aria-label="Código del tipo" value={codigo} maxLength={5} onChange={(event) => setCodigo(event.target.value.toUpperCase())} placeholder="G" className="input mt-1 py-1.5 text-xs uppercase" /></label>
       <label className="text-[11px] font-bold text-slate-500">Sección repetible (opcional)<input aria-label="Sección repetible" value={seccion} maxLength={60} onChange={(event) => setSeccion(event.target.value)} placeholder="Incisos, Asegurados, Coberturas…" className="input mt-1 py-1.5 text-xs" /></label>
+      <label className="text-[11px] font-bold text-slate-500">Extracción<select aria-label="Modo de extracción" value={modo} onChange={(event) => setModo(event.target.value as ModoExtraccion)} className="input mt-1 py-1.5 text-xs"><option value="manual">Manual: por reglas, sin IA</option><option value="ia">IA: la extrae Gemini</option></select><span className="mt-0.5 block font-normal text-slate-400">{modo === 'manual' ? 'No se llama a Gemini. Usa las reglas de cada campo (botón «Reglas»).' : 'Gemini extrae los campos de este tipo.'}</span></label>
       <label className="text-[11px] font-bold text-slate-500">Color<span className="mt-1 flex items-center gap-2"><input type="color" aria-label="Color del tipo" value={color} onChange={(event) => setColor(event.target.value)} className="h-8 w-12 cursor-pointer rounded border border-slate-200" /><EtiquetaTipo nombre={nombre || 'Vista previa'} codigo={codigoLimpio || null} color={color} /></span></label>
     </div>
     {error && (nombre || codigo) && <p role="alert" className="mt-2 text-[10px] text-red-600">{error}</p>}

@@ -26,13 +26,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import uuid
 from datetime import datetime, timezone
 from email.utils import parseaddr
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -127,10 +128,21 @@ class SeccionTipo(BaseModel):
         return texto
 
 
+MODOS = ("manual", "ia")
+
+
+def modo_predeterminado() -> str:
+    """Modo de un tipo que nunca se configuró: ``manual`` (``NEXORA_MODO_PREDETERMINADO`` lo cambia)."""
+    valor = os.getenv("NEXORA_MODO_PREDETERMINADO", "manual").strip().lower()
+    return valor if valor in MODOS else "manual"
+
+
 class TipoRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     nombre: str = Field(min_length=1, max_length=80)
+    # manual: extracción por reglas, sin IA (no se llama a Gemini). ia: Gemini extrae. Sin valor: se queda el que tenía.
+    modo: Literal["manual", "ia"] | None = None
     codigo: str = Field(min_length=1, max_length=5)
     color: str = Field(default="#7c3aed", pattern=r"^#[0-9a-fA-F]{6}$")
     seccion: SeccionTipo | None = None
@@ -246,6 +258,7 @@ class AlmacenTipos:
             # Avisos de cambios de estructura (por aseguradora): datos nuevos y campos que dejaron de aparecer.
             **({"sugerencias_estructura": [], "campos_ausentes": []} if ec else estructura_sugerida.publico({**tipo, "campos": campos})),
             "campos": campos,
+            "modo": tipo.get("modo") if tipo.get("modo") in MODOS else modo_predeterminado(),
             "contable": ec,
             # Estado de cuenta funciona aunque no tenga campos adicionales (como siempre).
             "configurado": ec or bool(campos),
@@ -319,6 +332,7 @@ class AlmacenTipos:
                 color=solicitud.color,
                 # Estado de cuenta conserva su sección de movimientos (columnas fijas y validación contable).
                 seccion={"nombre": "Movimientos"} if ec else (solicitud.seccion.model_dump() if solicitud.seccion else None),
+                modo=solicitud.modo or actual.get("modo") or modo_predeterminado(),
                 campos=[] if ec else [campo.model_dump(exclude_none=True) for campo in solicitud.campos],
             )
             self._validar_unicos(tipos)
@@ -526,6 +540,42 @@ def detectar_por_reglas(tipos: list[dict[str, Any]], *, remitente: str, asunto: 
             estructura = next((item for item in ec.get("estructuras") or [] if item["id"] == ESTRUCTURA_EC_ID), None)
             return finalizar_deteccion(ec, metodo="asunto", estructura=estructura, regla=filtro_estados.asunto_coincide(asunto))
     return None
+
+
+PALABRAS_TIPO: dict[str, tuple[str, ...]] = {
+    "EC": ("estado de cuenta", "saldo anterior", "saldo final", "movimientos del periodo"),
+    "A": ("automovil", "automoviles", "vehiculo", "placas", "numero de serie", "auto individual"),
+    "G": ("gastos medicos", "gastos medicos mayores", "coaseguro", "asegurados"),
+    "F": ("fianza", "afianzadora", "fiado", "beneficiario de la fianza", "monto afianzado"),
+    "RF": ("recibo de fianza", "recibo de pago", "importe pagado"),
+}
+
+
+def detectar_por_texto(tipos: list[dict[str, Any]], texto: str) -> dict[str, Any] | None:
+    """Sin IA, con el texto del documento: una aseguradora de las reglas que aparezca en el texto, o el tipo cuyo nombre,
+    palabras clave y etiquetas de campos aparecen más veces. None si nada destaca (entonces, si algún tipo es de
+    modo IA, se le pregunta a Gemini)."""
+    if not texto.strip():
+        return None
+    normal = comparable(texto)
+    for tipo in tipos:
+        for estructura in tipo.get("estructuras") or []:
+            for regla in (estructura.get("reglas") or {}).get("aseguradoras") or []:
+                if _contiene(normal, regla):
+                    return finalizar_deteccion(tipo, metodo="aseguradora", estructura=estructura, aseguradora=regla, regla=regla)
+    from .reglas_extraccion import etiquetas
+
+    puntajes: list[tuple[float, dict[str, Any]]] = []
+    for tipo in tipos:
+        palabras = [comparable(tipo["nombre"]), *PALABRAS_TIPO.get(tipo["codigo"], ())]
+        puntaje = sum(3 for palabra in palabras if palabra and _contiene(normal, palabra))
+        puntaje += sum(1 for campo in tipo.get("campos") or [] if any(_contiene(normal, etiqueta) for etiqueta in etiquetas(campo)[:3]))
+        puntajes.append((puntaje, tipo))
+    puntajes.sort(key=lambda par: par[0], reverse=True)
+    if not puntajes or puntajes[0][0] < 4 or (len(puntajes) > 1 and puntajes[0][0] - puntajes[1][0] < 2):
+        return None
+    tipo = puntajes[0][1]
+    return finalizar_deteccion(tipo, metodo="texto", estructura=next(iter(tipo.get("estructuras") or []), None))
 
 
 def resolver_clasificacion(tipos: list[dict[str, Any]], clasificacion: dict[str, Any]) -> dict[str, Any]:

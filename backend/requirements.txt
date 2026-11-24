@@ -14,3 +14,6 @@ PyMySQL>=1.1,<2
 alembic>=1.13,<2
 cryptography>=43
 argon2-cffi>=23,<26
+# OCR opcional (modo manual, PDFs escaneados): pytesseract (Apache-2.0) + el programa Tesseract instalado aparte.
+# Las páginas se dibujan con pypdfium2 (lo trae pdfplumber); nunca Poppler/pdf2image (GPL) ni PyMuPDF (AGPL).
+pytesseract>=0.3.10,<0.4

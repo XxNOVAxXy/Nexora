@@ -50,6 +50,31 @@ class CampoPlantilla(BaseModel):
     origen: Literal["ia", "manual"] = "manual"
     alcance: Literal["documento", "movimiento"] = "movimiento"
     clave: str | None = Field(default=None, max_length=64)
+    # Reglas para la extracción sin IA (modo manual): otras etiquetas con que aparece el campo, una regex opcional
+    # (su grupo 1 es el valor) y si es obligatorio. Sin sinónimos se usan los de la plantilla; sin "obligatorio",
+    # el de la plantilla (ver reglas_extraccion).
+    sinonimos: list[str] | None = Field(default=None, max_length=10)
+    regex: str | None = Field(default=None, max_length=300)
+    obligatorio: bool | None = None
+
+    @field_validator("sinonimos")
+    @classmethod
+    def _sinonimos_validos(cls, valores: list[str] | None) -> list[str] | None:
+        if valores is None:
+            return None
+        limpios: list[str] = []
+        for valor in valores:
+            texto = re.sub(r"\s+", " ", str(valor or "")).strip()[:80]
+            if texto and comparable(texto) not in {comparable(item) for item in limpios}:
+                limpios.append(texto)
+        return limpios or None
+
+    @field_validator("regex")
+    @classmethod
+    def _regex_valida(cls, valor: str | None) -> str | None:
+        from .reglas_extraccion import validar_regex
+
+        return validar_regex(valor)
 
     @field_validator("nombre")
     @classmethod

@@ -5,6 +5,7 @@ import type { CampoPlantilla, SugerenciaPlantilla } from './plantillaCampos'
 export const TIPO_EC_ID = 'tipo-ec'
 
 export type ReglasEstructura = { remitentes: string[]; aseguradoras: string[] }
+export type ModoExtraccion = 'manual' | 'ia'
 
 /** Formato de una aseguradora (o banco) dentro de un tipo. */
 export type Estructura = { id: string; nombre: string; version: number; reglas: ReglasEstructura; creado?: string; actualizado?: string; documentos?: number }
@@ -20,6 +21,8 @@ export type TipoDocumento = {
   /** "documento" = Una vez; "movimiento" = un valor en cada fila de la sección. */
   campos: CampoPlantilla[]
   estructuras: Estructura[]
+  /** manual: extracción por reglas, sin IA (predeterminado). ia: la extrae Gemini. */
+  modo?: ModoExtraccion
   /** Solo Estado de cuenta: columnas fijas y validación contable. */
   contable: boolean
   configurado: boolean
@@ -79,7 +82,7 @@ export function mensajeConfigurar(resultado: ResultadoConfigurar): { texto: stri
 export type SugerenciaEstructura = { aseguradora: string; clave: string; nombre: string; alcance: CampoPlantilla['alcance']; veces: number; documentos: number; ejemplo: string }
 export type CampoAusente = { aseguradora: string; nombre: string; racha: number }
 
-export type MetodoDeteccion = 'remitente' | 'aseguradora' | 'asunto' | 'ia' | 'manual'
+export type MetodoDeteccion = 'remitente' | 'aseguradora' | 'asunto' | 'ia' | 'manual' | 'texto'
 
 /** Tipo detectado (o elegido) para un documento. */
 export type TipoDocumentoDetectado = {
@@ -112,7 +115,7 @@ export type DocumentoRecibido = EntradaListado & {
 
 export type ListaTipos = { tipos: TipoDocumento[]; umbral_confianza: number }
 
-export type SolicitudTipo = { nombre: string; codigo: string; color: string; seccion: { nombre: string } | null; campos: CampoPlantilla[] }
+export type SolicitudTipo = { nombre: string; codigo: string; color: string; seccion: { nombre: string } | null; campos: CampoPlantilla[]; modo?: ModoExtraccion }
 
 export type SolicitudConfigurarDocumento = {
   messageId: string
@@ -159,7 +162,7 @@ export const tiposDocumentoApi = {
 }
 
 /** Solicitud de edición de un tipo a partir de su estado actual (con otros campos). */
-export const solicitudDe = (tipo: TipoDocumento, campos: CampoPlantilla[] = tipo.campos): SolicitudTipo => ({ nombre: tipo.nombre, codigo: tipo.codigo, color: tipo.color, seccion: tipo.seccion, campos })
+export const solicitudDe = (tipo: TipoDocumento, campos: CampoPlantilla[] = tipo.campos): SolicitudTipo => ({ nombre: tipo.nombre, codigo: tipo.codigo, color: tipo.color, seccion: tipo.seccion, campos, ...(tipo.modo ? { modo: tipo.modo } : {}) })
 
 /**
  * Tipos vigentes en memoria (como `plantillaVigente`): la pantalla de Extracción los usa para saber los campos y la
@@ -193,6 +196,7 @@ export function textoDeteccion(tipo: TipoDocumentoDetectado | null | undefined):
     case 'asunto': return 'Asunto de estado de cuenta'
     case 'ia': return `IA${confianza}`
     case 'manual': return 'Elegido a mano'
+    case 'texto': return 'Por el texto del documento (sin IA)'
   }
 }
 

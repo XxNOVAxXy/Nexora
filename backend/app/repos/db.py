@@ -176,8 +176,17 @@ def columnas_desde_registro(registro: dict[str, Any], estado_previo: str | None)
     """Registro (formato JSON) → valores de las columnas de ``documentos``."""
     estado, motivo = estado_y_motivo(registro, estado_previo)
     recepcion = {clave: valor for clave, valor in registro.items() if clave not in _CON_COLUMNA}
+    clasificacion = registro.get("clasificacion") if isinstance(registro.get("clasificacion"), dict) else {}
     ahora = ahora_utc()
+    columnas_clasificacion = {} if not clasificacion else {
+        "tipo": _texto(clasificacion.get("tipo"), 10),
+        "aseguradora": _texto(clasificacion.get("aseguradora"), 150),
+        "estructura": _texto(clasificacion.get("estructura"), 150),
+        "version": clasificacion.get("version") if isinstance(clasificacion.get("version"), int) else None,
+        "modo": _texto(clasificacion.get("modo"), 10),
+    }
     return {
+        **columnas_clasificacion,
         "nombre_archivo": (str(registro.get("nombre") or ""))[:255],
         "ruta_original": (str(registro.get("ruta") or ""))[:500],
         "sha256": (str(registro.get("sha256") or ""))[:64],

@@ -6,7 +6,8 @@ import { errorNombreCampo, MAX_CAMPOS_EXTRA, nombreComparable } from './camposEx
  * Misma lógica que backend/app/plantilla_campos.py (el backend la aplica al abrir un documento guardado; aquí se
  * aplica a los documentos nuevos antes de extraer y al editar la configuración).
  */
-export type CampoPlantilla = { id: string; nombre: string; origen: 'ia' | 'manual'; alcance: AlcanceCampo; clave?: string }
+/** `sinonimos`, `regex` y `obligatorio`: reglas de la extracción sin IA (modo manual). Sin ellos se usan los de la plantilla. */
+export type CampoPlantilla = { id: string; nombre: string; origen: 'ia' | 'manual'; alcance: AlcanceCampo; clave?: string; sinonimos?: string[] | null; regex?: string | null; obligatorio?: boolean | null }
 export type Plantilla = { configurada: boolean; campos: CampoPlantilla[]; actualizado: string | null }
 /** Campo que la IA encontró en el documento de ejemplo, con un valor de ejemplo y su tipo. */
 export type SugerenciaPlantilla = { clave: string; nombre: string; ejemplo: string; alcance: AlcanceCampo; filas: number }

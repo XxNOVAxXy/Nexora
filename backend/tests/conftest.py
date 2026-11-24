@@ -16,6 +16,9 @@ import pytest
 os.environ["NEXORA_ALMACEN"] = "json"
 os.environ["DATABASE_URL"] = ""
 os.environ["NEXORA_LLAVE_CIFRADO"] = ""
+# Las pruebas de antes de la Fase 3 prueban el flujo con IA (Gemini doble de prueba): sus tipos usan modo "ia".
+# Las del modo manual (el predeterminado de verdad) lo fijan en cada tipo; test_reglas_sin_ia revisa el predeterminado.
+os.environ["NEXORA_MODO_PREDETERMINADO"] = "ia"
 
 
 @pytest.fixture(autouse=True)

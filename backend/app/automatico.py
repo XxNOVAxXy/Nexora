@@ -65,7 +65,9 @@ from .gmail import GmailNotConnectedError, GmailRateLimitError
 from .orden_fechas import ordenar_por_fecha
 from .plantilla_campos import AlmacenPlantillas, deducir_campos
 from .recepcion import ServicioRecepcion
-from .tipos_documento import AlmacenTipos, deteccion_manual, direccion, detectar_tipo, huella_documento, para_clasificar, tipo_para_extraer
+from .reglas_extraccion import extraer_por_reglas, leer_documento, ocr_disponible, texto_de
+from .tipos_documento import (AlmacenTipos, detectar_por_reglas, detectar_por_texto, deteccion_manual, direccion, finalizar_deteccion, huella_documento,
+                              modo_predeterminado, para_clasificar, resolver_clasificacion, tipo_para_extraer)
 
 logger = logging.getLogger("nexora.automatico")
 
@@ -114,6 +116,22 @@ HORA_MEXICO = timezone(timedelta(hours=-6), "hora de Mexico")
 def hora_mexico(momento: datetime) -> str:
     """"24/11/2026 12:40 (hora de Mexico)" para los mensajes de los eventos (la fecha del evento va en UTC)."""
     return momento.astimezone(HORA_MEXICO).strftime("%d/%m/%Y %H:%M") + " (hora de Mexico)"
+
+
+def texto_extraccion(deteccion: dict[str, Any], resultado: dict[str, Any], *, al_reprocesar: bool = False) -> str:
+    """"Extraido por reglas (modo manual): 8 de 10 campos." o "Extraido con IA (modelo): 9 de 10 campos"."""
+    cuando = " al reprocesar" if al_reprocesar else ""
+    cuenta = f"{resultado.get('encontrados') or 0} de {resultado.get('total_campos') or 0} campos"
+    if deteccion.get("modo") == "manual":
+        ocr = " con OCR" if resultado.get("ocr") else ""
+        faltan = f"; faltan obligatorios: {', '.join(deteccion['faltantes'])}" if deteccion.get("faltantes") else ""
+        return f"Extraido por reglas{ocr}{cuando} (modo manual): {cuenta}{faltan}."[:500]
+    return f"Extraido con IA{cuando} ({resultado.get('model') or 'Gemini'}): {cuenta}."
+
+
+def detalle_extraccion(deteccion: dict[str, Any], resultado: dict[str, Any], documento: dict[str, Any]) -> dict[str, Any]:
+    return {"tipo": deteccion.get("codigo"), "filas": len(documento.get("transacciones", [])), "modo": deteccion.get("modo"),
+            "encontrados": resultado.get("encontrados"), "total": resultado.get("total_campos"), "faltantes": deteccion.get("faltantes"), "ocr": bool(resultado.get("ocr"))}
 
 
 def es_error_temporal(error: Exception) -> bool:
@@ -451,6 +469,15 @@ class ExtractorAutomatico:
         """Nombres que se piden a Gemini: los de la configuración de campos."""
         return normalizar_campos_solicitados([campo["nombre"] for campo in self.campos_configurados(email)])[:MAX_CAMPOS_EXTRA]
 
+    def campos_por_tipo(self, email: str) -> list[dict[str, Any]]:
+        try:
+            tipos = self.tipos.leer(email)
+        except Exception:
+            logger.exception("No se pudieron leer los tipos de documento")
+            return []
+        return [{"tipo_id": tipo["id"], "nombre": tipo["nombre"], "codigo": tipo["codigo"], "modo": tipo.get("modo"),
+                 "campos": [campo["nombre"] for campo in tipo.get("campos") or []]} for tipo in tipos]
+
     def estado(self, email: str) -> dict[str, Any]:
         estado = self._leer(email)
         try:
@@ -485,6 +512,8 @@ class ExtractorAutomatico:
             "ultimo_error": estado["ultimo_error"],
             "gemini_configurado": gemini_listo,
             "campos": self.campos_a_buscar(email),
+            # "Campos que se buscarán automáticamente", por tipo de documento y con su modo (manual: reglas; ia: Gemini).
+            "campos_por_tipo": self.campos_por_tipo(email),
             "envio_activo": bool(estado.get("envio_activo")),
             "solo_si_cuadra": estado.get("solo_si_cuadra") is not False,
             "envio_activado_en": estado.get("envio_activado_en"),
@@ -697,7 +726,8 @@ class ExtractorAutomatico:
         try:
             # Reintentos de envío pendientes: no dependen de Gmail ni de Gemini.
             self._procesar_envios(email, ctx)
-            if not self.gemini.status().get("enabled"):
+            if not self.gemini.status().get("enabled") and all(tipo.get("modo") == "ia" for tipo in self.tipos.leer(email)):
+                # Sin Gemini y todos los tipos en modo IA: no hay con qué extraer. En modo manual se sigue sin IA.
                 resultado, error = "sin_gemini", "Gemini no esta configurado."
             else:
                 self._procesar(email, estado, activado, ctx)
@@ -960,6 +990,12 @@ class ExtractorAutomatico:
         if registro is not None and self.recepcion.estado(registro) != (estado, motivo):
             self.recepcion.marcar(email, message_id, part_id, estado, motivo, mensaje)
 
+    def _estado_actual(self, email: str, message_id: str, part_id: str) -> str | None:
+        if self.recepcion is None:
+            return None
+        registro = self.recepcion.documentos.obtener(email, message_id, part_id)
+        return None if registro is None else self.recepcion.estado(registro)[0]
+
     def _marcar(self, email: str, message_id: str, part_id: str, estado: str, motivo: str | None = None, mensaje: str | None = None) -> None:
         if self.recepcion is not None:
             self.recepcion.marcar(email, message_id, part_id, estado, motivo, mensaje)
@@ -1009,11 +1045,14 @@ class ExtractorAutomatico:
             if self.recepcion is not None:
                 documento_recibido = self._recibir(email, message_id, part_id, data, media_type, nombre or filename, attachment_id, mensaje, "automatico")
                 diagnostico = documento_recibido.get("diagnostico") or {}
-                if diagnostico.get("codigo") != "ok":
+                escaneado_con_ocr = diagnostico.get("codigo") == "pdf_escaneado" and ocr_disponible()
+                if diagnostico.get("codigo") != "ok" and not escaneado_con_ocr:
                     return self._a_bandeja(email, ctx, clave, diagnostico)
+                if escaneado_con_ocr:
+                    # La bandeja que abrió el diagnóstico no aplica: se lee con OCR.
+                    self.recepcion.resolver(email, message_id, part_id, "leido_con_ocr")
                 media_type = diagnostico.get("mime") or media_type
-            deteccion, campos_tipo, extraer = self._detectar(email, data, media_type, nombre or filename, mensaje or {}, campos)
-            resultado = self.gemini.extract_document(data, media_type, nombre or filename, campos_solicitados=[campo["nombre"] for campo in campos_tipo], **extraer)
+            deteccion, campos_tipo, resultado = self._extraer_documento(email, data, media_type, nombre or filename, mensaje or {}, campos)
             if not deteccion.get("aseguradora") and resultado.get("aseguradora"):
                 deteccion["aseguradora"] = resultado["aseguradora"]
         except (GmailRateLimitError, GmailNotConnectedError, GeminiUnavailableError) as error:
@@ -1052,25 +1091,69 @@ class ExtractorAutomatico:
         # Solo lo extraído con el envío automático encendido se envía solo.
         enviar_auto = bool(self._leer(email).get("envio_activo"))
         self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"), enviar_auto=enviar_auto, proximo_intento=None)
-        self._evento(email, "extraccion", "ok", f"Extraido con IA ({resultado.get('model') or 'Gemini'}).", message_id, part_id,
-                     detalle={"tipo": deteccion.get("codigo"), "filas": len(documento.get("transacciones", []))})
-        self._marcar(email, message_id, part_id, "extraido")
+        self._evento(email, "extraccion", "ok", texto_extraccion(deteccion, resultado), message_id, part_id, detalle=detalle_extraccion(deteccion, resultado, documento))
+        self._marcar_extraido(email, message_id, part_id, deteccion)
         resumen["extraidos"] += 1
         logger.info("Ciclo automatico adjunto extraido message_id=%s part_id=%s transacciones=%d envio_auto=%s", message_id, part_id, len(documento.get("transacciones", [])), enviar_auto)
         if enviar_auto:
             self._contar_envio(email, ctx, message_id, part_id, self._enviar_auto(email, message_id, part_id))
         return "extraido"
 
-    def _detectar(self, email: str, data: bytes, media_type: str, filename: str, mensaje: dict[str, Any], campos_ec: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-        """Tipo del adjunto (reglas; si ninguna coincide, la IA), campos que se piden y argumentos de la extracción."""
+    def _detectar(self, email: str, data: bytes, media_type: str, filename: str, mensaje: dict[str, Any], texto: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Tipo del adjunto, de lo más seguro a lo menos: reglas de remitente o asunto, el texto del documento (sin IA)
+        y, solo si nada coincide y algún tipo está en modo IA, la clasificación de Gemini."""
         tipos = self.tipos.leer(email)
-        deteccion = detectar_tipo(tipos, remitente=mensaje.get("senderEmail", ""), asunto=mensaje.get("subject", ""),
-                                  clasificar=lambda: self.gemini.clasificar_documento(data, media_type, filename, para_clasificar(tipos)))
+        remitente = mensaje.get("senderEmail", "")
+        deteccion = detectar_por_reglas(tipos, remitente=remitente, asunto=mensaje.get("subject", "")) or detectar_por_texto(tipos, texto)
+        if deteccion is None:
+            if any(tipo.get("modo") == "ia" for tipo in tipos) and self.gemini.status().get("enabled"):
+                deteccion = resolver_clasificacion(tipos, self.gemini.clasificar_documento(data, media_type, filename, para_clasificar(tipos)))
+            else:
+                deteccion = finalizar_deteccion(None, metodo="texto")
+        deteccion = {**deteccion, "remitente": direccion(remitente)}
         tipo = next((item for item in tipos if item["id"] == deteccion.get("tipo_id")), None)
-        campos = campos_ec if tipo is not None and tipo.get("contable") else list((tipo or {}).get("campos") or [])
-        extraer = tipo_para_extraer(tipo)
         logger.info("Ciclo automatico tipo detectado codigo=%s metodo=%s confianza=%s requiere_revision=%s", deteccion.get("codigo"), deteccion.get("metodo"), deteccion.get("confianza"), deteccion.get("requiere_revision"))
-        return deteccion, campos, ({} if extraer is None else {"tipo": extraer})
+        return deteccion, tipo
+
+    def _extraer_documento(self, email: str, data: bytes, media_type: str, filename: str, mensaje: dict[str, Any], campos_ec: list[dict[str, Any]], *,
+                           tipo: dict[str, Any] | None = None, deteccion: dict[str, Any] | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        """Detecta el tipo (si no se da) y extrae según su modo: ``manual`` con las reglas de sus campos (nunca Gemini),
+        ``ia`` con Gemini. Devuelve (detección, campos del tipo, resultado con la forma del de Gemini)."""
+        lectura = leer_documento(data, media_type)
+        if tipo is None:
+            deteccion, tipo = self._detectar(email, data, media_type, filename, mensaje, texto_de(lectura))
+        assert deteccion is not None
+        campos = campos_ec if tipo is not None and tipo.get("contable") else list((tipo or {}).get("campos") or [])
+        modo = (tipo or {}).get("modo") or modo_predeterminado()
+        if modo == "ia":
+            extraer = tipo_para_extraer(tipo)
+            if not self.gemini.status().get("enabled"):
+                raise GeminiUnavailableError("Gemini no esta configurado y el tipo esta en modo IA.")
+            resultado = self.gemini.extract_document(data, media_type, filename, campos_solicitados=[campo["nombre"] for campo in campos], **({} if extraer is None else {"tipo": extraer}))
+            encontrados = sum(1 for item in resultado.get("resultados_campos") or [] if item.get("encontrado"))
+            resultado = {**resultado, "encontrados": encontrados, "total_campos": len(campos), "faltantes": []}
+        else:
+            aseguradoras = [nombre for estructura in (tipo or {}).get("estructuras") or [] for nombre in [estructura.get("nombre") or "", *((estructura.get("reglas") or {}).get("aseguradoras") or [])]
+                            if nombre and nombre != "Predeterminada"]
+            resultado = extraer_por_reglas(data, media_type, filename, campos, seccion=((tipo or {}).get("seccion") or {}).get("nombre"), contable=bool((tipo or {}).get("contable")),
+                                           codigo_tipo=(tipo or {}).get("codigo"), aseguradoras=aseguradoras, lectura=lectura)
+        faltantes = list(resultado.get("faltantes") or [])
+        deteccion = {**deteccion, "modo": modo, "encontrados": resultado.get("encontrados"), "total_campos": resultado.get("total_campos"), "faltantes": faltantes or None}
+        if faltantes and not deteccion.get("requiere_revision"):
+            # Campos obligatorios sin encontrar: se guarda como borrador revisable y no se envía solo.
+            deteccion.update(requiere_revision=True, motivo=f"Faltan campos obligatorios: {', '.join(faltantes)}"[:300])
+        logger.info("Extraccion modo=%s encontrados=%s/%s faltantes=%d ocr=%s", modo, resultado.get("encontrados"), resultado.get("total_campos"), len(faltantes), resultado.get("ocr"))
+        return deteccion, campos, resultado
+
+    def _marcar_extraido(self, email: str, message_id: str, part_id: str, deteccion: dict[str, Any]) -> None:
+        if self.recepcion is None:
+            return
+        clasificacion = {"tipo": deteccion.get("codigo"), "aseguradora": deteccion.get("aseguradora"), "estructura": deteccion.get("estructura"),
+                         "version": deteccion.get("version_campos") or deteccion.get("estructura_version"), "modo": deteccion.get("modo")}
+        if deteccion.get("faltantes"):
+            self.recepcion.marcar(email, message_id, part_id, "requiere_revision", "campos_faltantes", f"Faltan: {', '.join(deteccion['faltantes'])}", clasificacion=clasificacion)
+        else:
+            self.recepcion.marcar(email, message_id, part_id, "extraido", clasificacion=clasificacion)
 
     def _registrar_estructura(self, email: str, deteccion: dict[str, Any], resultado: dict[str, Any], data: bytes) -> None:
         """Avisos de cambios de estructura (datos nuevos o que dejan de aparecer). Nunca detiene la extracción."""
@@ -1154,13 +1237,16 @@ class ExtractorAutomatico:
         diagnostico = documento_recibido.get("diagnostico") or {}
         if diagnostico.get("codigo") not in {"ok", "pdf_escaneado"}:
             return {"estado": "sigue_en_bandeja", "documento": documento_recibido, "diagnostico": diagnostico, "mensaje": diagnostico.get("mensaje")}
-        if not self.gemini.status().get("enabled"):
-            raise GeminiUnavailableError("Gemini no esta configurado.")
         media_type = diagnostico.get("mime") or media_type
         campos = self.campos_configurados(email)
         try:
-            deteccion, campos_tipo, extraer = self._detectar(email, data, media_type, nombre, mensaje, campos)
-            resultado = self.gemini.extract_document(data, media_type, nombre, campos_solicitados=[campo["nombre"] for campo in campos_tipo], **extraer)
+            lectura = leer_documento(data, media_type)
+            deteccion, tipo = self._detectar(email, data, media_type, nombre, mensaje, texto_de(lectura))
+            if diagnostico.get("codigo") == "pdf_escaneado" and ((tipo or {}).get("modo") or modo_predeterminado()) != "ia" and not ocr_disponible():
+                # Modo manual sin OCR: un escaneado no se puede leer sin IA.
+                return {"estado": "sigue_en_bandeja", "documento": documento_recibido, "diagnostico": diagnostico,
+                        "mensaje": "El PDF esta escaneado y Tesseract (OCR) no esta instalado; capturalo a mano o pon el tipo en modo IA."}
+            deteccion, campos_tipo, resultado = self._extraer_documento(email, data, media_type, nombre, mensaje, campos, tipo=tipo, deteccion=deteccion)
         except Exception as error:
             causa = causa_de(error)
             self._evento(email, "extraccion", causa, str(error) or causa, message_id, part_id, origen="reprocesar")
@@ -1178,10 +1264,10 @@ class ExtractorAutomatico:
         self._registrar_estructura(email, deteccion, resultado, data)
         # El proceso automático ya no lo vuelve a tomar; no se envía solo (lo revisa el usuario).
         self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"), enviar_auto=False, proximo_intento=None)
-        self.recepcion.marcar(email, message_id, part_id, "extraido")
-        self._evento(email, "extraccion", "ok", f"Extraido con IA al reprocesar ({resultado.get('model') or 'Gemini'}).", message_id, part_id, origen="reprocesar",
-                     detalle={"tipo": deteccion.get("codigo"), "filas": len(documento.get("transacciones", []))})
+        self._evento(email, "extraccion", "ok", texto_extraccion(deteccion, resultado, al_reprocesar=True), message_id, part_id, origen="reprocesar",
+                     detalle=detalle_extraccion(deteccion, resultado, documento))
         self.recepcion.resolver(email, message_id, part_id, "extraido")
+        self._marcar_extraido(email, message_id, part_id, deteccion)
         return {"estado": "extraido", "documento": self.recepcion.documentos.obtener(email, message_id, part_id), "extraccion": documento,
                 "diagnostico": diagnostico, "mensaje": "Extraido: revisalo en Extraccion antes de enviarlo."}
 
@@ -1225,7 +1311,7 @@ class ExtractorAutomatico:
         logger.info("Ciclo automatico envio message_id=%s part_id=%s estado=%s", message_id, part_id, estado)
         final = {"enviado": ("enviado", None), "requiere_revision": ("requiere_revision", "envio_requiere_revision"), "incierto": ("requiere_revision", "envio_incierto"),
                  "error": ("error", "envio_error"), "sin_savedata": ("extraido", "sin_savedata"), "omitido": ("extraido", "envio_omitido")}.get(estado)
-        if final is not None:
+        if final is not None and not (final[0] == "requiere_revision" and self._estado_actual(email, message_id, part_id) == "requiere_revision"):
             self._marcar(email, message_id, part_id, final[0], final[1])
         ctx.setdefault("tipo_de", {})[clave] = self._nombre_tipo(email, message_id, part_id)
         if estado == "enviado":
@@ -1419,9 +1505,7 @@ class ExtractorAutomatico:
         actual = self.almacen.obtener(email, message_id, part_id)
         aseguradora = ((actual or {}).get("tipo_documento") or {}).get("aseguradora") or ""
         deteccion = {**deteccion_manual(tipo, aseguradora), "remitente": direccion(mensaje.get("senderEmail", ""))}
-        campos = self.campos_configurados(email) if tipo.get("contable") else list(tipo.get("campos") or [])
-        extraer = tipo_para_extraer(tipo)
-        resultado = self.gemini.extract_document(data, media_type, nombre, campos_solicitados=[campo["nombre"] for campo in campos], **({} if extraer is None else {"tipo": extraer}))
+        deteccion, campos, resultado = self._extraer_documento(email, data, media_type, nombre, mensaje, self.campos_configurados(email), tipo=tipo, deteccion=deteccion)
         if not deteccion.get("aseguradora") and resultado.get("aseguradora"):
             deteccion["aseguradora"] = resultado["aseguradora"]
         solicitud = borrador_desde_extraccion(resultado, campos, filename=nombre or str((actual or {}).get("filename") or ""), attachment_id=attachment_id, lote=uuid.uuid4().hex[:8],

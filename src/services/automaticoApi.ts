@@ -106,6 +106,8 @@ export type EstadoAutomatico = {
   gemini_configurado: boolean
   /** Columnas que se pedirán a Gemini: las que el usuario agregó o aceptó en sus extracciones guardadas. */
   campos: string[]
+  /** Campos que se buscan en cada tipo de documento, con su modo (manual: reglas; ia: Gemini). */
+  campos_por_tipo?: { tipo_id: string; nombre: string; codigo: string; modo: 'manual' | 'ia' | null; campos: string[] }[]
   /** Envío automático a SaveData (apagado por defecto). */
   envio_activo?: boolean
   /** Protección "Enviar solo si cuadra" (encendida por defecto). */

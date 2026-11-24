@@ -108,13 +108,13 @@ class Caso502:
 
     def test_ningun_documento_se_queda_en_leido(self) -> None:
         # Aunque un paso no deje estado (aquí se apaga a propósito), la red de seguridad lo toma del registro del proceso.
-        with patch.object(ExtractorAutomatico, "_marcar", lambda *_args, **_kwargs: None):
+        with patch.object(ExtractorAutomatico, "_marcar", lambda *_args, **_kwargs: None), patch.object(ExtractorAutomatico, "_marcar_extraido", lambda *_args, **_kwargs: None):
             self.extractor.ejecutar_ciclo()
         self.assertEqual(self.estado(), ("extraido", None))
         self.assertIn(("extraccion", "estado_recuperado"), self.eventos())
 
     def test_sin_forma_de_saber_el_estado_queda_en_error(self) -> None:
-        with patch.object(ExtractorAutomatico, "_marcar", lambda *_args, **_kwargs: None), patch.object(ExtractorAutomatico, "_estado_final", return_value=None):
+        with patch.object(ExtractorAutomatico, "_marcar", lambda *_args, **_kwargs: None), patch.object(ExtractorAutomatico, "_marcar_extraido", lambda *_args, **_kwargs: None), patch.object(ExtractorAutomatico, "_estado_final", return_value=None):
             self.extractor.ejecutar_ciclo()
         self.assertEqual(self.estado(), ("error", "sin_estado_final"))
         self.assertIn(("extraccion", "sin_estado_final"), self.eventos())

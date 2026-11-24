@@ -134,7 +134,8 @@ class ServicioRecepcion:
             return registro
         return self.documentos.actualizar(email, message_id, part_id, cambio)
 
-    def marcar(self, email: str, message_id: str, part_id: str, estado: str, motivo: str | None = None, mensaje: str | None = None) -> dict[str, Any] | None:
+    def marcar(self, email: str, message_id: str, part_id: str, estado: str, motivo: str | None = None, mensaje: str | None = None,
+               clasificacion: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Último resultado del proceso (extraido | enviado | requiere_revision | error) con su motivo. Solo sobre un
         documento ya recibido; nunca detiene el proceso (un fallo queda en el log)."""
         try:
@@ -146,6 +147,9 @@ class ServicioRecepcion:
             def cambio(previo: dict[str, Any] | None) -> dict[str, Any]:
                 registro = dict(previo or {})
                 registro["proceso"] = {"estado": estado, "motivo": (motivo or None) and str(motivo)[:50], "mensaje": (mensaje or None) and str(mensaje)[:300], "actualizado": ahora}
+                if clasificacion:
+                    # Tipo, aseguradora, estructura, versión y modo con que se extrajo (en la base, sus columnas).
+                    registro["clasificacion"] = {clave: clasificacion.get(clave) for clave in ("tipo", "aseguradora", "estructura", "version", "modo")}
                 registro["actualizado"] = ahora
                 return registro
             registro = self.documentos.actualizar(email, message_id, part_id, cambio)

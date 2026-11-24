@@ -183,7 +183,12 @@ class TipoDocumentoGuardado(BaseModel):
     estructura_id: str | None = Field(default=None, max_length=64)
     estructura: str | None = Field(default=None, max_length=120)
     estructura_version: int | None = None
-    metodo: Literal["remitente", "aseguradora", "asunto", "ia", "manual"] = "manual"
+    metodo: Literal["remitente", "aseguradora", "asunto", "ia", "manual", "texto"] = "manual"
+    # Cómo se extrajo: manual (reglas, sin IA) o ia (Gemini); y cuántos campos se encontraron de cuántos.
+    modo: Literal["manual", "ia"] | None = None
+    encontrados: int | None = None
+    total_campos: int | None = None
+    faltantes: list[str] | None = Field(default=None, max_length=30)
     confianza: float | None = Field(default=None, ge=0, le=1)
     aseguradora: str | None = Field(default=None, max_length=120)
     regla: str | None = Field(default=None, max_length=254)

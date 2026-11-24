@@ -52,6 +52,11 @@ export function textoIndicador(estado: EstadoAutomatico | null): string | null {
 }
 
 /** "Campos que se buscarán automáticamente: Nombre, RFC" (o que no hay ninguno). */
+/** «Autos individuales (manual, sin IA): Número de póliza, Placas…» por cada tipo de documento. */
+export function textoCamposPorTipo(porTipo: { nombre: string; modo: 'manual' | 'ia' | null; campos: string[] }[]): string[] {
+  return porTipo.map((tipo) => `${tipo.nombre} (${tipo.modo === 'ia' ? 'IA' : 'manual, sin IA'}): ${tipo.campos.length ? tipo.campos.join(', ') : 'sin campos configurados'}`)
+}
+
 export const textoCamposAutomaticos = (campos: string[]) =>
   campos.length > 0 ? `Campos que se buscarán automáticamente: ${campos.join(', ')}` : 'Campos que se buscarán automáticamente: ninguno (agrega columnas con "+ Campo" en una extracción).'
 
