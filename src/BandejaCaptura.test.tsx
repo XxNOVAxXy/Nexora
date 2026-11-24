@@ -4,11 +4,11 @@ import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DocumentoBandeja } from './services/bandejaApi'
 
-const { listarMock, reprocesarMock, descartarMock, eventosMock, mensajeMock } = vi.hoisted(() => ({
-  listarMock: vi.fn(), reprocesarMock: vi.fn(), descartarMock: vi.fn(), eventosMock: vi.fn(), mensajeMock: vi.fn(),
+const { listarMock, reprocesarMock, reintentarMock, descartarMock, eventosMock, mensajeMock } = vi.hoisted(() => ({
+  listarMock: vi.fn(), reprocesarMock: vi.fn(), reintentarMock: vi.fn(), descartarMock: vi.fn(), eventosMock: vi.fn(), mensajeMock: vi.fn(),
 }))
 vi.mock('./services/bandejaApi', () => ({
-  bandejaApi: { listar: listarMock, reprocesar: reprocesarMock, descartar: descartarMock, eventos: eventosMock, urlOriginal: (m: string, p: string) => `/api/documentos/${m}/${p}/original` },
+  bandejaApi: { listar: listarMock, reprocesar: reprocesarMock, reintentar: reintentarMock, descartar: descartarMock, eventos: eventosMock, urlOriginal: (m: string, p: string) => `/api/documentos/${m}/${p}/original` },
 }))
 vi.mock('./services/gmailApi', () => ({ gmailApi: { message: mensajeMock } }))
 
@@ -17,7 +17,7 @@ const { BandejaCapturaPage } = await import('./BandejaCaptura')
 const documento = (cambios: Partial<DocumentoBandeja> = {}, codigo: NonNullable<DocumentoBandeja['bandeja']>['codigo'] = 'pdf_protegido'): DocumentoBandeja => ({
   message_id: 'm1', part_id: '1', attachment_id: 'att-viejo', nombre: 'poliza.pdf', mime: 'application/pdf', tamano: 1000, recibido_en: '2026-11-20T10:00:00Z',
   asunto: 'Póliza ficticia', remitente: 'polizas@ficticia.test', guardado_en: '2026-11-20T10:01:00Z', actualizado: '2026-11-20T10:01:00Z', tiene_original: true,
-  diagnostico: { codigo: codigo === 'error_extraccion' ? 'ok' : codigo, mensaje: 'x', formato: 'pdf' },
+  diagnostico: { codigo: codigo === 'error_extraccion' || codigo === 'ia_no_disponible' ? 'ok' : codigo, mensaje: 'x', formato: 'pdf' },
   bandeja: { estado: 'pendiente', codigo, motivo: 'x', mensaje: 'El PDF esta protegido con contrasena: no se puede abrir sin ella.', entrada_en: '2026-11-20T10:01:00Z', resuelto_en: null, resolucion: null },
   ...cambios,
 })
@@ -90,6 +90,36 @@ describe('Bandeja de captura manual', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Quitar de la bandeja' }))
     await waitFor(() => expect(screen.queryByText('poliza.pdf')).toBeNull())
     expect(descartarMock).toHaveBeenCalledWith('m1', '1')
+  })
+
+  it('«Con error»: muestra el motivo (como el 502 de Gemini o un documento sin terminar) y «Reintentar»', async () => {
+    const conError = documento({ nombre: 'GNP GMM.pdf', bandeja: null, estado: 'error', motivo: 'gemini_http_502',
+      proceso: { estado: 'error', motivo: 'gemini_http_502', mensaje: 'El modelo de Gemini no esta disponible: gemini-2.5-flash-lite', actualizado: '2026-11-24T18:00:00Z' } })
+    const sinTerminar = documento({ message_id: 'm2', nombre: 'otro.pdf', bandeja: null, estado: 'leido', motivo: null, proceso: null })
+    listarMock.mockResolvedValue({ documentos: [conError, sinTerminar], motivos: {} })
+    reintentarMock.mockResolvedValue({ estado: 'extraido', mensaje: 'Extraido: revisalo en Extraccion antes de enviarlo.', documento: null })
+    pintar()
+    fireEvent.click(screen.getByRole('tab', { name: 'Con error' }))
+    await waitFor(() => expect(listarMock).toHaveBeenLastCalledWith('error'))
+    const fila = (await screen.findByText('GNP GMM.pdf')).closest('li')!
+    expect(within(fila).getByText('IA no disponible (502)')).toBeTruthy()
+    expect(within(fila).getByText(/gemini-2.5-flash-lite/)).toBeTruthy()
+    expect(within(screen.getByText('otro.pdf').closest('li')!).getByText('Sin terminar')).toBeTruthy()
+    fireEvent.click(within(fila).getByRole('button', { name: /Reintentar/ }))
+    await waitFor(() => expect(screen.queryByText('GNP GMM.pdf')).toBeNull())
+    expect(reintentarMock).toHaveBeenCalledWith('m1', '1')
+    expect(reprocesarMock).not.toHaveBeenCalled()
+  })
+
+  it('«Reintentar» que vuelve a fallar dice por qué y deja el documento en la lista', async () => {
+    const conError = documento({ bandeja: null, estado: 'error', motivo: 'gemini_http_502', proceso: { estado: 'error', motivo: 'gemini_http_502', mensaje: 'caido', actualizado: null } })
+    listarMock.mockResolvedValue({ documentos: [conError], motivos: {} })
+    reintentarMock.mockRejectedValue(new Error('El modelo de Gemini no esta disponible: gemini-2.5-flash-lite'))
+    pintar()
+    fireEvent.click(screen.getByRole('tab', { name: 'Con error' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Reintentar/ }))
+    expect((await screen.findByRole('alert')).textContent).toContain('gemini-2.5-flash-lite')
+    expect(screen.getByText('poliza.pdf')).toBeTruthy()
   })
 
   it('cambia entre pendientes, resueltos y descartados', async () => {

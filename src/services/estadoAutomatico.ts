@@ -94,6 +94,7 @@ export function resumenCiclo(ciclo: UltimoCiclo): string {
   if (ciclo.requieren_revision > 0) partes.push(plural(ciclo.requieren_revision, 'requiere revisión', 'requieren revisión'))
   if (ciclo.inciertos > 0) partes.push(plural(ciclo.inciertos, 'envío incierto', 'envíos inciertos'))
   if ((ciclo.en_bandeja ?? 0) > 0) partes.push(`${ciclo.en_bandeja} a captura manual`)
+  if ((ciclo.en_espera ?? 0) > 0) partes.push(`${ciclo.en_espera} en espera de reintento`)
   partes.push(plural(ciclo.omitidos, 'omitido', 'omitidos'), plural(ciclo.errores, 'error', 'errores'))
   return partes.join(' · ')
 }

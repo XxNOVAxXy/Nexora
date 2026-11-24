@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..db import CuentaCorreo, Documento, Envio, Evento, Usuario, a_iso, a_utc, ahora_utc
 from ..seguridad import Cifrador, hash_contrasena
+from .documentos import estado_y_motivo
 from .eventos import ETAPAS, MAX_LISTADO, MAX_MENSAJE
 
 logger = logging.getLogger("nexora.repos.db")
@@ -39,7 +40,6 @@ USUARIO_SISTEMA = "sistema"
 
 # Claves del registro JSON que tienen columna propia en ``documentos``; el resto va en la columna ``recepcion``.
 _CON_COLUMNA = {"message_id", "part_id", "nombre", "ruta", "sha256", "tamano", "recibido_en", "asunto", "remitente", "guardado_en", "actualizado"}
-_ESTADO_POR_BANDEJA = {"pendiente": "captura_manual", "resuelto": "extraido", "descartado": "descartado"}
 
 CODIGOS_OK = {"ok", "exito"}
 CODIGOS_AVISO = {"pdf_escaneado", "descartado", "omitido", "incierto", "requiere_revision", "sin_savedata", "no_existe", "original_no_guardado"}
@@ -161,13 +161,7 @@ def registro_desde_fila(fila: Documento) -> dict[str, Any]:
 
 def columnas_desde_registro(registro: dict[str, Any], estado_previo: str | None) -> dict[str, Any]:
     """Registro (formato JSON) → valores de las columnas de ``documentos``."""
-    bandeja = registro.get("bandeja") if isinstance(registro.get("bandeja"), dict) else None
-    diagnostico = registro.get("diagnostico") if isinstance(registro.get("diagnostico"), dict) else {}
-    estado = _ESTADO_POR_BANDEJA.get((bandeja or {}).get("estado") or "")
-    if estado is None:
-        estado = estado_previo if estado_previo and estado_previo not in _ESTADO_POR_BANDEJA.values() else "leido"
-    codigo_diagnostico = diagnostico.get("codigo")
-    motivo = (bandeja or {}).get("codigo") or (codigo_diagnostico if codigo_diagnostico and codigo_diagnostico != "ok" else None)
+    estado, motivo = estado_y_motivo(registro, estado_previo)
     recepcion = {clave: valor for clave, valor in registro.items() if clave not in _CON_COLUMNA}
     ahora = ahora_utc()
     return {

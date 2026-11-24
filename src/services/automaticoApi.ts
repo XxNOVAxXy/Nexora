@@ -75,6 +75,8 @@ export type UltimoCiclo = {
   ya_revisados: number
   /** Adjuntos que pasaron a la Bandeja de captura manual en el ciclo (ausente en ciclos anteriores a la bandeja). */
   en_bandeja?: number
+  /** Documentos con error temporal de la IA esperando su siguiente reintento (ausente en ciclos anteriores). */
+  en_espera?: number
   descartes: DescarteCiclo[]
   descartes_total: number
   /** "Se enviaron 2 (1 Fianzas, 1 Autos individuales) · 1 requiere revisión (Gastos médicos mayores)". */

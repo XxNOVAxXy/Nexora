@@ -11,6 +11,11 @@ Registro (todos los campos opcionales salvo los ids)::
     guardado_en, actualizado
     diagnostico        {codigo, mensaje, formato, mime, paginas, caracteres}
     bandeja            None | {estado: pendiente|resuelto|descartado, codigo, mensaje, entrada_en, resuelto_en, resolucion}
+    proceso            None | {estado: extraido|enviado|requiere_revision|error, motivo, mensaje, actualizado}
+
+Estado del documento (``estado_y_motivo``; en la base son las columnas ``estado`` y ``motivo``): ``leido`` solo
+mientras se procesa; al terminar un ciclo queda en extraido | enviado | requiere_revision | captura_manual | error
+(o descartado si el usuario lo quitó de la bandeja).
 """
 
 from __future__ import annotations
@@ -26,6 +31,30 @@ from ..extracciones import cuenta_id, escribir_atomico
 logger = logging.getLogger("nexora.repos.documentos")
 
 SCHEMA = 1
+
+
+ESTADOS_PROCESO = ("extraido", "enviado", "requiere_revision", "error")
+# Estados que salen de la bandeja (no del proceso).
+ESTADOS_BANDEJA_DOCUMENTO = ("captura_manual", "descartado")
+
+
+def estado_y_motivo(registro: dict[str, Any], estado_previo: str | None = None) -> tuple[str, str | None]:
+    """(estado, motivo) del documento. La bandeja pendiente o descartada manda; después, el último resultado del
+    proceso; sin ninguno, ``leido`` (o el estado que ya tenía en la base, si no era de la bandeja)."""
+    bandeja = registro.get("bandeja") if isinstance(registro.get("bandeja"), dict) else {}
+    proceso = registro.get("proceso") if isinstance(registro.get("proceso"), dict) else {}
+    if bandeja.get("estado") == "pendiente":
+        return "captura_manual", bandeja.get("codigo")
+    if bandeja.get("estado") == "descartado":
+        return "descartado", bandeja.get("codigo")
+    if proceso.get("estado") in ESTADOS_PROCESO:
+        return str(proceso["estado"]), proceso.get("motivo")
+    if bandeja.get("estado") == "resuelto":
+        return "extraido", bandeja.get("resolucion")
+    diagnostico = registro.get("diagnostico") if isinstance(registro.get("diagnostico"), dict) else {}
+    codigo = diagnostico.get("codigo")
+    estado = estado_previo if estado_previo and estado_previo not in ESTADOS_BANDEJA_DOCUMENTO else "leido"
+    return estado, codigo if codigo and codigo != "ok" else None
 
 
 def clave_documento(message_id: str, part_id: str) -> str:

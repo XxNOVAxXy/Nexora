@@ -471,9 +471,24 @@ def _call_gemini_sdk(api_key: str, model: str, data: bytes, mime_type: str, file
             raise GeminiRequestError("Gemini rechazo la solicitud por cuota o limite de velocidad.", code="quota", status_code=429, retryable=True) from error
         if "timeout" in lowered or "deadline" in lowered or "timed out" in lowered:
             raise GeminiRequestError("Gemini agoto el tiempo de espera.", code="timeout", status_code=504, retryable=True) from error
+        # Caída temporal del servicio o del modelo (500, 502, 503, 504): se reintenta con los modelos de respaldo. Va antes de
+        # "modelo no disponible" porque estos mensajes también dicen "model" ("The model is overloaded").
+        estado_http = _estado_http(error)
+        if estado_http in {500, 502, 503, 504} or any(texto in lowered for texto in ("overloaded", "unavailable", "internal error", "bad gateway")):
+            estado_http = estado_http if estado_http in {500, 502, 503, 504} else 503
+            raise GeminiRequestError(f"Gemini no esta disponible por ahora ({estado_http}) con el modelo {model}.", code="unavailable", status_code=estado_http, retryable=True) from error
         if "404" in lowered or "not found" in lowered or "model" in lowered and "not" in lowered:
             raise GeminiRequestError(f"El modelo de Gemini no esta disponible: {model}.", code="model_unavailable", status_code=502, retryable=False) from error
         raise GeminiRequestError(f"No se pudo completar la solicitud a Gemini: {message}", code="request", retryable=True) from error
+
+
+def _estado_http(error: Exception) -> int | None:
+    """Código HTTP de un error del SDK de Gemini (``APIError.code``), o el que aparezca al inicio del mensaje."""
+    codigo = getattr(error, "code", None) or getattr(error, "status_code", None)
+    if isinstance(codigo, int):
+        return codigo
+    coincidencia = re.match(r"\s*(\d{3})\b", str(error))
+    return int(coincidencia.group(1)) if coincidencia else None
 
 
 def _nombre_finalizacion(response: Any) -> str | None:

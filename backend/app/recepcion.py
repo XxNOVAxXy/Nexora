@@ -18,6 +18,7 @@ from typing import Any, Callable
 from .diagnostico import diagnosticar
 from .originales import AlmacenOriginales, extension_segura, sha256_de
 from .repos import RepoDocumentos, RepoEventos
+from .repos.documentos import estado_y_motivo
 
 logger = logging.getLogger("nexora.recepcion")
 
@@ -27,6 +28,7 @@ MOTIVOS_BANDEJA: dict[str, str] = {
     "pdf_escaneado": "PDF escaneado (sin texto)",
     "formato_no_soportado": "Formato no soportado",
     "error_extraccion": "No se pudo extraer",
+    "ia_no_disponible": "La IA no estuvo disponible",
 }
 ESTADOS_BANDEJA = ("pendiente", "resuelto", "descartado")
 
@@ -132,6 +134,33 @@ class ServicioRecepcion:
             return registro
         return self.documentos.actualizar(email, message_id, part_id, cambio)
 
+    def marcar(self, email: str, message_id: str, part_id: str, estado: str, motivo: str | None = None, mensaje: str | None = None) -> dict[str, Any] | None:
+        """Último resultado del proceso (extraido | enviado | requiere_revision | error) con su motivo. Solo sobre un
+        documento ya recibido; nunca detiene el proceso (un fallo queda en el log)."""
+        try:
+            if self.documentos.obtener(email, message_id, part_id) is None:
+                return None
+            ahora = self._ahora()
+
+            def cambio(previo: dict[str, Any] | None) -> dict[str, Any]:
+                registro = dict(previo or {})
+                registro["proceso"] = {"estado": estado, "motivo": (motivo or None) and str(motivo)[:50], "mensaje": (mensaje or None) and str(mensaje)[:300], "actualizado": ahora}
+                registro["actualizado"] = ahora
+                return registro
+            return self.documentos.actualizar(email, message_id, part_id, cambio)
+        except Exception:
+            logger.exception("No se pudo marcar el estado del documento message_id=%s part_id=%s", message_id, part_id)
+            return None
+
+    @staticmethod
+    def estado(registro: dict[str, Any]) -> tuple[str, str | None]:
+        return estado_y_motivo(registro)
+
+    def con_error(self, email: str) -> list[dict[str, Any]]:
+        """Documentos en error o que se quedaron en ``leido`` (sin terminar): los del botón "Reintentar"."""
+        registros = [registro for registro in self.documentos.listar(email) if estado_y_motivo(registro)[0] in {"error", "leido"}]
+        return sorted(registros, key=lambda registro: str(registro.get("actualizado") or ""), reverse=True)
+
     def resolver(self, email: str, message_id: str, part_id: str, resolucion: str, *, estado: str = "resuelto") -> dict[str, Any] | None:
         """Saca el documento de la bandeja (si estaba pendiente). Devuelve el registro o None si no estaba."""
         previo = self.documentos.obtener(email, message_id, part_id)
@@ -142,6 +171,9 @@ class ServicioRecepcion:
         def cambio(registro: dict[str, Any] | None) -> dict[str, Any]:
             registro = dict(registro or {})
             registro["bandeja"] = {**(registro.get("bandeja") or {}), "estado": estado, "resuelto_en": ahora, "resolucion": resolucion}
+            if estado == "resuelto":
+                # Resuelto (extraído al reprocesar o capturado a mano): un error anterior ya no aplica.
+                registro["proceso"] = {"estado": "extraido", "motivo": resolucion[:50], "mensaje": None, "actualizado": ahora}
             registro["actualizado"] = ahora
             return registro
         return self.documentos.actualizar(email, message_id, part_id, cambio)

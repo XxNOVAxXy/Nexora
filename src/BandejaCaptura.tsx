@@ -12,10 +12,24 @@ export const MOTIVO_BANDEJA: Record<CodigoBandeja, { texto: string; ayuda: strin
   pdf_escaneado: { texto: 'PDF escaneado', ayuda: 'No tiene texto. «Reprocesar» lo lee con la IA como imagen.', clase: 'bg-amber-100 text-amber-800' },
   formato_no_soportado: { texto: 'Formato no soportado', ayuda: 'No es PDF ni imagen. Revisa el archivo y captúralo a mano si hace falta.', clase: 'bg-slate-200 text-slate-700' },
   error_extraccion: { texto: 'No se pudo extraer', ayuda: 'La extracción automática agotó sus intentos. «Reprocesar» lo intenta de nuevo.', clase: 'bg-red-50 text-red-700' },
+  ia_no_disponible: { texto: 'IA no disponible', ayuda: 'La IA no respondió en 3 intentos. «Reprocesar» lo intenta de nuevo o captúralo a mano.', clase: 'bg-red-50 text-red-700' },
+}
+
+/** Motivo de un documento en error, en palabras. */
+export function textoMotivoError(documento: DocumentoBandeja): string {
+  const motivo = documento.motivo ?? ''
+  if (documento.estado === 'leido') return 'Sin terminar'
+  if (motivo === 'gemini_timeout') return 'La IA tardó demasiado'
+  const http = /^gemini_http_(\d{3})$/.exec(motivo)
+  if (http) return http[1] === '429' ? 'IA: límite de uso (429)' : `IA no disponible (${http[1]})`
+  if (motivo === 'servicio_no_disponible') return 'Servicio no disponible'
+  if (motivo === 'envio_error') return 'Error al enviar a SaveData'
+  if (motivo === 'proceso_interrumpido' || motivo === 'sin_estado_final') return 'Proceso interrumpido'
+  return motivo ? motivo.replace(/_/g, ' ') : 'Error'
 }
 
 const ETAPA: Record<EventoProceso['etapa'], string> = { lectura: 'Lectura', diagnostico: 'Diagnóstico', extraccion: 'Extracción', envio: 'Envío' }
-const ESTADOS: { valor: EstadoBandeja; texto: string }[] = [{ valor: 'pendiente', texto: 'Pendientes' }, { valor: 'resuelto', texto: 'Resueltos' }, { valor: 'descartado', texto: 'Descartados' }]
+const ESTADOS: { valor: EstadoBandeja; texto: string }[] = [{ valor: 'pendiente', texto: 'Pendientes' }, { valor: 'error', texto: 'Con error' }, { valor: 'resuelto', texto: 'Resueltos' }, { valor: 'descartado', texto: 'Descartados' }]
 
 const fechaHora = (valor: string | null | undefined) => (valor ? formatoMexico({ dateStyle: 'medium', timeStyle: 'short' }).format(new Date(valor)) : '—')
 const clave = (documento: DocumentoBandeja) => `${documento.message_id}__${documento.part_id}`
@@ -53,10 +67,12 @@ export function BandejaCapturaPage() {
     setOcupado(id)
     setAviso(null)
     try {
-      const resultado = await bandejaApi.reprocesar(documento.message_id, documento.part_id)
+      const enError = estado === 'error'
+      const resultado = await (enError ? bandejaApi.reintentar : bandejaApi.reprocesar)(documento.message_id, documento.part_id)
       const ok = resultado.estado !== 'sigue_en_bandeja'
       setAviso({ id, ok, mensaje: ok ? (resultado.mensaje ?? 'Listo.') : `Sigue sin poder procesarse: ${resultado.mensaje ?? ''}`.trim() })
-      if (ok) setDocumentos((previo) => previo?.filter((item) => clave(item) !== id) ?? previo)
+      // En «Con error», si pasó a la bandeja tampoco sigue en esta lista.
+      if (ok || enError) setDocumentos((previo) => previo?.filter((item) => clave(item) !== id) ?? previo)
     } catch (motivo) {
       setAviso({ id, ok: false, mensaje: motivo instanceof Error ? motivo.message : 'No se pudo reprocesar.' })
     } finally {
@@ -108,26 +124,29 @@ export function BandejaCapturaPage() {
 
     {error && <div role="alert" className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
     {!error && documentos === null && <div className="panel flex items-center justify-center gap-2 p-10 text-sm text-slate-400"><Loader2 size={16} className="animate-spin" />Cargando bandeja…</div>}
-    {documentos?.length === 0 && <div className="panel p-10 text-center text-sm text-slate-400">{estado === 'pendiente' ? 'No hay documentos pendientes de captura manual.' : 'No hay documentos en esta lista.'}</div>}
+    {documentos?.length === 0 && <div className="panel p-10 text-center text-sm text-slate-400">{estado === 'pendiente' ? 'No hay documentos pendientes de captura manual.' : estado === 'error' ? 'No hay documentos con error.' : 'No hay documentos en esta lista.'}</div>}
 
     {documentos && documentos.length > 0 && <ul className="space-y-3">{documentos.map((documento) => {
       const id = clave(documento)
       const bandeja = documento.bandeja
-      const motivo = bandeja ? MOTIVO_BANDEJA[bandeja.codigo] : undefined
+      const enError = estado === 'error'
+      const motivo = bandeja && !enError ? MOTIVO_BANDEJA[bandeja.codigo] : undefined
       const expandido = abierto === id
       const lista = eventos[id]
       return <li key={id} className="panel overflow-hidden">
         <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-center">
           <button type="button" aria-label={expandido ? 'Ocultar historial' : 'Ver historial'} aria-expanded={expandido} onClick={() => verEventos(documento)} className="self-start rounded-md p-1 text-slate-400 hover:bg-slate-100 lg:self-auto">{expandido ? <ChevronDown size={16} /> : <ChevronRight size={16} />}</button>
           <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2"><FileText size={16} className="shrink-0 text-slate-400" /><span className="truncate font-semibold text-ink">{documento.nombre || 'Documento'}</span>{motivo && <span className={`rounded-full px-2 py-0.5 text-[11px] font-bold ${motivo.clase}`}>{motivo.texto}</span>}</div>
+            <div className="flex flex-wrap items-center gap-2"><FileText size={16} className="shrink-0 text-slate-400" /><span className="truncate font-semibold text-ink">{documento.nombre || 'Documento'}</span>{motivo && <span className={`rounded-full px-2 py-0.5 text-[11px] font-bold ${motivo.clase}`}>{motivo.texto}</span>}{enError && <span className="rounded-full bg-red-50 px-2 py-0.5 text-[11px] font-bold text-red-700">{textoMotivoError(documento)}</span>}</div>
             <div className="mt-1 text-xs text-slate-500">{documento.asunto || 'Sin asunto'}{documento.remitente ? ` · ${documento.remitente}` : ''} · Recibido {fechaHora(documento.recibido_en)} · En la bandeja desde {fechaHora(bandeja?.entrada_en)}</div>
-            {bandeja?.mensaje && <div className="mt-1.5 flex items-start gap-1.5 text-xs text-slate-700"><AlertTriangle size={13} className="mt-0.5 shrink-0 text-amber-600" /><span>{bandeja.mensaje}{motivo ? ` ${motivo.ayuda}` : ''}</span></div>}
-            {bandeja && bandeja.estado !== 'pendiente' && <div className="mt-1 text-xs text-slate-500">{bandeja.estado === 'resuelto' ? 'Resuelto' : 'Descartado'} {fechaHora(bandeja.resuelto_en)}{bandeja.resolucion ? ` (${bandeja.resolucion.replace(/_/g, ' ')})` : ''}</div>}
+            {enError && <div className="mt-1.5 flex items-start gap-1.5 text-xs text-red-700"><AlertTriangle size={13} className="mt-0.5 shrink-0" /><span>{documento.proceso?.mensaje ?? 'El documento se recibió pero no terminó de procesarse.'} «Reintentar» lo vuelve a extraer ahora.</span></div>}
+            {!enError && bandeja?.mensaje && <div className="mt-1.5 flex items-start gap-1.5 text-xs text-slate-700"><AlertTriangle size={13} className="mt-0.5 shrink-0 text-amber-600" /><span>{bandeja.mensaje}{motivo ? ` ${motivo.ayuda}` : ''}</span></div>}
+            {!enError && bandeja && bandeja.estado !== 'pendiente' && <div className="mt-1 text-xs text-slate-500">{bandeja.estado === 'resuelto' ? 'Resuelto' : 'Descartado'} {fechaHora(bandeja.resuelto_en)}{bandeja.resolucion ? ` (${bandeja.resolucion.replace(/_/g, ' ')})` : ''}</div>}
           </div>
           <div className="flex flex-wrap gap-2 lg:shrink-0">
             {documento.tiene_original && <a href={bandejaApi.urlOriginal(documento.message_id, documento.part_id)} target="_blank" rel="noreferrer" className="btn-soft justify-center"><ExternalLink size={15} />Ver original</a>}
-            {bandeja?.estado === 'pendiente' && <>
+            {enError && <button type="button" onClick={() => void reprocesar(documento)} disabled={ocupado !== null} className="btn-primary justify-center">{ocupado === id ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}Reintentar</button>}
+            {!enError && bandeja?.estado === 'pendiente' && <>
               <button type="button" onClick={() => void reprocesar(documento)} disabled={ocupado !== null} className="btn-primary justify-center">{ocupado === id ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}Reprocesar</button>
               <button type="button" onClick={() => void capturar(documento)} disabled={ocupado !== null} className="btn-soft justify-center"><PenLine size={15} />Capturar a mano</button>
               <button type="button" onClick={() => void descartar(documento)} disabled={ocupado !== null} aria-label="Quitar de la bandeja" title="Quitar de la bandeja" className="flex items-center justify-center rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-500 hover:bg-slate-50"><Trash2 size={15} /></button>

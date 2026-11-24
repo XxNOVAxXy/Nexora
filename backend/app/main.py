@@ -572,8 +572,9 @@ def guardar_extraccion(message_id: str, part_id: str, payload: GuardarExtraccion
 
 def _documento_publico(registro: dict[str, Any]) -> dict[str, Any]:
     campos = ("message_id", "part_id", "attachment_id", "nombre", "mime", "tamano", "sha256", "recibido_en", "asunto", "remitente", "guardado_en",
-              "actualizado", "diagnostico", "bandeja")
-    return {**{campo: registro.get(campo) for campo in campos}, "tiene_original": bool(registro.get("ruta"))}
+              "actualizado", "diagnostico", "bandeja", "proceso")
+    estado, motivo = recepcion.estado(registro)
+    return {**{campo: registro.get(campo) for campo in campos}, "estado": estado, "motivo": motivo, "tiene_original": bool(registro.get("ruta"))}
 
 
 @app.get("/api/salud/db")
@@ -583,9 +584,17 @@ def salud_base_datos() -> dict[str, Any]:
 
 
 @app.get("/api/bandeja")
-def listar_bandeja(estado: str = Query("pendiente", pattern="^(pendiente|resuelto|descartado)$")) -> dict[str, Any]:
+def listar_bandeja(estado: str = Query("pendiente", pattern="^(pendiente|resuelto|descartado|error)$")) -> dict[str, Any]:
+    """``error``: documentos en error o que se quedaron sin terminar (``leido``), con el botón "Reintentar"."""
     email = _cuenta_actual()
-    return {"documentos": [_documento_publico(registro) for registro in recepcion.bandeja(email, estado)], "motivos": MOTIVOS_BANDEJA}
+    registros = recepcion.con_error(email) if estado == "error" else recepcion.bandeja(email, estado)
+    return {"documentos": [_documento_publico(registro) for registro in registros], "motivos": MOTIVOS_BANDEJA}
+
+
+@app.post("/api/documentos/{message_id}/{part_id}/reintentar")
+def reintentar_documento(message_id: str, part_id: str) -> dict[str, Any]:
+    """Botón "Reintentar" de un documento en error (o que se quedó en leido): lo vuelve a diagnosticar y extraer ya."""
+    return reprocesar_bandeja(message_id, part_id)
 
 
 @app.post("/api/bandeja/{message_id}/{part_id}/reprocesar")

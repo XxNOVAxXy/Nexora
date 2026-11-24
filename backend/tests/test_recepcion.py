@@ -233,13 +233,14 @@ class CicloAutomatico(BaseRecepcion):
         self.assertEqual(len(list((self.raiz / "originales").rglob("*.pdf"))), 1)
 
     def test_intentos_agotados_pasan_a_la_bandeja(self) -> None:
+        # Un error que no es temporal (el documento no le sirve a la IA): se reintenta sin espera y va a la bandeja.
         self.gmail.correo_con("m1", [("a1", pdf_con_texto(), "application/pdf", "estado.pdf")])
-        self.gemini.fallar = GeminiRequestError("respuesta invalida", code="invalid_response", status_code=502)
+        self.gemini.fallar = GeminiRequestError("documento invalido", code="invalid_document", status_code=422)
         for _ in range(MAX_INTENTOS):
             self.extractor.ejecutar_ciclo()
         self.assertEqual(self.estado_adjunto("m1")["estado"], "error")
         self.assertEqual(self.recepcion.documentos.obtener(EMAIL, "m1", "1")["bandeja"]["codigo"], "error_extraccion")
-        self.assertEqual([codigo for etapa, codigo in self.eventos("m1") if etapa == "extraccion"], ["gemini_http_502"] * MAX_INTENTOS)
+        self.assertEqual([codigo for etapa, codigo in self.eventos("m1") if etapa == "extraccion"], ["gemini_http_422"] * MAX_INTENTOS)
 
 
 class Reprocesar(BaseRecepcion):

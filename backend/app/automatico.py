@@ -70,6 +70,11 @@ from .tipos_documento import AlmacenTipos, deteccion_manual, direccion, detectar
 logger = logging.getLogger("nexora.automatico")
 
 MAX_INTENTOS = 3
+# Errores temporales de la IA (429, 500, 502, 503, 504 y tiempo agotado): espera antes del 2.º y del 3.er intento.
+ESPERAS_REINTENTO = (timedelta(minutes=10), timedelta(minutes=30))
+CODIGOS_HTTP_TEMPORALES = {429, 500, 502, 503, 504}
+# Errores de Gemini que no se arreglan esperando (configuración o documento): nunca son temporales.
+CODIGOS_NO_TEMPORALES = {"authentication", "empty_document", "invalid_document", "unsupported_mime", "campo_invalido", "sdk_missing"}
 MAX_CORREOS_POR_CICLO = 100
 # Margen hacia atrás sobre el último correo procesado: Gmail no garantiza el orden exacto de llegada.
 MARGEN_BUSQUEDA = timedelta(days=1)
@@ -100,6 +105,20 @@ MOTIVOS: dict[str, str] = {
     "sin_savedata": "SAVEDATA_URL no esta configurada: se extrajo pero no se envio.",
 }
 INTERRUMPIDO_REINICIO = "El backend se reinicio o se apago antes de terminar el ciclo."
+
+
+def es_error_temporal(error: Exception) -> bool:
+    """429, 500, 502, 503, 504 o tiempo agotado de Gemini (después de probar los modelos de GEMINI_FALLBACK_MODELS)."""
+    if not isinstance(error, GeminiRequestError) or error.code in CODIGOS_NO_TEMPORALES:
+        return False
+    return error.code == "timeout" or error.status_code in CODIGOS_HTTP_TEMPORALES
+
+
+def causa_de(error: Exception) -> str:
+    """Código del evento y del motivo: ``gemini_http_502``, ``gemini_timeout``… o el nombre de la excepción."""
+    if isinstance(error, GeminiRequestError):
+        return "gemini_timeout" if error.code == "timeout" else f"gemini_http_{error.status_code}"
+    return error.__class__.__name__
 
 
 def _proceso_vivo(pid: int) -> bool:
@@ -135,7 +154,7 @@ def _proceso_vivo(pid: int) -> bool:
 
 def _resumen_vacio() -> dict[str, int]:
     return {"correos_encontrados": 0, "extraidos": 0, "enviados": 0, "requieren_revision": 0, "inciertos": 0,
-            "omitidos": 0, "errores": 0, "ya_revisados": 0, "en_bandeja": 0}
+            "omitidos": 0, "errores": 0, "ya_revisados": 0, "en_bandeja": 0, "en_espera": 0}
 
 
 def _tipos_adjuntos(adjuntos: list[dict[str, Any]]) -> str:
@@ -858,11 +877,43 @@ class ExtractorAutomatico:
             completo = True
             for adjunto in validos:
                 part_id = str(adjunto.get("partId"))
-                if self._procesar_adjunto(email, message_id, part_id, adjunto, campos, ctx, mensaje) not in TERMINALES:
+                if self._procesar_adjunto_seguro(email, message_id, part_id, adjunto, campos, ctx, mensaje) not in TERMINALES:
                     completo = False
             if completo:
                 self._avanzar(email, "ultimo_correo", {"id": message_id, "recibido": _iso(recibido)})
                 self._avanzar(email, "revisado_hasta", _iso(recibido))
+
+    def _procesar_adjunto_seguro(self, email: str, message_id: str, part_id: str, adjunto: dict[str, Any], campos: list[dict[str, Any]], ctx: dict[str, Any],
+                                 mensaje: dict[str, Any] | None = None) -> str:
+        """Regla: ningún documento recibido se queda en ``leido`` al terminar su paso por el ciclo. Si el paso terminó
+        (o se cortó) sin dejarle estado, queda en ``error`` con un evento de aviso que dice por qué."""
+        estado = "interrumpido"
+        try:
+            estado = self._procesar_adjunto(email, message_id, part_id, adjunto, campos, ctx, mensaje)
+            return estado
+        finally:
+            self._sin_quedarse_en_leido(email, message_id, part_id, estado)
+
+    def _sin_quedarse_en_leido(self, email: str, message_id: str, part_id: str, estado_adjunto: str) -> None:
+        if self.recepcion is None:
+            return
+        try:
+            registro = self.recepcion.documentos.obtener(email, message_id, part_id)
+        except Exception:
+            logger.exception("No se pudo revisar el estado final del documento %s__%s", message_id, part_id)
+            return
+        if registro is None or self.recepcion.estado(registro)[0] != "leido":
+            return
+        motivo = "proceso_interrumpido" if estado_adjunto not in TERMINALES else "sin_estado_final"
+        mensaje = ("El ciclo se corto antes de terminar este documento; se reintentara en la siguiente revision." if motivo == "proceso_interrumpido"
+                   else "El documento termino su paso por el ciclo sin un estado final.")
+        self.recepcion.marcar(email, message_id, part_id, "error", motivo, mensaje)
+        self._evento(email, "extraccion", motivo, mensaje, message_id, part_id, detalle={"estado_adjunto": estado_adjunto})
+        logger.warning("Ciclo automatico documento sin estado final clave=%s__%s motivo=%s", message_id, part_id, motivo)
+
+    def _marcar(self, email: str, message_id: str, part_id: str, estado: str, motivo: str | None = None, mensaje: str | None = None) -> None:
+        if self.recepcion is not None:
+            self.recepcion.marcar(email, message_id, part_id, estado, motivo, mensaje)
 
     def _procesar_adjunto(self, email: str, message_id: str, part_id: str, adjunto: dict[str, Any], campos: list[dict[str, Any]], ctx: dict[str, Any],
                           mensaje: dict[str, Any] | None = None) -> str:
@@ -875,13 +926,21 @@ class ExtractorAutomatico:
         intentos = int(entrada.get("intentos") or 0)
         if intentos >= MAX_INTENTOS:
             self._anotar(email, clave, estado="error", error=entrada.get("error") or "Se agotaron los intentos.")
+            self._marcar(email, message_id, part_id, "error", "intentos_agotados", entrada.get("error") or "Se agotaron los intentos.")
             resumen["errores"] += 1
             ctx["claves"]["error"].append(clave)
             logger.info("Ciclo automatico adjunto error message_id=%s part_id=%s motivo=intentos_agotados", message_id, part_id)
             return "error"
+        # Error temporal de la IA: espera creciente antes del siguiente intento (sigue en "error" mientras tanto).
+        proximo = _fecha(entrada.get("proximo_intento"))
+        if proximo is not None and self.reloj() < proximo:
+            resumen["en_espera"] += 1
+            logger.info("Ciclo automatico adjunto en espera de reintento clave=%s hasta=%s", clave, entrada.get("proximo_intento"))
+            return "pendiente"
         # Una extracción guardada (o editada) por el usuario nunca se toca.
         if self.almacen.obtener(email, message_id, part_id) is not None:
             self._anotar(email, clave, estado="omitido", error=None)
+            self._marcar(email, message_id, part_id, "extraido", "ya_tenia_extraccion")
             self._descartar(email, ctx, clave, "ya_tenia_extraccion", message_id=message_id, part_id=part_id, mensaje=mensaje)
             return "omitido"
 
@@ -907,10 +966,13 @@ class ExtractorAutomatico:
             self._anotar(email, clave, estado="pendiente", intentos=intentos, error=str(error))
             etapa = "extraccion" if isinstance(error, GeminiUnavailableError) else "lectura"
             self._evento(email, etapa, "servicio_no_disponible", str(error), message_id, part_id)
+            self._marcar(email, message_id, part_id, "error", "servicio_no_disponible", str(error))
+            resumen["errores"] += 1
+            ctx["claves"]["error"].append(clave)
             logger.info("Ciclo automatico adjunto pendiente message_id=%s part_id=%s motivo=%s", message_id, part_id, error.__class__.__name__)
             raise _CortarCiclo(str(error)) from error
         except GeminiRequestError as error:
-            estado = self._fallo(email, clave, intentos + 1, str(error), ctx, f"gemini_http_{error.status_code}")
+            estado = self._fallo(email, clave, intentos + 1, str(error), ctx, causa_de(error), temporal=es_error_temporal(error))
             if error.status_code == 429:
                 raise _CortarCiclo(str(error)) from error
             return estado
@@ -926,6 +988,7 @@ class ExtractorAutomatico:
         except (ConflictoVersion, EnvioEnCurso):
             # El usuario guardó este documento mientras Gemini extraía: lo suyo se conserva.
             self._anotar(email, clave, estado="omitido", error=None)
+            self._marcar(email, message_id, part_id, "extraido", "guardado_por_usuario")
             self._descartar(email, ctx, clave, "guardado_por_usuario", message_id=message_id, part_id=part_id, mensaje=mensaje)
             return "omitido"
         except Exception as error:
@@ -933,9 +996,10 @@ class ExtractorAutomatico:
             return self._fallo(email, clave, intentos + 1, str(error) or error.__class__.__name__, ctx, error.__class__.__name__)
         # Solo lo extraído con el envío automático encendido se envía solo.
         enviar_auto = bool(self._leer(email).get("envio_activo"))
-        self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"), enviar_auto=enviar_auto)
+        self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"), enviar_auto=enviar_auto, proximo_intento=None)
         self._evento(email, "extraccion", "ok", f"Extraido con IA ({resultado.get('model') or 'Gemini'}).", message_id, part_id,
                      detalle={"tipo": deteccion.get("codigo"), "filas": len(documento.get("transacciones", []))})
+        self._marcar(email, message_id, part_id, "extraido")
         resumen["extraidos"] += 1
         logger.info("Ciclo automatico adjunto extraido message_id=%s part_id=%s transacciones=%d envio_auto=%s", message_id, part_id, len(documento.get("transacciones", [])), enviar_auto)
         if enviar_auto:
@@ -1043,8 +1107,10 @@ class ExtractorAutomatico:
             deteccion, campos_tipo, extraer = self._detectar(email, data, media_type, nombre, mensaje, campos)
             resultado = self.gemini.extract_document(data, media_type, nombre, campos_solicitados=[campo["nombre"] for campo in campos_tipo], **extraer)
         except Exception as error:
-            causa = f"gemini_http_{error.status_code}" if isinstance(error, GeminiRequestError) else error.__class__.__name__
+            causa = causa_de(error)
             self._evento(email, "extraccion", causa, str(error) or causa, message_id, part_id, origen="reprocesar")
+            if (registro_actual := self.recepcion.documentos.obtener(email, message_id, part_id)) is not None and self.recepcion.estado(registro_actual)[0] != "captura_manual":
+                self.recepcion.marcar(email, message_id, part_id, "error", causa, str(error) or causa)
             raise
         if not deteccion.get("aseguradora") and resultado.get("aseguradora"):
             deteccion["aseguradora"] = resultado["aseguradora"]
@@ -1053,28 +1119,38 @@ class ExtractorAutomatico:
         documento = self.almacen.guardar(email, message_id, part_id, solicitud)
         self._registrar_estructura(email, deteccion, resultado, data)
         # El proceso automático ya no lo vuelve a tomar; no se envía solo (lo revisa el usuario).
-        self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"), enviar_auto=False)
+        self._anotar(email, clave, estado="extraido", error=None, version=documento.get("version"), enviar_auto=False, proximo_intento=None)
+        self.recepcion.marcar(email, message_id, part_id, "extraido")
         self._evento(email, "extraccion", "ok", f"Extraido con IA al reprocesar ({resultado.get('model') or 'Gemini'}).", message_id, part_id, origen="reprocesar",
                      detalle={"tipo": deteccion.get("codigo"), "filas": len(documento.get("transacciones", []))})
         self.recepcion.resolver(email, message_id, part_id, "extraido")
         return {"estado": "extraido", "documento": self.recepcion.documentos.obtener(email, message_id, part_id), "extraccion": documento,
                 "diagnostico": diagnostico, "mensaje": "Extraido: revisalo en Extraccion antes de enviarlo."}
 
-    def _fallo(self, email: str, clave: str, intentos: int, mensaje: str, ctx: dict[str, Any], causa: str = "error") -> str:
-        estado = "error" if intentos >= MAX_INTENTOS else "pendiente"
-        self._anotar(email, clave, estado=estado, intentos=intentos, error=mensaje[:500])
+    def _fallo(self, email: str, clave: str, intentos: int, mensaje: str, ctx: dict[str, Any], causa: str = "error", *, temporal: bool = False) -> str:
+        """Un intento de extracción falló. El documento queda en ``error`` con ``causa`` como motivo y el error cuenta en
+        el resumen del ciclo. Se reintenta en los siguientes ciclos (si es temporal, con espera creciente) hasta
+        ``MAX_INTENTOS``; después pasa a la bandeja (``ia_no_disponible`` si la IA nunca respondió)."""
+        agotado = intentos >= MAX_INTENTOS
+        estado = "error" if agotado else "pendiente"
+        proximo = None if agotado or not temporal else self.reloj() + ESPERAS_REINTENTO[min(intentos, len(ESPERAS_REINTENTO)) - 1]
+        self._anotar(email, clave, estado=estado, intentos=intentos, error=mensaje[:500], proximo_intento=_iso(proximo), causa=causa)
         message_id, _, part_id = clave.partition("__")
-        self._evento(email, "extraccion", causa, mensaje, message_id, part_id, detalle={"intento": intentos, "de": MAX_INTENTOS})
-        if estado == "error" and self.recepcion is not None:
+        self._evento(email, "extraccion", causa, mensaje, message_id, part_id,
+                     detalle={"intento": intentos, "de": MAX_INTENTOS, "temporal": temporal, "proximo_intento": _iso(proximo)})
+        self._marcar(email, message_id, part_id, "error", causa, mensaje)
+        if agotado and self.recepcion is not None:
             # Agotó sus intentos: pasa a captura manual.
+            codigo = "ia_no_disponible" if temporal else "error_extraccion"
+            texto = (f"La IA no estuvo disponible en {MAX_INTENTOS} intentos ({causa}): {mensaje}" if temporal
+                     else f"Se agotaron los {MAX_INTENTOS} intentos de extraccion: {mensaje}")
             try:
-                self.recepcion.a_bandeja(email, message_id, part_id, "error_extraccion", f"Se agotaron los {MAX_INTENTOS} intentos de extraccion: {mensaje}"[:500])
+                self.recepcion.a_bandeja(email, message_id, part_id, codigo, texto[:500])
             except Exception:
                 logger.exception("No se pudo pasar a la bandeja %s", clave)
-        logger.info("Ciclo automatico adjunto fallo clave=%s intento=%d/%d causa=%s estado=%s", clave, intentos, MAX_INTENTOS, causa, estado)
-        if estado == "error":
-            ctx["resumen"]["errores"] += 1
-            ctx["claves"]["error"].append(clave)
+        logger.info("Ciclo automatico adjunto fallo clave=%s intento=%d/%d causa=%s temporal=%s estado=%s", clave, intentos, MAX_INTENTOS, causa, temporal, estado)
+        ctx["resumen"]["errores"] += 1
+        ctx["claves"]["error"].append(clave)
         return estado
 
     # --- Envío automático a SaveData -----------------------------------------------------------
@@ -1086,6 +1162,10 @@ class ExtractorAutomatico:
         clave = f"{message_id}__{part_id}"
         resumen, claves = ctx["resumen"], ctx["claves"]
         logger.info("Ciclo automatico envio message_id=%s part_id=%s estado=%s", message_id, part_id, estado)
+        final = {"enviado": ("enviado", None), "requiere_revision": ("requiere_revision", "envio_requiere_revision"), "incierto": ("requiere_revision", "envio_incierto"),
+                 "error": ("error", "envio_error"), "sin_savedata": ("extraido", "sin_savedata"), "omitido": ("extraido", "envio_omitido")}.get(estado)
+        if final is not None:
+            self._marcar(email, message_id, part_id, final[0], final[1])
         ctx.setdefault("tipo_de", {})[clave] = self._nombre_tipo(email, message_id, part_id)
         if estado == "enviado":
             resumen["enviados"] += 1

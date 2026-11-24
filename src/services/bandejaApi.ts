@@ -4,8 +4,11 @@
 const API_URL = import.meta.env.DEV ? '/api' : (import.meta.env.VITE_API_URL ?? '/api').replace(/\/$/, '')
 
 export type CodigoDiagnostico = 'ok' | 'pdf_protegido' | 'pdf_danado' | 'pdf_escaneado' | 'formato_no_soportado'
-export type CodigoBandeja = Exclude<CodigoDiagnostico, 'ok'> | 'error_extraccion'
-export type EstadoBandeja = 'pendiente' | 'resuelto' | 'descartado'
+export type CodigoBandeja = Exclude<CodigoDiagnostico, 'ok'> | 'error_extraccion' | 'ia_no_disponible'
+/** `error`: documentos en error o que se quedaron sin terminar (`leido`); se reintentan con «Reintentar». */
+export type EstadoBandeja = 'pendiente' | 'resuelto' | 'descartado' | 'error'
+/** Estado del documento (en la base, columnas `estado` y `motivo`). */
+export type EstadoDocumento = 'leido' | 'extraido' | 'enviado' | 'requiere_revision' | 'captura_manual' | 'error' | 'descartado'
 
 export type DocumentoBandeja = {
   message_id: string
@@ -22,6 +25,10 @@ export type DocumentoBandeja = {
   tiene_original: boolean
   diagnostico: { codigo: CodigoDiagnostico; mensaje: string; formato: string | null; paginas?: number | null } | null
   bandeja: { estado: EstadoBandeja; codigo: CodigoBandeja; motivo: string; mensaje: string; entrada_en: string | null; resuelto_en: string | null; resolucion: string | null } | null
+  estado?: EstadoDocumento
+  /** Código del motivo: `gemini_http_502`, `ia_no_disponible`, `pdf_protegido`… */
+  motivo?: string | null
+  proceso?: { estado: EstadoDocumento; motivo: string | null; mensaje: string | null; actualizado: string | null } | null
 }
 
 export type EventoProceso = {
@@ -61,6 +68,8 @@ const ruta = (messageId: string, partId: string) => `${encodeURIComponent(messag
 export const bandejaApi = {
   listar: (estado: EstadoBandeja = 'pendiente') => request<{ documentos: DocumentoBandeja[]; motivos: Record<string, string> }>(`/bandeja?estado=${estado}`),
   reprocesar: (messageId: string, partId: string) => request<ResultadoReproceso>(`/bandeja/${ruta(messageId, partId)}/reprocesar`, { method: 'POST' }),
+  /** «Reintentar» un documento en error (o que se quedó sin terminar): lo vuelve a diagnosticar y extraer ya. */
+  reintentar: (messageId: string, partId: string) => request<ResultadoReproceso>(`/documentos/${ruta(messageId, partId)}/reintentar`, { method: 'POST' }),
   descartar: (messageId: string, partId: string) => request<{ documento: DocumentoBandeja }>(`/bandeja/${ruta(messageId, partId)}/descartar`, { method: 'POST' }),
   eventos: (messageId: string, partId: string) => request<{ eventos: EventoProceso[] }>(`/documentos/${ruta(messageId, partId)}/eventos`),
   urlOriginal: (messageId: string, partId: string) => `${API_URL}/documentos/${ruta(messageId, partId)}/original`,
